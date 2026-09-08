@@ -29,8 +29,6 @@ from .models import (
 # multi-slot need actually exists.
 SINGLE_ANSWER_SLOT = 1
 
-KINDS = ("task", "suite", "config", "scorer")
-
 
 class AppError(Exception):
     def __init__(self, status: int, code: str, message: str):
@@ -107,6 +105,9 @@ def register_version(conn: sqlite3.Connection, reg: VersionRegistration) -> tupl
                  canonical([a.model_dump() for a in reg.assets]), db.utcnow()),
             )
     except sqlite3.IntegrityError:
+        # UNIQUE(kind, name, version) is the authoritative guard; this branch
+        # only maps the multi-worker registration race to a correct idempotent
+        # 200 instead of a spurious 500.
         row = fetch_version(conn, reg.kind, reg.name, reg.version)
         if row is not None and row["id"] == digest:
             return version_record(row), 200
@@ -238,7 +239,11 @@ def create_app(data_root: str | None = None) -> FastAPI:
     async def healthz():
         return {"status": "ok"}
 
-    @app.post("/v1/versions", status_code=201)
+    @app.post(
+        "/v1/versions",
+        status_code=201,
+        responses={200: {"description": "Idempotent re-registration of identical content", "model": VersionRecord}},
+    )
     async def post_version(reg: VersionRegistration):
         record, status = register_version(conn, reg)
         return JSONResponse(status_code=status, content=record)
