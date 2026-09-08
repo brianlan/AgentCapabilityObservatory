@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ACO local SQLite data root (ACO_DATA_ROOT default)
+data/
