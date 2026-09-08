@@ -126,7 +126,7 @@ class TestManagerHelpers:
         insert_trial(conn)
         run_id = runs.create_run(conn, "t1", {}, supervisor_pid=-1)
         runs.mark_running(conn, run_id, container_id="abc")
-        reap_lost_supervisors(conn, None)
+        reap_lost_supervisors(conn)
         row = runs.get_run(conn, run_id)
         assert row["status"] == "error"
         assert row["exit_kind"] == "supervisor_lost"
@@ -137,5 +137,5 @@ class TestManagerHelpers:
     def test_live_supervisor_run_is_left_alone(self, conn):
         insert_trial(conn)
         run_id = runs.create_run(conn, "t1", {}, supervisor_pid=os.getpid())
-        reap_lost_supervisors(conn, None)
+        reap_lost_supervisors(conn)
         assert runs.get_run(conn, run_id)["status"] == "launching"

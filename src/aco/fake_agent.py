@@ -19,8 +19,6 @@ import shlex
 from harbor.agents.installed.base import NonZeroAgentExitCodeError
 from harbor.agents.nop import NopAgent
 
-SCENARIOS = ("submit", "exit", "background")
-
 
 def _session_request(method: str, path: str, token: str, payload: dict | None = None) -> dict:
     import json

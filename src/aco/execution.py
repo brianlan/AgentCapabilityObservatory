@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 
 from . import db, runs
-from .supervisor import RUN_LABEL, cleanup_container
+from .supervisor import cleanup_container
 
 POLL_INTERVAL_SEC = 1.0
 SUPERVISOR_TIMEOUT_SEC = 300  # generous ceiling; the supervisor enforces its own shorter one
@@ -57,7 +57,7 @@ def recover_stale_claims(conn) -> None:
     conn.commit()
 
 
-def reap_lost_supervisors(conn, root: Path) -> None:
+def reap_lost_supervisors(conn) -> None:
     """Supervisor died without recording an outcome: keep the intent, record
     the loss, and clean up only containers carrying our label."""
     for run in runs.unfinished_runs(conn):
@@ -140,10 +140,10 @@ def main() -> int:
     conn = db.connect(root / "aco.db")
     db.migrate(conn)  # idempotent; manager may start before the API's first migrate
     recover_stale_claims(conn)
-    reap_lost_supervisors(conn, root)
+    reap_lost_supervisors(conn)
     print(f"execution manager watching {root}", flush=True)
     while True:
-        reap_lost_supervisors(conn, root)
+        reap_lost_supervisors(conn)
         if not run_one(conn, root, args.api_url):
             time.sleep(POLL_INTERVAL_SEC)
 
