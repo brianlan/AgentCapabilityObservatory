@@ -458,6 +458,54 @@ class TestRecover:
         status = conn.execute("SELECT status FROM submissions WHERE trial_id='t1'").fetchone()
         assert status["status"] == "error"
 
+    def test_extra_unmanifested_file_fails_recovery_validation(self, conn, trial, tmp_path):
+        staging, manifest = self._staging_with_manifest(conn, trial, tmp_path)
+        (staging / "workspace" / "sneaky.txt").write_text("added after the manifest")
+        artifacts.recover(conn, tmp_path)
+        sealed = conn.execute("SELECT * FROM sealed_answers WHERE trial_id='t1'").fetchone()
+        assert sealed["status"] == "anomaly"
+        assert "unmanifested content in the answer: workspace/sneaky.txt" in sealed["anomaly"]
+        assert not (tmp_path / "answers").exists()
+        status = conn.execute("SELECT status FROM submissions WHERE trial_id='t1'").fetchone()
+        assert status["status"] == "error"
+
+    def test_manifest_path_traversal_is_rejected(self, conn, trial, tmp_path):
+        staging, manifest = self._staging_with_manifest(conn, trial, tmp_path)
+        outside = tmp_path / "outside.txt"
+        outside.write_text("file outside the answer directory")
+        manifest["files"].append({
+            "path": "../outside.txt",
+            "bytes": outside.stat().st_size,
+            "sha256": hashlib.sha256(outside.read_bytes()).hexdigest(),
+            "type": "regular",
+        })
+        (staging / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+        artifacts.recover(conn, tmp_path)
+        sealed = conn.execute("SELECT * FROM sealed_answers WHERE trial_id='t1'").fetchone()
+        assert sealed["status"] == "anomaly"
+        assert "escapes the answer directory" in sealed["anomaly"]
+        assert not (tmp_path / "answers").exists()
+
+    def test_unsupported_trigger_manifest_becomes_anomaly(self, conn, trial, tmp_path):
+        staging, manifest = self._staging_with_manifest(conn, trial, tmp_path)
+        manifest["trigger"] = "boot"  # would violate the DB CHECK at registration
+        (staging / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+        artifacts.recover(conn, tmp_path)  # must not raise
+        sealed = conn.execute("SELECT * FROM sealed_answers WHERE trial_id='t1'").fetchone()
+        assert sealed["status"] == "anomaly"
+        assert "unreadable or malformed" in sealed["anomaly"]
+        status = conn.execute("SELECT status FROM submissions WHERE trial_id='t1'").fetchone()
+        assert status["status"] == "error"
+
+    def test_malformed_entry_manifest_becomes_anomaly(self, conn, trial, tmp_path):
+        staging, manifest = self._staging_with_manifest(conn, trial, tmp_path)
+        manifest["files"][0]["sha256"] = 123  # wrong type, not a digest
+        (staging / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+        artifacts.recover(conn, tmp_path)  # must not raise
+        sealed = conn.execute("SELECT * FROM sealed_answers WHERE trial_id='t1'").fetchone()
+        assert sealed["status"] == "anomaly"
+        assert "unreadable or malformed" in sealed["anomaly"]
+
     def test_registered_but_content_missing_marks_anomaly(self, conn, trial, tmp_path, fake_container):
         workspace, _ = fake_container
         (workspace / "answer.txt").write_text("the answer")

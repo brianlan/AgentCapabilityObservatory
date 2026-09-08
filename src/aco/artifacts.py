@@ -21,7 +21,7 @@ import sqlite3
 import subprocess
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .db import utcnow
 
@@ -164,37 +164,70 @@ def manifest_digest(manifest: dict) -> str:
 
 
 def _load_manifest(path: Path) -> dict | None:
-    """Parse a manifest file; None when unreadable or structurally wrong."""
+    """Parse and schema-check a manifest file; None when unreadable, missing
+    required fields, or carrying an unsupported trigger — malformed metadata
+    must become an anomaly, never reach registration (#14)."""
     try:
         manifest = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return None
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
+    if not isinstance(manifest, dict):
+        return None
+    for key in ("trial_id", "run_id", "trigger"):
+        if not isinstance(manifest.get(key), str) or not manifest[key]:
+            return None
+    if manifest["trigger"] not in ("submit", "exit", "timeout"):
+        return None
+    if not isinstance(manifest.get("files"), list):
+        return None
+    for entry in manifest["files"]:
+        if (not isinstance(entry, dict)
+                or not isinstance(entry.get("path"), str) or not entry["path"]
+                or not isinstance(entry.get("bytes"), int) or isinstance(entry["bytes"], bool)
+                or not isinstance(entry.get("sha256"), str)
+                or entry.get("type") not in ("regular", "binary")):
+            return None
+    if not isinstance(manifest.get("changes"), dict):
+        return None
+    if not isinstance(manifest.get("total_bytes"), int) or isinstance(manifest["total_bytes"], bool):
         return None
     return manifest
 
 
 def _manifest_mismatch(manifest: dict, content_root: Path,
                        trial_id: str, run_id: str) -> str | None:
-    """Cross-check a manifest against the on-disk bytes it claims to describe.
+    """Cross-check a manifest against the complete on-disk tree it claims to
+    describe.
 
-    Returns an anomaly detail when disk facts contradict the manifest
-    (wrong trial/run metadata, missing or symlinked entries, changed size or
-    content), None when the bytes corroborate it. Recovery must never
-    register an answer that fails this check (#14).
+    Returns an anomaly detail when disk facts contradict the manifest —
+    wrong trial/run metadata, non-relative or escaping entry paths, missing
+    or symlinked entries, changed size or content, or extra unmanifested
+    files — None when the tree is exactly the manifest's content (#14).
     """
     if manifest.get("trial_id") != trial_id or manifest.get("run_id") != run_id:
         return "manifest trial/run metadata does not match the recovered location"
+    expected: dict[str, dict] = {}
     for entry in manifest.get("files", []):
-        if not isinstance(entry, dict):
-            return "manifest contains a malformed file entry"
-        path = content_root / str(entry.get("path", ""))
+        rel = PurePosixPath(entry["path"])
+        if rel.is_absolute() or ".." in rel.parts:
+            return f"manifest entry path escapes the answer directory: {entry['path']!r}"
+        path = content_root / rel
         if path.is_symlink() or not path.is_file():
-            return f"manifest entry missing or not a regular file: {entry.get('path')}"
-        data = path.read_bytes()
+            return f"manifest entry missing or not a regular file: {entry['path']}"
+        expected[rel.as_posix()] = entry
+    for p in content_root.rglob("*"):
+        rel = p.relative_to(content_root).as_posix()
+        if rel == _MANIFEST:
+            continue
+        if p.is_symlink():
+            return f"symlink inside the recovered content: {rel}"
+        if p.is_file() and rel not in expected:
+            return f"unmanifested content in the answer: {rel}"
+    for rel, entry in expected.items():
+        data = (content_root / rel).read_bytes()
         if (len(data) != entry.get("bytes")
                 or hashlib.sha256(data).hexdigest() != entry.get("sha256")):
-            return f"manifest entry content mismatch: {entry.get('path')}"
+            return f"manifest entry content mismatch: {rel}"
     return None
 
 
