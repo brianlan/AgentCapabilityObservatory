@@ -1,0 +1,219 @@
+"""Independent supervisor process: runs one trial via Harbor and records evidence (#13).
+
+The FastAPI process only plans; this process owns long-running execution and
+container control. Only public Harbor entry points are used (Trial.create,
+add_hook, verifier-off config, extra compose file) with a pinned Harbor
+version. Harbor's raw outcome is diagnostics only — never a score (#15 owns
+scoring).
+"""
+
+import argparse
+import asyncio
+import json
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+from . import db, runs
+
+# pinned at adoption; prototype verified the installed package against this
+# source commit byte-for-byte (prototypes/harbor-freeze evidence).
+HARBOR_VERSION = "0.22.0"
+HARBOR_SOURCE_COMMIT = "71c39eafbd134d43ae3f489b5e6488b2a157de65"
+ADAPTER_VERSION = "0.1.0"
+
+# fixed digest used by the prototype; the fake agent needs nothing newer
+IMAGE = "python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254"
+RUN_LABEL = "aco.run"
+DEFAULT_AGENT_TIMEOUT_SEC = 20
+TRIAL_GRACE_SEC = 90
+
+FAKE_HARNESS = "fake"
+# the fake target calls no model; anything model-shaped is unsupported, never
+# silently downgraded (issue acceptance: explicit failure)
+FAKE_MODEL_VALUES = {"", "none"}
+
+
+class UnsupportedTarget(Exception):
+    pass
+
+
+def translate_profile(profile: dict) -> int:
+    """Return the agent timeout for the fake target or raise UnsupportedTarget."""
+    if profile.get("harness") != FAKE_HARNESS:
+        raise UnsupportedTarget(
+            f"unsupported harness {profile.get('harness')!r}: only {FAKE_HARNESS!r} executes in V1"
+        )
+    if profile.get("model") not in FAKE_MODEL_VALUES:
+        raise UnsupportedTarget(
+            f"fake target does not support model={profile.get('model')!r};"
+            " the fake agent calls no model in V1"
+        )
+    for key in ("provider", "skills", "credentials"):
+        if profile.get(key):
+            raise UnsupportedTarget(
+                f"fake target does not support {key}={profile.get(key)!r};"
+                " only a bare fake profile executes in V1"
+            )
+    return DEFAULT_AGENT_TIMEOUT_SEC
+
+
+def command(*args, check=True):
+    return subprocess.run(args, text=True, capture_output=True, timeout=20, check=check)
+
+
+def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run_id: str) -> Path:
+    """Minimal Harbor task dir: registry prompt as instruction, pinned image,
+    offline compose override with our identification label."""
+    task_dir = work_dir / "task"
+    (task_dir / "environment").mkdir(parents=True)
+    (task_dir / "instruction.md").write_text(instruction)
+    (task_dir / "task.toml").write_text(
+        f'schema_version = "1.4"\n[environment]\ndocker_image = "{IMAGE}"\n'
+        f'network_mode = "public"\n[agent]\ntimeout_sec = {agent_timeout_sec}\n'
+    )
+    (task_dir / "environment" / "Dockerfile").write_text(f"FROM {IMAGE}\n")
+    compose = task_dir / "offline.yaml"
+    compose.write_text(
+        "services:\n"
+        "  main:\n"
+        "    network_mode: none\n"
+        "    labels:\n"
+        f"      {RUN_LABEL}: {run_id}\n"
+    )
+    return task_dir
+
+
+def discover_container(run_id: str) -> str:
+    ids = command(
+        "docker", "ps", "-q",
+        "--filter", f"label={RUN_LABEL}={run_id}",
+        "--filter", "label=com.docker.compose.service=main",
+    ).stdout.split()
+    if len(ids) != 1:
+        raise RuntimeError(f"expected exactly one agent container, found {len(ids)}")
+    return ids[0]
+
+
+def cleanup_container(run_id: str) -> None:
+    ids = command("docker", "ps", "-aq", "--filter", f"label={RUN_LABEL}={run_id}", check=False).stdout.split()
+    for cid in ids:
+        command("docker", "rm", "-f", cid, check=False)
+
+
+def container_security_summary(container_id: str) -> dict:
+    """Runtime evidence: the agent container must stay unprivileged and
+    isolated (no docker socket, no host network)."""
+    inspect = json.loads(command("docker", "inspect", container_id).stdout)[0]
+    host_config = inspect["HostConfig"]
+    mounts = [str(m.get("Source", "")) for m in inspect.get("Mounts", [])]
+    mounts += host_config.get("Binds") or []
+    return {
+        "privileged": bool(host_config.get("Privileged")),
+        "network_mode": host_config.get("NetworkMode"),
+        "docker_socket_mounted": any("docker.sock" in source for source in mounts),
+    }
+
+
+async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) -> None:
+    run_id = run["run_id"]
+    trial = conn.execute("SELECT * FROM trials WHERE id = ?", (run["trial_id"],)).fetchone()
+    task_content = json.loads(
+        conn.execute("SELECT content FROM versions WHERE id = ?", (trial["task_version_id"],)).fetchone()["content"]
+    )
+    profile = json.loads(
+        conn.execute("SELECT content FROM versions WHERE id = ?", (trial["config_version_id"],)).fetchone()["content"]
+    )
+
+    # fail before any side effect on unsupported profiles
+    try:
+        agent_timeout_sec = translate_profile(profile)
+    except UnsupportedTarget as exc:
+        runs.finish_run(conn, run_id, "error", runs.EXIT_UNSUPPORTED_TARGET, str(exc))
+        return
+
+    from harbor.models.trial.config import (
+        AgentConfig,
+        EnvironmentConfig,
+        TaskConfig,
+        TrialConfig,
+        VerifierConfig,
+    )
+    from harbor.trial.hooks import TrialEvent
+    from harbor.trial.trial import Trial
+
+    work_dir = root / "runs" / run_id
+    task_dir = build_task_dir(work_dir, task_content.get("prompt", ""), agent_timeout_sec, run_id)
+    trials_dir = work_dir / "trials"
+    container_id = None
+
+    async def on_agent_start(_event):
+        nonlocal container_id
+        container_id = await asyncio.to_thread(discover_container, run_id)
+        runs.mark_running(conn, run_id, container_id=container_id, image=IMAGE)
+        security = await asyncio.to_thread(container_security_summary, container_id)
+        runs.add_phase(conn, run_id, "agent_start", container_id=container_id,
+                       container_security=security)
+
+    async def on_agent_end(_event):
+        runs.add_phase(conn, run_id, "agent_end")
+
+    trial_obj = await Trial.create(TrialConfig(
+        task=TaskConfig(path=task_dir),
+        trial_name=f"aco-{run_id[:12]}",
+        trials_dir=trials_dir,
+        agent=AgentConfig(import_path="aco.fake_agent:FakeAgent"),
+        environment=EnvironmentConfig(extra_docker_compose=[task_dir / "offline.yaml"]),
+        # harbor scoring is disabled permanently; ACO owns all official results
+        verifier=VerifierConfig(disable=True),
+        artifacts=["/workspace"],
+    ))
+    trial_obj.add_hook(TrialEvent.AGENT_START, on_agent_start)
+    trial_obj.add_hook(TrialEvent.AGENT_END, on_agent_end)
+
+    runs.observe_run(conn, run_id, ADAPTER_VERSION, HARBOR_VERSION, str(trials_dir))
+    try:
+        result = await asyncio.wait_for(trial_obj.run(), timeout=agent_timeout_sec + TRIAL_GRACE_SEC)
+    except asyncio.TimeoutError:
+        runs.add_phase(conn, run_id, "trial_timeout")
+        runs.finish_run(conn, run_id, "error", runs.EXIT_TIMEOUT,
+                        f"trial exceeded {agent_timeout_sec + TRIAL_GRACE_SEC}s")
+        return
+    finally:
+        if container_id is None:
+            cleanup_container(run_id)
+
+    exception = result.exception_info.exception_type if result.exception_info else None
+    exit_kind = runs.EXIT_AGENT_ERROR if exception else runs.EXIT_NORMAL
+    runs.add_phase(conn, run_id, "trial_finished", exception=exception,
+                   verifier_scored=result.verifier_result is not None)
+    runs.finish_run(conn, run_id, "finished", exit_kind, exception)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="aco-supervisor", description=__doc__)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--data-root", required=True)
+    args = parser.parse_args()
+
+    root = Path(args.data_root).expanduser()
+    conn = db.connect(root / "aco.db")
+    run = runs.get_run(conn, args.run_id)
+    if run is None:
+        print(f"run {args.run_id} does not exist", file=sys.stderr)
+        return 2
+    try:
+        asyncio.run(execute_run(conn, run, root))
+    except Exception as exc:  # noqa: BLE001 — supervisor records its own crash
+        # leave diagnostics; the manager reaps leftovers (container/pid)
+        if runs.get_run(conn, args.run_id)["status"] in ("launching", "running"):
+            runs.finish_run(conn, args.run_id, "error", runs.EXIT_AGENT_ERROR,
+                            f"{type(exc).__name__}: {exc}")
+        cleanup_container(args.run_id)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -9,6 +9,7 @@ description = "Agent Capability Observatory: versioned registry and evaluation p
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
+    "harbor==0.22.0",
     "pydantic>=2.7",
     "uvicorn>=0.30",
 ]

@@ -17,6 +17,8 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # manager, supervisor, and API share the database file across processes
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
