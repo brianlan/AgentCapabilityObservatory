@@ -416,6 +416,48 @@ class TestRecover:
         status = conn.execute("SELECT status FROM submissions WHERE trial_id='t1'").fetchone()
         assert status["status"] == "sealed"
 
+    def test_staging_with_wrong_trial_metadata_is_not_registered(self, conn, trial, tmp_path):
+        staging, manifest = self._staging_with_manifest(conn, trial, tmp_path)
+        manifest["trial_id"] = "other-trial"
+        (staging / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+        artifacts.recover(conn, tmp_path)
+        assert conn.execute(
+            "SELECT status FROM sealed_answers WHERE trial_id='t1'"
+        ).fetchone()["status"] == "anomaly"
+        anomaly = conn.execute("SELECT anomaly FROM sealed_answers WHERE trial_id='t1'").fetchone()["anomaly"]
+        assert "metadata does not match" in anomaly
+        assert not (tmp_path / "answers").exists()  # nothing was published or registered
+        status = conn.execute("SELECT status FROM submissions WHERE trial_id='t1'").fetchone()
+        assert status["status"] == "error"
+
+    def test_published_directory_with_wrong_digest_name_is_not_registered(self, conn, trial, tmp_path):
+        staging, manifest = self._staging_with_manifest(conn, trial, tmp_path)
+        digest = artifacts.manifest_digest(manifest)
+        artifacts.publish(staging, digest, tmp_path / "answers")
+        (tmp_path / "answers" / digest).rename(tmp_path / "answers" / ("0" * 64))
+        artifacts.recover(conn, tmp_path)
+        sealed = conn.execute("SELECT * FROM sealed_answers WHERE trial_id='t1'").fetchone()
+        assert sealed["status"] == "anomaly"
+        assert "directory name does not match the manifest digest" in sealed["anomaly"]
+        status = conn.execute("SELECT status FROM submissions WHERE trial_id='t1'").fetchone()
+        assert status["status"] == "error"
+
+    def test_mutated_published_bytes_flip_registration_to_anomaly(self, conn, trial, tmp_path, fake_container):
+        workspace, _ = fake_container
+        (workspace / "answer.txt").write_text("the answer")
+        seal_trial(conn, trial, tmp_path)
+        digest = conn.execute("SELECT digest FROM sealed_answers").fetchone()["digest"]
+        answer_file = tmp_path / "answers" / digest / "workspace" / "answer.txt"
+        self._rmtree_force(answer_file.parent)  # published dirs are read-only
+        answer_file.parent.mkdir(parents=True)
+        answer_file.write_text("tampered after publication")
+        artifacts.recover(conn, tmp_path)
+        sealed = conn.execute("SELECT * FROM sealed_answers WHERE trial_id='t1'").fetchone()
+        assert sealed["status"] == "anomaly"
+        assert "content mismatch: workspace/answer.txt" in sealed["anomaly"]
+        status = conn.execute("SELECT status FROM submissions WHERE trial_id='t1'").fetchone()
+        assert status["status"] == "error"
+
     def test_registered_but_content_missing_marks_anomaly(self, conn, trial, tmp_path, fake_container):
         workspace, _ = fake_container
         (workspace / "answer.txt").write_text("the answer")

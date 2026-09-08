@@ -163,6 +163,41 @@ def manifest_digest(manifest: dict) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def _load_manifest(path: Path) -> dict | None:
+    """Parse a manifest file; None when unreadable or structurally wrong."""
+    try:
+        manifest = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
+        return None
+    return manifest
+
+
+def _manifest_mismatch(manifest: dict, content_root: Path,
+                       trial_id: str, run_id: str) -> str | None:
+    """Cross-check a manifest against the on-disk bytes it claims to describe.
+
+    Returns an anomaly detail when disk facts contradict the manifest
+    (wrong trial/run metadata, missing or symlinked entries, changed size or
+    content), None when the bytes corroborate it. Recovery must never
+    register an answer that fails this check (#14).
+    """
+    if manifest.get("trial_id") != trial_id or manifest.get("run_id") != run_id:
+        return "manifest trial/run metadata does not match the recovered location"
+    for entry in manifest.get("files", []):
+        if not isinstance(entry, dict):
+            return "manifest contains a malformed file entry"
+        path = content_root / str(entry.get("path", ""))
+        if path.is_symlink() or not path.is_file():
+            return f"manifest entry missing or not a regular file: {entry.get('path')}"
+        data = path.read_bytes()
+        if (len(data) != entry.get("bytes")
+                or hashlib.sha256(data).hexdigest() != entry.get("sha256")):
+            return f"manifest entry content mismatch: {entry.get('path')}"
+    return None
+
+
 def write_diagnostic_patch(baseline: Path | None, staging: Path, dest: Path) -> None:
     """Best-effort git patch of workspace changes, stored OUTSIDE the sealed
     answer (diagnostics only, never part of the official content)."""
@@ -318,7 +353,17 @@ def recover(conn: sqlite3.Connection, root: Path) -> None:
                 continue
             manifest_path = staging / _MANIFEST
             if manifest_path.is_file():
-                manifest = json.loads(manifest_path.read_text())
+                manifest = _load_manifest(manifest_path)
+                if manifest is None:
+                    shutil.rmtree(run_dir, ignore_errors=True)
+                    mark_anomaly(conn, trial_id, run_id,
+                                 "staging manifest is unreadable or malformed")
+                    continue
+                mismatch = _manifest_mismatch(manifest, staging, trial_id, run_id)
+                if mismatch:
+                    shutil.rmtree(run_dir, ignore_errors=True)
+                    mark_anomaly(conn, trial_id, run_id, mismatch)
+                    continue
                 digest = manifest_digest(manifest)
                 submission = conn.execute(
                     "SELECT receipt_id FROM submissions WHERE trial_id = ?", (trial_id,)
@@ -343,7 +388,9 @@ def recover(conn: sqlite3.Connection, root: Path) -> None:
             manifest_path = answer_dir / _MANIFEST
             if not answer_dir.is_dir() or not manifest_path.is_file():
                 continue
-            manifest = json.loads(manifest_path.read_text())
+            manifest = _load_manifest(manifest_path)
+            if manifest is None:
+                continue  # nothing trustworthy to attribute or register
             trial_id = manifest.get("trial_id")
             if not trial_id or conn.execute(
                 "SELECT 1 FROM sealed_answers WHERE trial_id = ?", (trial_id,)
@@ -353,6 +400,13 @@ def recover(conn: sqlite3.Connection, root: Path) -> None:
                 "SELECT run_id FROM trial_runs WHERE trial_id = ?", (trial_id,)
             ).fetchone()
             if run is None:
+                continue
+            mismatch = _manifest_mismatch(manifest, answer_dir, trial_id, run["run_id"])
+            if mismatch or manifest_digest(manifest) != answer_dir.name:
+                # disk facts contradict the manifest: register nothing
+                detail = ("published content fails recovery validation: "
+                          + (mismatch or "directory name does not match the manifest digest"))
+                mark_anomaly(conn, trial_id, run["run_id"], detail)
                 continue
             submission = conn.execute(
                 "SELECT receipt_id FROM submissions WHERE trial_id = ?", (trial_id,)
@@ -364,11 +418,26 @@ def recover(conn: sqlite3.Connection, root: Path) -> None:
                      manifest.get("trigger", "exit"), times)
             set_submission_status(conn, trial_id, "sealed")
 
-    for row in conn.execute("SELECT trial_id, digest FROM sealed_answers WHERE status = 'sealed'").fetchall():
-        if not (root / "answers" / row["digest"]).is_dir():
+    for row in conn.execute(
+        "SELECT trial_id, run_id, digest FROM sealed_answers WHERE status = 'sealed'"
+    ).fetchall():
+        answer_dir = root / "answers" / row["digest"]
+        if not answer_dir.is_dir():
+            detail = "registered answer content missing from disk"
+        else:
+            manifest = _load_manifest(answer_dir / _MANIFEST)
+            mismatch = (_manifest_mismatch(manifest, answer_dir, row["trial_id"], row["run_id"])
+                        if manifest is not None else None)
+            if mismatch:
+                detail = f"registered answer fails recovery validation: {mismatch}"
+            elif manifest is None or manifest_digest(manifest) != row["digest"]:
+                detail = "registered answer manifest does not match the registered digest"
+            else:
+                detail = None
+        if detail:
             conn.execute(
                 "UPDATE sealed_answers SET status = 'anomaly', anomaly = ? WHERE trial_id = ?",
-                ("registered answer content missing from disk", row["trial_id"]),
+                (detail, row["trial_id"]),
             )
             set_submission_status(conn, row["trial_id"], "error")
     conn.commit()
