@@ -15,7 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import db, runs
+from . import artifacts, db, runs
 
 # pinned at adoption; prototype verified the installed package against this
 # source commit byte-for-byte (prototypes/harbor-freeze evidence).
@@ -124,6 +124,28 @@ def container_security_summary(container_id: str) -> dict:
     }
 
 
+def _has_submission(conn: sqlite3.Connection, trial_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM submissions WHERE trial_id = ?", (trial_id,)
+    ).fetchone() is not None
+
+
+def _seal_after_run(conn: sqlite3.Connection, run: sqlite3.Row, container_id: str | None,
+                    trigger: str, root: Path, baseline_dir: Path) -> None:
+    """Freeze the workspace through the single seal entry point. The seal
+    happens while the container still exists — Harbor's later artifact
+    collection is diagnostics only and never the official answer (#14)."""
+    if container_id is None:
+        return
+    try:
+        receipt = artifacts.seal(conn, run, container_id, trigger, root, baseline_dir)
+    except Exception as exc:  # noqa: BLE001 — sealing failure is recorded, never fatal
+        runs.add_phase(conn, run["run_id"], "seal_failed", detail=f"{type(exc).__name__}: {exc}")
+        return
+    runs.add_phase(conn, run["run_id"], "sealed", receipt_id=receipt["receipt_id"],
+                   answer_digest=receipt["digest"])
+
+
 async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) -> None:
     run_id = run["run_id"]
     trial = conn.execute("SELECT * FROM trials WHERE id = ?", (run["trial_id"],)).fetchone()
@@ -152,6 +174,7 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     from harbor.trial.trial import Trial
 
     work_dir = root / "runs" / run_id
+    baseline_dir = root / "sealing" / run_id / "baseline"
     task_dir = build_task_dir(work_dir, task_content.get("prompt", ""), agent_timeout_sec, run_id)
     trials_dir = work_dir / "trials"
     container_id = None
@@ -163,9 +186,14 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         security = await asyncio.to_thread(container_security_summary, container_id)
         runs.add_phase(conn, run_id, "agent_start", container_id=container_id,
                        container_security=security)
+        # pre-agent baseline for the manifest's added/modified/deleted diff
+        await asyncio.to_thread(artifacts.snapshot_baseline, container_id, baseline_dir)
 
     async def on_agent_end(_event):
         runs.add_phase(conn, run_id, "agent_end")
+        trigger = "submit" if _has_submission(conn, run["trial_id"]) else "exit"
+        await asyncio.to_thread(_seal_after_run, conn, run, container_id,
+                                trigger, root, baseline_dir)
 
     trial_obj = await Trial.create(TrialConfig(
         task=TaskConfig(path=task_dir),
@@ -185,6 +213,8 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         result = await asyncio.wait_for(trial_obj.run(), timeout=agent_timeout_sec + TRIAL_GRACE_SEC)
     except asyncio.TimeoutError:
         runs.add_phase(conn, run_id, "trial_timeout")
+        await asyncio.to_thread(_seal_after_run, conn, run, container_id,
+                                "timeout", root, baseline_dir)
         runs.finish_run(conn, run_id, "error", runs.EXIT_TIMEOUT,
                         f"trial exceeded {agent_timeout_sec + TRIAL_GRACE_SEC}s")
         return

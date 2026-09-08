@@ -159,10 +159,11 @@ class TestHarborExecution:
         finished = next(p for p in run["phases"] if p["event"] == "trial_finished")
         assert finished["verifier_scored"] is False
 
-        # the fake agent's submit became the trial's single end-intent
+        # the fake agent's submit became the trial's single end-intent,
+        # sealed by the supervisor into the official answer (#14)
         submission = submit_response(stack["root"] / "aco.db", trial_id)
         assert submission is not None
-        assert submission["status"] == "accepted"
+        assert submission["status"] == "sealed"
 
         # agent container evidence recorded at runtime: no docker socket,
         # never privileged, no host network
@@ -257,3 +258,115 @@ class TestHarborExecution:
         # explicit failure only: no container was ever created
         assert run["container_id"] is None
         assert "agent_start" not in [p["event"] for p in run["phases"]]
+
+
+def published_dirs(root) -> list:
+    return sorted((root / "answers").glob("*")) if (root / "answers").is_dir() else []
+
+
+def read_manifest(answer_dir) -> dict:
+    return json.loads((answer_dir / "manifest.json").read_text())
+
+
+class TestSealedAnswers:
+    def test_submit_seals_official_answer_with_stable_receipt(self, stack):
+        """The submit trigger seals through the pause/copy boundary: the
+        published answer is content-addressed, read-only, and its receipt is
+        stable across repeated queries (#14)."""
+        import hashlib
+        import stat as stat_mod
+
+        base = stack["base"]
+        trial_id = create_trial(base, "FAKE:submit\nseal me", {"harness": "fake", "model": "none"})
+        run = wait_for_run(base, trial_id)
+
+        events = [p["event"] for p in run["phases"]]
+        assert "sealed" in events, run["phases"]
+        sealed_phase = next(p for p in run["phases"] if p["event"] == "sealed")
+        digest = sealed_phase["answer_digest"]
+        answer_dir = stack["root"] / "answers" / digest
+        assert answer_dir.is_dir()
+
+        # the official answer is the frozen workspace, published read-only
+        answer_file = answer_dir / "workspace" / "answer.txt"
+        assert answer_file.is_file()
+        assert stat_mod.S_IMODE(answer_file.stat().st_mode) & 0o222 == 0
+        manifest = read_manifest(answer_dir)
+        assert manifest["trial_id"] == trial_id
+        assert manifest["trigger"] == "submit"
+        entry = next(e for e in manifest["files"] if e["path"] == "workspace/answer.txt")
+        assert entry["sha256"] == hashlib.sha256(answer_file.read_bytes()).hexdigest()
+        assert manifest["changes"]["added"] == ["workspace/answer.txt"]
+
+        # registration + session-visible status/digest
+        submission = submit_response(stack["root"] / "aco.db", trial_id)
+        assert submission["status"] == "sealed"
+        status, token_body = http("POST", base + f"/v1/trials/{trial_id}/session-token", {})
+        assert status == 201
+        headers = {"Authorization": f"Bearer {token_body['token']}"}
+        request = urllib.request.Request(base + "/v1/session/submission", headers=headers)
+        with urllib.request.urlopen(request, timeout=10) as response:
+            first = json.loads(response.read())
+        time.sleep(0.5)
+        request = urllib.request.Request(base + "/v1/session/submission", headers=headers)
+        with urllib.request.urlopen(request, timeout=10) as response:
+            second = json.loads(response.read())
+        assert first == second
+        assert first["receipt_id"] == sealed_phase["receipt_id"]
+        assert first["status"] == "sealed"
+        assert first["answer_digest"] == digest
+
+        # Harbor's post-hoc artifact dir is a different location and never
+        # takes the answers/ place
+        assert answer_dir in published_dirs(stack["root"])
+
+    def test_background_writer_cannot_change_sealed_answer(self, stack):
+        """Parent (agent) exits while a background writer keeps writing:
+        the sealed snapshot freezes at pause time and stays byte-stable, while
+        Harbor's later diagnostic collection sees the writer's extra output."""
+        import hashlib
+
+        base = stack["base"]
+        trial_id = create_trial(base, "FAKE:background\nkeep writing", {"harness": "fake", "model": "none"})
+        run = wait_for_run(base, trial_id)
+        assert run["exit_kind"] == "normal"
+        sealed_phase = next(p for p in run["phases"] if p["event"] == "sealed")
+        answer_dir = stack["root"] / "answers" / sealed_phase["answer_digest"]
+        sealed_bg = answer_dir / "workspace" / "bg.txt"
+        assert sealed_bg.is_file()
+        frozen_digest = hashlib.sha256(sealed_bg.read_bytes()).hexdigest()
+
+        # the detached writer keeps appending after the freeze: the published
+        # answer never changes
+        time.sleep(3)
+        assert hashlib.sha256(sealed_bg.read_bytes()).hexdigest() == frozen_digest
+        assert sealed_phase["answer_digest"] in {d.name for d in published_dirs(stack["root"])}
+
+        # Harbor's diagnostics captured at least as much (likely more), in a
+        # different location, and cannot override the sealed answer
+        harbor_bg = sorted((stack["root"] / "runs").rglob("bg.txt"))
+        assert harbor_bg, "diagnostic artifact missing"
+        assert len(harbor_bg[0].read_text().splitlines()) >= len(sealed_bg.read_text().splitlines())
+
+    def test_exit_without_submission_still_seals_workspace(self, stack):
+        """Agent exit with no end-intent: the workspace is still sealed with
+        trigger 'exit' and a generated receipt — one official answer per trial."""
+        base = stack["base"]
+        trial_id = create_trial(base, "FAKE:exit\nno submit", {"harness": "fake", "model": "none"})
+        run = wait_for_run(base, trial_id)
+        assert run["exit_kind"] == "agent_error"
+        assert submit_response(stack["root"] / "aco.db", trial_id) is None
+
+        sealed_phase = next(p for p in run["phases"] if p["event"] == "sealed")
+        answer_dir = stack["root"] / "answers" / sealed_phase["answer_digest"]
+        manifest = read_manifest(answer_dir)
+        assert manifest["trigger"] == "exit"
+        assert (answer_dir / "workspace" / "answer.txt").is_file()
+        conn = sqlite3.connect(stack["root"] / "aco.db")
+        conn.row_factory = sqlite3.Row
+        try:
+            sealed = conn.execute("SELECT receipt_id, status FROM sealed_answers WHERE trial_id = ?", (trial_id,)).fetchone()
+        finally:
+            conn.close()
+        assert sealed["status"] == "sealed"
+        assert sealed["receipt_id"]  # generated: no submission receipt existed
