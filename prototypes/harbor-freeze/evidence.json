@@ -1,0 +1,466 @@
+{
+  "harbor_source": "71c39eafbd134d43ae3f489b5e6488b2a157de65",
+  "python": "3.12.14 | packaged by Anaconda, Inc. | (main, Aug 27 2026, 14:46:43) [GCC 14.3.0]",
+  "image": "python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254",
+  "cases": [
+    {
+      "mode": "control",
+      "passed_checks": true,
+      "harbor_exception": null,
+      "harbor_scored": false,
+      "receipt": null,
+      "events": [
+        {
+          "action": "agent_start",
+          "at": 1788832245.0712702,
+          "cid": "f47edb75fd06"
+        },
+        {
+          "action": "agent_end_hook",
+          "at": 1788832245.9377499
+        },
+        {
+          "action": "background_writer_survived_agent_exit",
+          "samples": [
+            {
+              "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+              "child.txt": "ff5a1ae012afa5d4c889c50ad427aaf545d31a4fac04ffc1c4d03d403ba4250a",
+              "parent.txt": "c75cb66ae28d8ebc6eded002c28a8ba0d06d3a78c6b5cbf9b2ade051f0775ac4"
+            },
+            {
+              "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+              "child.txt": "ad57366865126e55649ecb23ae1d48887544976efea46a48eb5d85a6eeb4d306",
+              "parent.txt": "c75cb66ae28d8ebc6eded002c28a8ba0d06d3a78c6b5cbf9b2ade051f0775ac4"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "mode": "exit",
+      "passed_checks": true,
+      "harbor_exception": null,
+      "harbor_scored": false,
+      "receipt": {
+        "cid": "293482fc01b1",
+        "reason": "agent_exit",
+        "requested_at": 1788832258.716883,
+        "frozen_at": 1788832258.7452323,
+        "status": "collected",
+        "collected_at": 1788832258.9683611,
+        "hashes": {
+          "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+          "child.txt": "bbb965ab0c80d6538cf2184babad2a564a010376712012bd07b0af92dcd3097d",
+          "parent.txt": "c75cb66ae28d8ebc6eded002c28a8ba0d06d3a78c6b5cbf9b2ade051f0775ac4"
+        },
+        "finish": "pause"
+      },
+      "events": [
+        {
+          "action": "agent_start",
+          "at": 1788832257.8042548,
+          "cid": "293482fc01b1"
+        },
+        {
+          "action": "agent_end_hook",
+          "at": 1788832258.5874686
+        },
+        {
+          "action": "collect",
+          "reason": "agent_exit",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832258.9888513
+        },
+        {
+          "action": "collect",
+          "reason": "duplicate_after_trial_cleanup",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832269.3700867
+        }
+      ],
+      "harbor_artifact_hashes": {
+        "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+        "child.txt": "bbb965ab0c80d6538cf2184babad2a564a010376712012bd07b0af92dcd3097d",
+        "parent.txt": "c75cb66ae28d8ebc6eded002c28a8ba0d06d3a78c6b5cbf9b2ade051f0775ac4"
+      },
+      "harbor_artifacts_match_official": true,
+      "independent_verifier": "PASS"
+    },
+    {
+      "mode": "timeout",
+      "passed_checks": true,
+      "harbor_exception": "AgentTimeoutError",
+      "harbor_scored": false,
+      "receipt": {
+        "cid": "653d9ebe1784",
+        "reason": "timeout",
+        "requested_at": 1788832272.9949386,
+        "frozen_at": 1788832273.007707,
+        "status": "collected",
+        "collected_at": 1788832273.230802,
+        "hashes": {
+          "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+          "child.txt": "d6e5a20b30f87216b2c758f5e7a23c437dbc3dfa1ccb177c474de152bb0ef731",
+          "parent.txt": "d6e5a20b30f87216b2c758f5e7a23c437dbc3dfa1ccb177c474de152bb0ef731"
+        },
+        "finish": "pause"
+      },
+      "events": [
+        {
+          "action": "agent_start",
+          "at": 1788832270.3645244,
+          "cid": "653d9ebe1784"
+        },
+        {
+          "action": "agent_end_hook",
+          "at": 1788832272.8681319
+        },
+        {
+          "action": "collect",
+          "reason": "timeout",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832273.2512424
+        },
+        {
+          "action": "collect",
+          "reason": "duplicate_after_trial_cleanup",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832283.6352308
+        }
+      ],
+      "harbor_artifact_hashes": {
+        "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+        "child.txt": "d6e5a20b30f87216b2c758f5e7a23c437dbc3dfa1ccb177c474de152bb0ef731",
+        "parent.txt": "d6e5a20b30f87216b2c758f5e7a23c437dbc3dfa1ccb177c474de152bb0ef731"
+      },
+      "harbor_artifacts_match_official": true,
+      "independent_verifier": "PASS"
+    },
+    {
+      "mode": "submit",
+      "passed_checks": true,
+      "harbor_exception": "NonZeroAgentExitCodeError",
+      "harbor_scored": false,
+      "receipt": {
+        "cid": "40e8ee2797a7",
+        "reason": "submit",
+        "requested_at": 1788832285.5545938,
+        "frozen_at": 1788832285.577808,
+        "status": "collected",
+        "collected_at": 1788832285.84232,
+        "hashes": {
+          "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+          "child.txt": "44c8031cb036a7350d8b9b8603af662a4b9cdbd2f96e8d5de5af435c9c35da69",
+          "parent.txt": "44c8031cb036a7350d8b9b8603af662a4b9cdbd2f96e8d5de5af435c9c35da69"
+        },
+        "finish": "kill"
+      },
+      "events": [
+        {
+          "action": "agent_start",
+          "at": 1788832284.6324427,
+          "cid": "40e8ee2797a7"
+        },
+        {
+          "action": "agent_end_hook",
+          "at": 1788832285.8180585
+        },
+        {
+          "action": "collect",
+          "reason": "submit",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832285.8672776
+        },
+        {
+          "action": "collect",
+          "reason": "submit",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832285.8672907
+        },
+        {
+          "action": "collect",
+          "reason": "duplicate_after_trial_cleanup",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832286.1914432
+        }
+      ],
+      "harbor_artifact_hashes": {
+        "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+        "child.tmp": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "child.txt": "44c8031cb036a7350d8b9b8603af662a4b9cdbd2f96e8d5de5af435c9c35da69",
+        "parent.tmp": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "parent.txt": "44c8031cb036a7350d8b9b8603af662a4b9cdbd2f96e8d5de5af435c9c35da69"
+      },
+      "harbor_artifacts_match_official": false,
+      "independent_verifier": "PASS"
+    },
+    {
+      "mode": "crash",
+      "passed_checks": true,
+      "harbor_exception": "NonZeroAgentExitCodeError",
+      "harbor_scored": false,
+      "receipt": {
+        "cid": "d7e3d2e2b57d",
+        "reason": "submit",
+        "requested_at": 1788832288.1142507,
+        "frozen_at": 1788832288.1366622,
+        "status": "collected",
+        "collected_at": 1788832288.5408323,
+        "hashes": {
+          "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+          "child.txt": "b4944c6ff08dc6f43da2e9c824669b7d927dd1fa976fadc7b456881f51bf5ccc",
+          "parent.txt": "b4944c6ff08dc6f43da2e9c824669b7d927dd1fa976fadc7b456881f51bf5ccc"
+        },
+        "finish": "kill"
+      },
+      "events": [
+        {
+          "action": "agent_start",
+          "at": 1788832287.1794307,
+          "cid": "d7e3d2e2b57d"
+        },
+        {
+          "action": "collect",
+          "reason": "submit",
+          "fault": "crash",
+          "exit_code": 77,
+          "at": 1788832288.1445584
+        },
+        {
+          "action": "agent_end_hook",
+          "at": 1788832288.5054793
+        },
+        {
+          "action": "collect",
+          "reason": "submit",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832288.56275
+        },
+        {
+          "action": "collect",
+          "reason": "submit",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832288.5643184
+        },
+        {
+          "action": "collect",
+          "reason": "duplicate_after_trial_cleanup",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832288.8846855
+        }
+      ],
+      "harbor_artifact_hashes": {
+        "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+        "child.txt": "b4944c6ff08dc6f43da2e9c824669b7d927dd1fa976fadc7b456881f51bf5ccc",
+        "parent.txt": "b4944c6ff08dc6f43da2e9c824669b7d927dd1fa976fadc7b456881f51bf5ccc"
+      },
+      "harbor_artifacts_match_official": true,
+      "independent_verifier": "PASS"
+    },
+    {
+      "mode": "copy_failure",
+      "passed_checks": true,
+      "harbor_exception": "NonZeroAgentExitCodeError",
+      "harbor_scored": false,
+      "receipt": {
+        "cid": "0ab97c321127",
+        "reason": "submit",
+        "requested_at": 1788832290.786234,
+        "frozen_at": 1788832290.8090587,
+        "status": "collected",
+        "error": "Error response from daemon: Could not find the file /missing in container 0ab97c321127",
+        "collected_at": 1788832291.2411187,
+        "hashes": {
+          "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+          "child.txt": "a46e37632fa6ca51a13fe39a567b3c23b28c2f47d8af6be9bd63e030e214ba38",
+          "parent.txt": "a46e37632fa6ca51a13fe39a567b3c23b28c2f47d8af6be9bd63e030e214ba38"
+        },
+        "finish": "kill"
+      },
+      "events": [
+        {
+          "action": "agent_start",
+          "at": 1788832289.8766344,
+          "cid": "0ab97c321127"
+        },
+        {
+          "action": "collect",
+          "reason": "submit",
+          "fault": "copy",
+          "exit_code": 1,
+          "at": 1788832290.8440542
+        },
+        {
+          "action": "agent_end_hook",
+          "at": 1788832291.2092133
+        },
+        {
+          "action": "collect",
+          "reason": "submit",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832291.2622173
+        },
+        {
+          "action": "collect",
+          "reason": "submit",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832291.2630866
+        },
+        {
+          "action": "collect",
+          "reason": "duplicate_after_trial_cleanup",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832291.6012936
+        }
+      ],
+      "harbor_artifact_hashes": {
+        "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+        "child.txt": "a46e37632fa6ca51a13fe39a567b3c23b28c2f47d8af6be9bd63e030e214ba38",
+        "parent.txt": "a46e37632fa6ca51a13fe39a567b3c23b28c2f47d8af6be9bd63e030e214ba38"
+      },
+      "harbor_artifacts_match_official": true,
+      "independent_verifier": "PASS"
+    }
+  ],
+  "repeat_submit": [
+    {
+      "harbor_artifact_hashes": {
+        "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+        "child.txt": "44c8031cb036a7350d8b9b8603af662a4b9cdbd2f96e8d5de5af435c9c35da69",
+        "parent.txt": "44c8031cb036a7350d8b9b8603af662a4b9cdbd2f96e8d5de5af435c9c35da69"
+      },
+      "harbor_artifacts_match_official": true,
+      "mode": "submit",
+      "passed_checks": true,
+      "harbor_exception": "NonZeroAgentExitCodeError",
+      "harbor_scored": false,
+      "receipt": {
+        "cid": "4ef57810cf0d",
+        "reason": "submit",
+        "requested_at": 1788832425.4352689,
+        "frozen_at": 1788832425.4711654,
+        "status": "collected",
+        "collected_at": 1788832425.9397573,
+        "hashes": {
+          "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+          "child.txt": "44c8031cb036a7350d8b9b8603af662a4b9cdbd2f96e8d5de5af435c9c35da69",
+          "parent.txt": "44c8031cb036a7350d8b9b8603af662a4b9cdbd2f96e8d5de5af435c9c35da69"
+        },
+        "finish": "kill"
+      },
+      "events": [
+        {
+          "action": "agent_start",
+          "at": 1788832424.5089388,
+          "cid": "4ef57810cf0d"
+        },
+        {
+          "action": "agent_end_hook",
+          "at": 1788832425.7089517
+        },
+        {
+          "action": "collect",
+          "reason": "submit",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832425.9651136
+        },
+        {
+          "action": "collect",
+          "reason": "submit",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832425.9659138
+        },
+        {
+          "action": "collect",
+          "reason": "duplicate_after_trial_cleanup",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832426.2558906
+        }
+      ]
+    },
+    {
+      "harbor_artifact_hashes": {
+        "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+        "child.txt": "a46e37632fa6ca51a13fe39a567b3c23b28c2f47d8af6be9bd63e030e214ba38",
+        "parent.txt": "a46e37632fa6ca51a13fe39a567b3c23b28c2f47d8af6be9bd63e030e214ba38"
+      },
+      "harbor_artifacts_match_official": true,
+      "mode": "submit",
+      "passed_checks": true,
+      "harbor_exception": "NonZeroAgentExitCodeError",
+      "harbor_scored": false,
+      "receipt": {
+        "cid": "f8559096bb19",
+        "reason": "submit",
+        "requested_at": 1788832428.1684823,
+        "frozen_at": 1788832428.1918461,
+        "status": "collected",
+        "collected_at": 1788832428.464022,
+        "hashes": {
+          "added.bin": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880",
+          "child.txt": "a46e37632fa6ca51a13fe39a567b3c23b28c2f47d8af6be9bd63e030e214ba38",
+          "parent.txt": "a46e37632fa6ca51a13fe39a567b3c23b28c2f47d8af6be9bd63e030e214ba38"
+        },
+        "finish": "kill"
+      },
+      "events": [
+        {
+          "action": "agent_start",
+          "at": 1788832427.2622201,
+          "cid": "f8559096bb19"
+        },
+        {
+          "action": "agent_end_hook",
+          "at": 1788832428.432906
+        },
+        {
+          "action": "collect",
+          "reason": "submit",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832428.4898179
+        },
+        {
+          "action": "collect",
+          "reason": "submit",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832428.4907107
+        },
+        {
+          "action": "collect",
+          "reason": "duplicate_after_trial_cleanup",
+          "fault": "none",
+          "exit_code": 0,
+          "at": 1788832428.8897426
+        }
+      ]
+    }
+  ],
+  "harbor_version": "0.22.0",
+  "docker_version": "29.6.1",
+  "captured_utc": "2026-09-08T01:55:25.734843+00:00",
+  "setup_attempt": {
+    "status": "prototype setup watchdog expired before agent start",
+    "seconds": 45,
+    "cause": "Harbor egress sidecar image build did not finish within prototype watchdog",
+    "change": "Public Harbor network baseline plus explicit Docker Compose network_mode:none; Harbor allowlist not tested"
+  },
+  "installed_trial_sha256": "35586a7eb1db77e15fc89497f3a5511c888752017626fcc7dce3373ef8b1c467"
+}
