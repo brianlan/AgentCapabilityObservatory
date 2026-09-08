@@ -335,7 +335,7 @@ def recover(conn: sqlite3.Connection, root: Path) -> None:
             else:
                 # copy never completed: cannot prove a timely freeze
                 shutil.rmtree(run_dir, ignore_errors=True)
-                _mark_anomaly(conn, trial_id, run_id,
+                mark_anomaly(conn, trial_id, run_id,
                               "incomplete staging copy: freeze could not be proven")
 
     if answers_root.is_dir():
@@ -374,13 +374,24 @@ def recover(conn: sqlite3.Connection, root: Path) -> None:
     conn.commit()
 
 
-def _mark_anomaly(conn: sqlite3.Connection, trial_id: str, run_id: str, detail: str) -> None:
-    """Record an execution-condition anomaly for a trial that never sealed."""
+def mark_anomaly(conn: sqlite3.Connection, trial_id: str, run_id: str,
+                 detail: str, trigger: str = "exit") -> None:
+    """Record an execution-condition anomaly for a trial that never sealed.
+
+    The receipt stays stable: reuse the submission's receipt when one exists,
+    generate one only for exits with no submission (#14).
+    """
+    if conn.execute("SELECT 1 FROM sealed_answers WHERE trial_id = ?", (trial_id,)).fetchone():
+        return  # already sealed or anomaly recorded: the receipt must not change
+    submission = conn.execute(
+        "SELECT receipt_id FROM submissions WHERE trial_id = ?", (trial_id,)
+    ).fetchone()
+    receipt_id = submission["receipt_id"] if submission else uuid.uuid4().hex
     conn.execute(
         "INSERT INTO sealed_answers (trial_id, run_id, receipt_id, digest, manifest,"
         " seal_trigger, trigger_at, frozen_at, copied_at, published_at, registered_at,"
-        " status, anomaly) VALUES (?, ?, ?, '', ?, 'exit', ?, ?, ?, ?, ?, 'anomaly', ?)",
-        (trial_id, run_id, uuid.uuid4().hex, "{}", utcnow(), utcnow(), utcnow(), utcnow(), utcnow(), detail),
+        " status, anomaly) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, 'anomaly', ?)",
+        (trial_id, run_id, receipt_id, "{}", trigger, utcnow(), utcnow(), utcnow(), utcnow(), utcnow(), detail),
     )
     set_submission_status(conn, trial_id, "error")
 

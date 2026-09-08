@@ -136,6 +136,12 @@ def _seal_after_run(conn: sqlite3.Connection, run: sqlite3.Row, container_id: st
     happens while the container still exists — Harbor's later artifact
     collection is diagnostics only and never the official answer (#14)."""
     if container_id is None:
+        # sealing cannot even be attempted (e.g. timeout before container
+        # discovery): persist an explainable anomaly instead of leaving the
+        # submission in limbo (#14)
+        detail = "sealing skipped: no agent container discovered"
+        artifacts.mark_anomaly(conn, run["trial_id"], run["run_id"], detail, trigger=trigger)
+        runs.add_phase(conn, run["run_id"], "seal_failed", detail=detail)
         return
     try:
         receipt = artifacts.seal(conn, run, container_id, trigger, root, baseline_dir)

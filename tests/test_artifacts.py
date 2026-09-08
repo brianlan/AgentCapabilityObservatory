@@ -250,6 +250,22 @@ class TestSeal:
         assert status["status"] == "error"
         assert conn.execute("SELECT 1 FROM sealed_answers").fetchone() is None
 
+    def test_copy_failure_marks_submission_error(self, conn, trial, tmp_path, fake_container, monkeypatch):
+        workspace, calls = fake_container
+
+        def broken_copy(container_id, container_path, dest):
+            calls["copy"] += 1
+            raise RuntimeError("docker cp failed")
+
+        monkeypatch.setattr(artifacts, "copy_from_container", broken_copy)
+        with pytest.raises(artifacts.SealError, match="freeze failed: docker cp failed"):
+            seal_trial(conn, trial, tmp_path)
+        status = conn.execute("SELECT status FROM submissions WHERE trial_id='t1'").fetchone()
+        assert status["status"] == "error"
+        assert conn.execute("SELECT 1 FROM sealed_answers").fetchone() is None
+        assert not (tmp_path / "answers").exists()
+        assert calls["pause"] == 1  # the freeze was attempted through the boundary
+
     def test_validation_failure_marks_submission_error(self, conn, trial, tmp_path, fake_container):
         workspace, _ = fake_container
         os.symlink("/etc/passwd", workspace / "escape")
@@ -338,8 +354,55 @@ class TestRecover:
         assert sealed["status"] == "anomaly"
         assert "freeze could not be proven" in sealed["anomaly"]
         assert not (tmp_path / "sealing" / trial["run_id"]).exists()
+        # the trial's own receipt is preserved even in the anomaly state
+        assert sealed["receipt_id"] == "r-123"
         status = conn.execute("SELECT status FROM submissions WHERE trial_id='t1'").fetchone()
         assert status["status"] == "error"
+
+    def test_anomaly_generates_receipt_without_submission(self, conn, trial):
+        conn.execute("DELETE FROM submissions")
+        conn.commit()
+        artifacts.mark_anomaly(conn, "t1", trial["run_id"], "no container")
+        sealed = conn.execute("SELECT receipt_id FROM sealed_answers WHERE trial_id='t1'").fetchone()
+        assert sealed["receipt_id"] and len(sealed["receipt_id"]) == 32
+
+    def test_anomaly_is_idempotent(self, conn, trial):
+        artifacts.mark_anomaly(conn, "t1", trial["run_id"], "first")
+        artifacts.mark_anomaly(conn, "t1", trial["run_id"], "second")
+        assert conn.execute("SELECT COUNT(*) FROM sealed_answers").fetchone()[0] == 1
+        sealed = conn.execute("SELECT anomaly FROM sealed_answers WHERE trial_id='t1'").fetchone()
+        assert sealed["anomaly"] == "first"  # the first persisted verdict wins
+
+    def test_receipt_loss_keeps_registered_receipt_stable(self, conn, trial, tmp_path, fake_container):
+        workspace, _ = fake_container
+        (workspace / "answer.txt").write_text("the answer")
+        receipt = seal_trial(conn, trial, tmp_path)
+        conn.execute("DELETE FROM submissions")  # the receipt record is lost
+        conn.commit()
+        artifacts.recover(conn, tmp_path)  # must not invent a new receipt
+        sealed = conn.execute(
+            "SELECT receipt_id, digest, status FROM sealed_answers WHERE trial_id='t1'"
+        ).fetchone()
+        assert sealed["receipt_id"] == receipt["receipt_id"]
+        assert sealed["digest"] == receipt["digest"]
+        assert sealed["status"] == "sealed"
+
+    def test_no_container_persists_anomaly_and_seal_failed(self, conn, trial, tmp_path):
+        from aco import supervisor
+
+        supervisor._seal_after_run(conn, trial, None, "timeout", tmp_path, tmp_path)
+        sealed = conn.execute(
+            "SELECT receipt_id, status, anomaly, seal_trigger FROM sealed_answers WHERE trial_id='t1'"
+        ).fetchone()
+        assert sealed["status"] == "anomaly"
+        assert sealed["seal_trigger"] == "timeout"
+        assert sealed["receipt_id"] == "r-123"
+        assert sealed["anomaly"] == "sealing skipped: no agent container discovered"
+        status = conn.execute("SELECT status FROM submissions WHERE trial_id='t1'").fetchone()
+        assert status["status"] == "error"
+        run = runs.get_run(conn, trial["run_id"])
+        phases = json.loads(run["phases"])
+        assert any(p["event"] == "seal_failed" for p in phases)
 
     def test_published_but_unregistered_is_registered_from_disk(self, conn, trial, tmp_path):
         staging, manifest = self._staging_with_manifest(conn, trial, tmp_path)
