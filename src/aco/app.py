@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import db
+from . import db, runs
 from .models import (
     AssetRef,
     ConfigContent,
@@ -374,6 +374,13 @@ def create_app(data_root: str | None = None) -> FastAPI:
         if row is None:
             raise AppError(404, "not_found", f"trial {trial_id} does not exist")
         return trial_out(row)
+
+    # management path: launch intent, run phases, and raw exit diagnostics
+    @app.get("/v1/trials/{trial_id}/runs")
+    async def get_trial_runs(trial_id: str):
+        if conn.execute("SELECT 1 FROM trials WHERE id = ?", (trial_id,)).fetchone() is None:
+            raise AppError(404, "not_found", f"trial {trial_id} does not exist")
+        return [runs.run_out(row) for row in runs.list_runs(conn, trial_id)]
 
     # management path: mints a trial-scoped token (plaintext returned once)
     @app.post("/v1/trials/{trial_id}/session-token", status_code=201)

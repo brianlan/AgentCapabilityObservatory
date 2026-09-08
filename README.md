@@ -47,3 +47,14 @@ V1 架构规划已完成，尚未进入生产实现。GitHub 的 [ACO V1 架构�
 - `GET /v1/session/submission`：查询结束意图状态（`accepted` / `sealing` / `sealed` / `error`，V1 只有 `accepted`）。
 
 日志与错误响应不包含令牌明文、答案内容或隐藏测试信息。
+
+## 执行：Harbor + 独立监督进程（#13）
+
+FastAPI 进程只保存计划与状态；长运行由独立进程承担：
+
+- **执行管理器**（本机单例，默认单槽）：`/ssd4/envs/aco_py312/bin/python -m aco.execution --data-root data --api-url http://127.0.0.1:8000`。从 SQLite 原子领取 `planned` Trial，先持久化启动意图（`trial_runs` 表），再 spawn 监督子进程； supervisor 死亡会留下启动意图与 `supervisor_lost` 诊断，并按运行标签清理容器。要求 API 服务已启动（通过 HTTP 领取 session token）。
+- **监督进程**：`/ssd4/envs/aco_py312/bin/python -m aco.supervisor --run-id <id> --data-root data`（通常由管理器拉起，不建议手动运行）。用固定版本 Harbor 0.22.0（源 commit `71c39eafbd134d43ae3f489b5e6488b2a157de65`）运行 Trial：只使用公开接入点（`Trial.create`、`add_hook`、`import_path` agent、关闭 verifier、额外 compose 文件）；Harbor 自动评分永久禁用，其原始退出/日志只作诊断，ACO 不读取 Harbor reward 作为正式分数。
+- **运行观测**：`GET /v1/trials/{trial_id}/runs` 返回启动意图（`requested_profile` 冻结不覆盖）、阶段事件、容器关联（含运行时安全摘要：非 privileged、无 docker socket、`network_mode: none`）、原始退出（`exit_kind`/`exit_detail`）与日志目录引用；未观测字段保持 `null`。
+- **假 target**：V1 只执行 `harness: "fake"`（config 版本内容 `{"harness": "fake", "model": "none"}`）。`aco.fake_agent:FakeAgent` 仅供测试（领题 → 写普通文件 → 按指令场景提交/前台退出/后台写入），不代表真实 harness 接入；其他 harness 或模型/provider/skills/credentials 组合显式失败，不静默回退。
+
+e2e 测试（需要本机 Docker）：`/ssd4/envs/aco_py312/bin/python -m pytest tests/e2e`。
