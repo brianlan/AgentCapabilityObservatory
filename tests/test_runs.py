@@ -62,6 +62,20 @@ class TestTranslateProfile:
             with pytest.raises(UnsupportedTarget):
                 translate_profile(profile)
 
+    def test_inference_field_fails_explicitly(self):
+        with pytest.raises(UnsupportedTarget, match="does not support inference"):
+            translate_profile(
+                {"harness": "fake", "model": "none", "inference": {"temperature": 0.7}}
+            )
+
+    def test_unknown_profile_fields_fail_explicitly(self):
+        for profile in (
+            {"harness": "fake", "model": "none", "temperature": 0.7},
+            {"harness": "fake", "model": "none", "unknown_key": "x"},
+        ):
+            with pytest.raises(UnsupportedTarget, match="unsupported target profile field"):
+                translate_profile(profile)
+
 
 class TestRunRecords:
     def test_launch_intent_persisted_before_observation(self, conn):

@@ -33,6 +33,8 @@ FAKE_HARNESS = "fake"
 # the fake target calls no model; anything model-shaped is unsupported, never
 # silently downgraded (issue acceptance: explicit failure)
 FAKE_MODEL_VALUES = {"", "none"}
+# complete accepted fake-profile shape; anything else fails explicitly
+FAKE_KNOWN_KEYS = ("harness", "model", "provider", "skills", "credentials", "inference")
 
 
 class UnsupportedTarget(Exception):
@@ -41,6 +43,12 @@ class UnsupportedTarget(Exception):
 
 def translate_profile(profile: dict) -> int:
     """Return the agent timeout for the fake target or raise UnsupportedTarget."""
+    for key in sorted(profile):
+        if key not in FAKE_KNOWN_KEYS:
+            raise UnsupportedTarget(
+                f"unsupported target profile field {key!r} for {FAKE_HARNESS!r} in V1;"
+                " only a bare fake profile executes"
+            )
     if profile.get("harness") != FAKE_HARNESS:
         raise UnsupportedTarget(
             f"unsupported harness {profile.get('harness')!r}: only {FAKE_HARNESS!r} executes in V1"
@@ -50,7 +58,7 @@ def translate_profile(profile: dict) -> int:
             f"fake target does not support model={profile.get('model')!r};"
             " the fake agent calls no model in V1"
         )
-    for key in ("provider", "skills", "credentials"):
+    for key in ("provider", "skills", "credentials", "inference"):
         if profile.get(key):
             raise UnsupportedTarget(
                 f"fake target does not support {key}={profile.get(key)!r};"
