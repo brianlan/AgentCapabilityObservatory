@@ -74,3 +74,8 @@ class ExperimentOut(BaseModel):
     requested: dict[str, Any]
     created_at: str
     trials: list[TrialOut]
+
+
+class SubmitRequest(BaseModel):
+    answer: Any
+    idempotency_key: str = Field(min_length=1)
