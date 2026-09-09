@@ -7,6 +7,7 @@ runs against a real SQLite database. Real restart-during-execution coverage
 lives in tests/e2e/test_execution.py.
 """
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -14,7 +15,7 @@ import time
 
 import pytest
 
-from aco import db, lifecycle, runs, supervisor, verification
+from aco import artifacts, db, lifecycle, runs, supervisor, verification
 from aco.execution import claim_next_planned, recover_stale_claims, reap_lost_supervisors
 
 
@@ -223,6 +224,171 @@ class TestRestart:
         assert verification.requeue_stuck_running(conn) == 1
         row = conn.execute("SELECT status, started_at FROM verifications WHERE id = 'v1'").fetchone()
         assert row["status"] == "queued" and row["started_at"] is None
+
+
+class TestTerminationRaces:
+    """Deterministic interleavings across separate SQLite connections (#16):
+    submit/cancel/timeout race for one legal termination reason; the loser
+    observes a stable explainable state and never rewrites history."""
+
+    @pytest.fixture()
+    def two_conns(self, tmp_path):
+        conn = db.connect(tmp_path / "aco.db")
+        db.migrate(conn)
+        other = db.connect(tmp_path / "aco.db")  # second process-style connection
+        yield conn, other
+        conn.close()
+        other.close()
+
+    def test_seal_wins_cancel_keeps_official_answer(self, two_conns, monkeypatch):
+        """Seal registered first: cancel stops the run as diagnostics but the
+        trial keeps its official answer, status, and receipt."""
+        conn, other = two_conns
+        make_experiment(conn, n_trials=1)
+        monkeypatch.setattr(supervisor, "cleanup_container", lambda run_id: None)
+        child = subprocess.Popen(["sleep", "30"])
+        run_id = runs.create_run(conn, "t1", {}, supervisor_pid=child.pid)
+        conn.execute("UPDATE trial_runs SET status = 'running' WHERE run_id = ?", (run_id,))
+        conn.execute("UPDATE trials SET status = 'claimed' WHERE id = 't1'")
+        seal_row(conn, "t1", status="sealed", frozen_at="2026-09-09T12:00:10+00:00")
+        conn.commit()
+
+        client = _client_for(conn)
+        summary = client.post("/v1/experiments/e1/cancel").json()
+        child.kill(); child.wait()
+        assert summary == {"status": "cancelled", "cancelled": 0, "stopped": 1, "untouched": 0}
+        # the official answer stands untouched: exactly one answer row, sealed
+        assert conn.execute("SELECT COUNT(*) FROM sealed_answers").fetchone()[0] == 1
+        assert conn.execute("SELECT status FROM sealed_answers WHERE trial_id = 't1'").fetchone()[0] == "sealed"
+        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "claimed"
+        # the in-flight run was still stopped (diagnostic only)
+        assert runs.get_run(conn, run_id)["exit_kind"] == "cancelled"
+
+    def test_cancel_wins_timeout_seal_loses(self, two_conns, monkeypatch):
+        """Cancel registered first: the supervisor's late timeout outcome
+        (seal attempt, verdict, finish) must not create a second answer or
+        rewrite the terminal exit reason."""
+        from datetime import datetime, timedelta, timezone
+
+        conn, other = two_conns
+        make_experiment(conn, n_trials=1)
+        monkeypatch.setattr(supervisor, "cleanup_container", lambda run_id: None)
+        run_id = runs.create_run(conn, "t1", {}, supervisor_pid=-1)
+        conn.execute("UPDATE trial_runs SET status = 'running' WHERE run_id = ?", (run_id,))
+        conn.execute("UPDATE trials SET status = 'claimed' WHERE id = 't1'")
+        conn.commit()
+
+        # cancel wins (API connection)
+        _client_for(conn).post("/v1/experiments/e1/cancel")
+        first = runs.get_run(conn, run_id)
+        receipt_before = conn.execute(
+            "SELECT receipt_id, digest FROM sealed_answers WHERE trial_id = 't1'").fetchone()
+
+        # the supervisor's timeout path lands afterwards (separate connection)
+        runs.add_phase(other, run_id, "trial_timeout")
+        artifacts.mark_anomaly(other, "t1", run_id, "timeout path lost the race", trigger="timeout")
+        verdict = lifecycle.record_timeout_verdict(
+            other, "e1", "t1", run_id,
+            datetime.now(timezone.utc) - timedelta(seconds=5), timedelta(seconds=90))
+        rewritten = runs.finish_run(other, run_id, "error", runs.EXIT_TIMEOUT, "late timeout")
+
+        assert verdict in ("within_tolerance", "over_tolerance")  # recorded, harmless
+        assert rewritten is False  # first legal termination is never rewritten
+        assert runs.get_run(other, run_id)["exit_kind"] == "cancelled"
+        receipt_after = conn.execute(
+            "SELECT receipt_id, digest, status FROM sealed_answers WHERE trial_id = 't1'").fetchone()
+        assert (receipt_after["receipt_id"], receipt_after["digest"]) == \
+               (receipt_before["receipt_id"], receipt_before["digest"])  # stable receipt
+        assert conn.execute("SELECT COUNT(*) FROM sealed_answers").fetchone()[0] == 1
+        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "cancelled"
+
+    def test_submit_accepted_then_cancel_yields_one_reason(self, two_conns, monkeypatch):
+        """Submit accepted, seal never happened, cancel arrives: one terminal
+        reason (diagnostic anomaly), the submission is closed, a repeat of
+        the losing path cannot add a second answer."""
+        conn, other = two_conns
+        make_experiment(conn, n_trials=1)
+        monkeypatch.setattr(supervisor, "cleanup_container", lambda run_id: None)
+        run_id = runs.create_run(conn, "t1", {}, supervisor_pid=-1)
+        conn.execute("UPDATE trial_runs SET status = 'running' WHERE run_id = ?", (run_id,))
+        conn.execute("UPDATE trials SET status = 'claimed' WHERE id = 't1'")
+        conn.commit()
+        client = _client_for(conn)
+        token = client.post("/v1/trials/t1/session-token").json()["token"]
+        resp = client.post("/v1/session/submit", headers={"Authorization": f"Bearer {token}"},
+                           json={"answer": "in flight", "idempotency_key": "k1"})
+        assert resp.status_code == 202  # submit wins the acceptance race
+
+        client.post("/v1/experiments/e1/cancel")  # cancel wins the termination race
+        # losing timeout path repeats afterwards: exactly-once guards hold
+        artifacts.mark_anomaly(other, "t1", run_id, "second attempt", trigger="timeout")
+        assert conn.execute("SELECT COUNT(*) FROM sealed_answers").fetchone()[0] == 1
+        row = conn.execute("SELECT status, anomaly FROM sealed_answers WHERE trial_id = 't1'").fetchone()
+        assert row["status"] == "anomaly" and "cancelled" in row["anomaly"]
+        submission = conn.execute("SELECT status FROM submissions WHERE trial_id = 't1'").fetchone()
+        assert submission["status"] == "error"
+        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "cancelled"
+        assert runs.get_run(conn, run_id)["exit_kind"] == "cancelled"
+
+
+class TestRestartDuringSealing:
+    """Restart while a seal is mid-flight: startup recovery finishes or flags
+    the answer from disk truth and never creates a second run (#16)."""
+
+    def _stage_interrupted_seal(self, conn, root, complete: bool):
+        make_experiment(conn, n_trials=1)
+        child = subprocess.Popen(["sleep", "30"])
+        run_id = runs.create_run(conn, "t1", {}, supervisor_pid=child.pid)
+        child.kill(); child.wait()  # supervisor is dead after the restart
+        conn.execute("UPDATE trials SET status = 'claimed' WHERE id = 't1'")
+        conn.commit()
+        staging = root / "sealing" / run_id / "staging"
+        (staging / "workspace").mkdir(parents=True)
+        (staging / "workspace" / "answer.txt").write_bytes(b"partial run answer")
+        if complete:
+            manifest = artifacts.build_manifest(staging, "t1", run_id, "timeout", None)
+            (staging / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+        return run_id
+
+    @pytest.mark.parametrize("complete,expected_status", [(True, "sealed"), (False, "anomaly")])
+    def test_startup_recovery_is_terminal_without_new_run(self, tmp_path, monkeypatch,
+                                                          complete, expected_status):
+        from aco.execution import startup_recovery
+
+        conn = db.connect(tmp_path / "aco.db")
+        db.migrate(conn)
+        monkeypatch.setattr(supervisor, "cleanup_container", lambda run_id: None)
+        run_id = self._stage_interrupted_seal(conn, tmp_path, complete)
+
+        startup_recovery(conn, tmp_path)  # the exact manager-startup sequence
+
+        runs_rows = conn.execute("SELECT run_id FROM trial_runs WHERE trial_id = 't1'").fetchall()
+        assert len(runs_rows) == 1  # no second run, no rerun
+        trial = conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0]
+        assert trial == "claimed"  # never silently returns to the plan
+        answer = conn.execute(
+            "SELECT status, digest, receipt_id FROM sealed_answers WHERE trial_id = 't1'").fetchone()
+        assert answer["status"] == expected_status
+        if complete:
+            assert answer["digest"] != ""
+            assert (tmp_path / "answers" / answer["digest"]).is_dir()  # published from disk truth
+            # a trial that never submitted has no submissions row; the receipt
+            # still exists on the answer record itself
+            assert conn.execute("SELECT COUNT(*) FROM submissions WHERE trial_id = 't1'").fetchone()[0] in (0, 1)
+        assert claim_next_planned(conn) is None
+        conn.close()
+
+
+def _client_for(conn):
+    """A TestClient bound to the same database file through its own
+    connection, like a second server process."""
+    from pathlib import Path
+
+    from fastapi.testclient import TestClient
+
+    from aco.app import create_app
+    db_file = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    return TestClient(create_app(data_root=str(db_file.parent)))
 
 
 class TestTimeoutVerdict:

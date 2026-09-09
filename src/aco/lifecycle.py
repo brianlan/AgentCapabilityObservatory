@@ -127,9 +127,11 @@ def _stop_run(conn: sqlite3.Connection, run: sqlite3.Row) -> None:
     if sealed is None:
         artifacts.mark_anomaly(conn, trial_id, run["run_id"],
                                "cancelled before the answer was sealed", trigger="exit")
+        conn.execute("UPDATE trials SET status = 'cancelled' WHERE id = ?", (trial_id,))
+    # a sealed answer keeps its official eligibility: the run stops as a
+    # diagnostic, the trial's status and receipt stay untouched
     runs.finish_run(conn, run["run_id"], "error", runs.EXIT_CANCELLED,
                     "cancelled by explicit experiment cancel")
-    conn.execute("UPDATE trials SET status = 'cancelled' WHERE id = ?", (trial_id,))
     experiment_id = conn.execute(
         "SELECT experiment_id FROM trials WHERE id = ?", (trial_id,)
     ).fetchone()["experiment_id"]

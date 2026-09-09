@@ -122,6 +122,19 @@ def run_one(conn, root: Path, api_url: str) -> bool:
     return True
 
 
+def startup_recovery(conn, root: Path) -> None:
+    """One-time reconciliation at manager startup (#16), in order: stale
+    claims (launch intent is authoritative), lost supervisors, interrupted
+    seals from disk truth (#14), adoption of live supervisors, requeue of
+    stuck scoring, and pausing unstarted plans until explicit resume."""
+    recover_stale_claims(conn)
+    reap_lost_supervisors(conn)
+    artifacts.recover(conn, root)
+    lifecycle.adopt_live_supervisors(conn)  # surviving supervisors keep running, never rerun (#16)
+    verification.requeue_stuck_running(conn)  # scoring has no side effects; requeue is safe (#16)
+    lifecycle.pause_unstarted_on_restart(conn)  # unstarted plans wait for explicit resume (#16)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="aco-execution", description=__doc__)
     parser.add_argument("--data-root", required=True)
@@ -141,12 +154,7 @@ def main() -> int:
 
     conn = db.connect(root / "aco.db")
     db.migrate(conn)  # idempotent; manager may start before the API's first migrate
-    recover_stale_claims(conn)
-    reap_lost_supervisors(conn)
-    artifacts.recover(conn, root)  # finish or flag interrupted seals from disk truth (#14)
-    lifecycle.adopt_live_supervisors(conn)  # surviving supervisors keep running, never rerun (#16)
-    verification.requeue_stuck_running(conn)  # scoring has no side effects; requeue is safe (#16)
-    lifecycle.pause_unstarted_on_restart(conn)  # unstarted plans wait for explicit resume (#16)
+    startup_recovery(conn, root)
     print(f"execution manager watching {root}", flush=True)
     while True:
         reap_lost_supervisors(conn)

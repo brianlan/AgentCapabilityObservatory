@@ -89,13 +89,17 @@ def finish_run(
     status: str,
     exit_kind: str,
     exit_detail: str | None = None,
-) -> None:
-    conn.execute(
+) -> bool:
+    """Record the terminal outcome. First legal termination wins (#16): a
+    run already finished or errored is never rewritten by a later
+    finisher (e.g. a supervisor's timeout landing after a cancel)."""
+    cur = conn.execute(
         "UPDATE trial_runs SET status = ?, exit_kind = ?, exit_detail = ?, finished_at = ?"
-        " WHERE run_id = ?",
+        " WHERE run_id = ? AND status IN ('launching', 'running')",
         (status, exit_kind, exit_detail, utcnow(), run_id),
     )
     conn.commit()
+    return cur.rowcount > 0
 
 
 def get_run(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
