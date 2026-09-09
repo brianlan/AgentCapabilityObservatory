@@ -33,3 +33,5 @@ aco = ["migrations/*.sql", "web/templates/*.html"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+# fixture task bundles contain non-pytest test_*.py files; never collect them
+norecursedirs = ["tests/fixtures"]

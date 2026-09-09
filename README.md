@@ -104,3 +104,36 @@ aco resume <experiment-id>
 - **延迟/令牌/费用**：仅当 verifier submetrics 上报时按名称展示均值与样本数（来源：verifier submetrics），未上报显示缺失——不填零、不混入能力分。
 
 测试（含手算分母、覆盖率与上下界的 fixture）：`/ssd4/envs/aco_py312/bin/python -m pytest tests/results tests/web`。
+
+## 独立评分与封存（#14、#15）
+
+正式答案是 ACO 自己经 pause/copy 冻结的 workspace 快照（Harbor 的事后收集仅作诊断）；评分由独立 verifier 容器执行（`--network none --read-only`，封存答案与 verifier bundle 均只读挂载，唯一可写是全新输出目录），每次执行追加一条 `verifications` 记录，错误分类记录、绝不写成 `pass=false`。verifier bundle 以 digest 固定（登记时声明，执行前校验）。
+
+## 任务准入（#20）
+
+题目 bundle 在登记为稳定候选前必须通过准入工具全部门槛（复用正式封存与评分入口，非模拟）：
+
+```bash
+/ssd4/envs/aco_py312/bin/python -m aco.admission admit <bundle-dir> --data-root data
+```
+
+bundle 布局（固定单一布局）：
+
+```
+<bundle>/
+  task.toml                       # schema/name/version/image/verifier/contract/provenance
+  public/environment/workspace/   # agent 可见的初始 workspace
+  private/verifier/               # 可信 verifier bundle（run.py + config.json）
+  private/reference/workspace/    # 参考答案（workspace 覆盖层）
+  private/wrong_answers/<case>/workspace/   # 声明的错误答案（作弊用例）
+```
+
+门槛：静态检查（manifest 完整性、provenance、无符号链接/特殊文件）、泄漏扫描（agent 可见 bundle 与镜像层均不得含隐藏资产内容）、Oracle（参考答案新环境连续 3 次通过且封存内容一致——三次是起步检查，不是确定性证明）、NOP（未修改初始 workspace 必须 0/3）、错误答案全部不得通过、同一封存答案重复评分一致。任何门槛失败即退出码非零，且不登记稳定候选版本。
+
+报告（JSON + Markdown，含每项证据与 task/verifier/environment/contract digest 及 provenance）写入 `<data-root>/admission/`。全部通过后，工具把可信 verifier bundle 导入 `<data-root>/verifiers/<scorer-id>/`（即正式评分路径 `verification.runner` 的加载位置，导入后校验 digest），并经正常 registry 登记 task + scorer 版本（数据库只保存版本、digest、provenance 与报告引用，未新增表）；导入或登记失败不会留下"看似可用"的候选。晋级 Core 必须人工审阅：
+
+```bash
+/ssd4/envs/aco_py312/bin/python -m aco.admission promote <report.json> --to core --reviewed-by <人工审阅人>
+```
+
+公开仓库只包含 `tests/fixtures/tasks/synthetic-add` 合成 fixture（仅用于验证准入工具本身）；私有题目内容（说明、隐藏测试、参考答案）一律放在私有存储，通过本工具在本地准入，不在公开仓库出现。

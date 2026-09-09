@@ -1,0 +1,21 @@
+# Synthetic fixture task bundle — admission-tool test only (#20).
+#
+# Fully synthetic: proves nothing about real tasks and is NOT a leaderboard
+# task. The "task" is: write add(a, b) in solution.py, run it on the sample
+# input (2, 4), and save the output to answer.txt.
+schema = "aco.task-bundle/v1"
+name = "synthetic-add"
+version = "v1"
+image = "python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254"
+
+[verifier]
+entrypoint = ["python", "/verifier/run.py"]
+result_schema = "aco.verification-result/v1"
+
+[contract]
+required_outputs = ["/workspace/answer.txt"]
+
+[provenance]
+source = "synthetic fixture authored for admission-tool tests"
+license = "MIT"
+modifications = "initial authoring; no third-party content"
