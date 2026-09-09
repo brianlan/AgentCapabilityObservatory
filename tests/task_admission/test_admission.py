@@ -324,6 +324,77 @@ def test_idempotent_task_row_survives_registration_failure(bundle, root, monkeyp
     assert not (root / "verifiers" / scorer_id).exists()  # bundle still cleaned up
 
 
+def test_failed_admission_serializes_and_keeps_concurrent_attempt_working(bundle, root, monkeypatch):
+    """Regression (review finding): concurrent admissions of the same
+    content-addressed verifier serialize on a lock file — a failing attempt
+    finishes its rollback (rows + staging) before another attempt can build
+    on its rows or directory, so B always ends with a usable bundle."""
+    import fcntl as fcntl_module
+    import threading
+    from aco.app import AppError, register_version as real_register, version_digest
+    from aco.models import AssetRef
+
+    b = admission.Bundle.load(bundle)
+    events = {"a_staged": threading.Event(), "b_waiting": threading.Event(),
+              "release": threading.Event()}
+    tids = {"a": None, "b": None}
+    reports = {}
+    real_flock = fcntl_module.flock
+
+    def flock_with_signal(file, request):
+        if threading.get_ident() == tids["b"] and request == fcntl_module.LOCK_EX \
+                and not events["b_waiting"].is_set():
+            events["b_waiting"].set()  # B is blocked while A owns the critical section
+        return real_flock(file, request)
+
+    def register_for_interleaving(conn, reg):
+        tid = threading.get_ident()
+        if tid == tids["a"] and reg.kind == "task":
+            result = real_register(conn, reg)  # A's task row (rolled back later)
+            events["a_staged"].set()  # A holds the lock, task row committed
+            events["release"].wait(10)  # failure held back until B is blocked on the lock
+            return result
+        if tid == tids["a"] and reg.kind == "scorer":
+            raise AppError(409, "version_conflict", "injected failure for A")
+        return real_register(conn, reg)
+
+    monkeypatch.setattr(fcntl_module, "flock", flock_with_signal)
+    monkeypatch.setattr(admission, "register_version", register_for_interleaving)
+    patch_containers(monkeypatch, root, lambda gate, index: PASS if gate == "oracle" else FAIL)
+
+    def run(name, expect_ok):
+        tids[name] = threading.get_ident()
+        report = run_report(bundle, root)
+        reports[name] = report
+        assert report["all_passed"] is expect_ok
+
+    thread_a = threading.Thread(target=run, args=("a", False))
+    thread_a.start()
+    assert events["a_staged"].wait(10), "A never reached registration"
+    thread_b = threading.Thread(target=run, args=("b", True))
+    thread_b.start()
+    assert events["b_waiting"].wait(10), "B never blocked on the admission lock"
+    events["release"].set()  # A fails, rolls back, unlocks; then B proceeds
+    thread_a.join(30)
+    thread_b.join(30)
+    assert not thread_a.is_alive() and not thread_b.is_alive()
+    assert reports["a"]["gates"]["registration"]["ok"] is False
+    assert "registry rejected" in reports["a"]["gates"]["registration"]["detail"]
+
+    bundle_digest = runner_bundle_digest(b.verifier_bundle)
+    scorer_id = version_digest(
+        "scorer", f"{b.manifest['name']}-verifier", b.manifest["version"],
+        b.verifier.model_dump(), [AssetRef(name="bundle", digest=bundle_digest)])
+    published = root / "verifiers" / scorer_id
+    assert published.is_dir(), "concurrent admission lost its verifier bundle"
+    assert runner_bundle_digest(published) == bundle_digest
+    conn = sqlite3.connect(root / "aco.db")
+    rows = sorted(conn.execute("SELECT kind, name FROM versions").fetchall())
+    conn.close()
+    assert rows == sorted([("task", b.manifest["name"]),
+                           ("scorer", f"{b.manifest['name']}-verifier")])  # B's rows only
+
+
 def test_admission_leaves_verifier_bundle_usable_for_runtime(bundle, root, monkeypatch):
     """A successful admission must leave the trusted verifier bundle where
     verification.runner loads it, with a digest matching the registered asset."""

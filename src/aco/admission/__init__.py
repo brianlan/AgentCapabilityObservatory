@@ -33,6 +33,7 @@ all-passed report and an explicit --reviewed-by human name.
 """
 
 import argparse
+import fcntl  # POSIX: serializes concurrent admissions of one scorer id
 import hashlib
 import os
 import uuid
@@ -472,18 +473,30 @@ def run_admission(bundle_path: Path, data_root: Path) -> dict:
     return report
 
 
+def _rollback_candidate(conn, created_rows: list[str], staging: Path) -> None:
+    """Failure atomicity: remove this attempt's private staging directory and
+    roll back exactly the rows its register_version calls inserted (201);
+    rows returned idempotently (200) are never touched."""
+    with conn:
+        for row_id in created_rows:
+            conn.execute("DELETE FROM versions WHERE id = ?", (row_id,))
+    shutil.rmtree(staging, ignore_errors=True)
+
+
 def _register_candidate(conn, bundle: Bundle, data_root: Path,
                         verifier_bundle_digest: str, environment_digest: str) -> dict:
-    """Import the trusted verifier bundle into the runtime data root and
+    """Stage the trusted verifier bundle into the runtime data root and
     register the task and scorer versions through the normal registry.
 
     The DB keeps only versions, digests, provenance, and a report reference;
     the executable bundle goes to verifiers/<scorer_id> — exactly where
-    verification.runner loads it. Any failure leaves no apparently usable
-    candidate: the bundle digest is verified before registration, and a
-    failed attempt removes the imported bundle plus exactly the version rows
-    its register_version calls inserted (status 201); rows returned
-    idempotently (status 200) are never touched.
+    verification.runner loads it. The bundle is staged in a private
+    directory and published with one atomic rename only after a fully
+    successful registration, so a failed attempt never removes a directory
+    another admission may already be using. Any failure leaves no apparently
+    usable candidate: staging and exactly the version rows this attempt
+    inserted (status 201) are removed; rows returned idempotently (200) are
+    never touched.
     """
     scorer_name = f"{bundle.manifest['name']}-verifier"
     scorer_version = bundle.manifest["version"]
@@ -495,35 +508,41 @@ def _register_candidate(conn, bundle: Bundle, data_root: Path,
         | {"admission": "stable-candidate", "admission_report_dir": "admission/"}
     task_assets = [AssetRef(name="verifier_bundle", digest=verifier_bundle_digest),
                    AssetRef(name="environment", digest=environment_digest)]
-    # the version id is deterministic (content-addressed), so the bundle can
-    # be imported before registration and removed again if registration fails
+    # the version id is deterministic (content-addressed): identical bundles
+    # converge on the same destination directory, so concurrent admissions of
+    # the same scorer id serialize on a lock file — a failing attempt finishes
+    # its rollback before another attempt can build on its rows or directory
     scorer_id = version_digest("scorer", scorer_name, scorer_version,
                                scorer_content, scorer_assets)
     dest = data_root / "verifiers" / scorer_id
-    created = False
-    if dest.is_dir():
-        if runner.bundle_digest(dest) != verifier_bundle_digest:
-            raise AdmissionError(f"verifier bundle already present with different content: {dest}")
-    else:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        staging = dest.parent / f".import-{uuid.uuid4().hex}"
-        shutil.copytree(bundle.verifier_bundle, staging)
+    lock_path = data_root / "verifiers" / f".{scorer_id}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
-            os.replace(staging, dest)  # same filesystem by construction
-        except OSError:
-            shutil.rmtree(staging, ignore_errors=True)
-            raise
-        created = True
-    if runner.bundle_digest(dest) != verifier_bundle_digest:
-        if created:
-            shutil.rmtree(dest, ignore_errors=True)
-        raise AdmissionError("imported verifier bundle digest mismatch")
-    # register_version returns 201 only when the call itself inserted the row,
-    # so rollback can be scoped exactly to this attempt's inserts: rows that
-    # already existed (idempotent re-admission or a concurrent identical
-    # registration) come back as 200 and are never deleted
+            _register_candidate_locked(
+                conn, bundle, verifier_bundle_digest, environment_digest,
+                scorer_name, scorer_version, scorer_content, scorer_assets,
+                task_name, task_version, task_content, task_assets, dest)
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _register_candidate_locked(conn, bundle: Bundle, verifier_bundle_digest: str,
+                               environment_digest: str, scorer_name: str,
+                               scorer_version: str, scorer_content: dict,
+                               scorer_assets: list, task_name: str, task_version: str,
+                               task_content: dict, task_assets: list,
+                               dest: Path) -> dict:
+    if dest.is_dir() and runner.bundle_digest(dest) != verifier_bundle_digest:
+        raise AdmissionError(f"verifier bundle already present with different content: {dest}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging = dest.parent / f".import-{uuid.uuid4().hex}"
+    shutil.copytree(bundle.verifier_bundle, staging)
     created_rows: list[str] = []
     try:
+        if runner.bundle_digest(staging) != verifier_bundle_digest:
+            raise AdmissionError("imported verifier bundle digest mismatch")
         task_record, status = register_version(conn, VersionRegistration(
             kind="task", name=task_name, version=task_version,
             content=task_content, assets=task_assets))
@@ -534,13 +553,21 @@ def _register_candidate(conn, bundle: Bundle, data_root: Path,
             content=scorer_content, assets=scorer_assets))
         if status == 201:
             created_rows.append(scorer_record["id"])
+        try:
+            os.replace(staging, dest)  # atomic publish; same filesystem by construction
+        except OSError:
+            # a previous attempt already published the same content-addressed
+            # bundle; its directory is identical, so discard our staging copy
+            if runner.bundle_digest(dest) != verifier_bundle_digest:
+                raise AdmissionError(
+                    f"verifier bundle already present with different content: {dest}")
+            shutil.rmtree(staging, ignore_errors=True)
     except AppError as exc:
-        with conn:  # roll the partial registration back, atomically
-            for row_id in created_rows:  # 201-inserts only, see above
-                conn.execute("DELETE FROM versions WHERE id = ?", (row_id,))
-        if created:
-            shutil.rmtree(dest, ignore_errors=True)
+        _rollback_candidate(conn, created_rows, staging)
         raise AdmissionError(f"registry rejected the candidate: {exc.message}") from exc
+    except AdmissionError:
+        _rollback_candidate(conn, created_rows, staging)
+        raise
     return {"version_id": task_record["id"], "scorer_id": scorer_record["id"]}
 
 
