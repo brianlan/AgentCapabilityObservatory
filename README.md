@@ -65,7 +65,7 @@ e2e 测试（需要本机 Docker）：`/ssd4/envs/aco_py312/bin/python -m pytest
 
 ```bash
 # 安装后使用（console script）
-/ssd4/envs/aco_py312/bin/python -m pip install -e . && aco --api-url http://127.0.0.1:8000 --help
+/ssd4/envs/aco_py312/bin/python -m pip install -e . && aco run --api-url http://127.0.0.1:8000 --help
 # 免安装运行
 /ssd4/envs/aco_py312/bin/python -m aco.cli --help   # 或 PYTHONPATH=src python -m aco.cli
 
