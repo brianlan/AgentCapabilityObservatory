@@ -16,7 +16,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from . import artifacts, db, runs
+from . import artifacts, db, runs, verification
 from .supervisor import cleanup_container
 
 POLL_INTERVAL_SEC = 1.0
@@ -145,7 +145,11 @@ def main() -> int:
     print(f"execution manager watching {root}", flush=True)
     while True:
         reap_lost_supervisors(conn)
-        if not run_one(conn, root, args.api_url):
+        # verifications first: re-scoring stays responsive even while a long
+        # trial run blocks the single loop (one of each per iteration)
+        handled = verification.run_pending(conn, root)
+        handled = run_one(conn, root, args.api_url) or handled
+        if not handled:
             time.sleep(POLL_INTERVAL_SEC)
 
 

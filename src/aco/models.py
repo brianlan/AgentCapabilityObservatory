@@ -2,7 +2,7 @@
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class VersionRef(BaseModel):
@@ -78,4 +78,29 @@ class ExperimentOut(BaseModel):
 
 class SubmitRequest(BaseModel):
     answer: Any
+    idempotency_key: str = Field(min_length=1)
+
+
+class ScorerContent(BaseModel):
+    """Verifier bundle contract: digest-pinned image, entrypoint, and the
+    machine-readable result schema the bundle must emit (#15)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    image: str  # must be digest-pinned: name@sha256:...
+    entrypoint: list[str] = Field(min_length=1)
+    result_schema: str = Field(min_length=1)
+
+    @field_validator("image")
+    @classmethod
+    def _digest_pinned(cls, value: str) -> str:
+        if "@sha256:" not in value:
+            raise ValueError("image must be digest-pinned (name@sha256:...)")
+        return value
+
+
+class VerificationCreate(BaseModel):
+    """Create a scoring job for the trial's registered Sealed Answer."""
+
+    verifier: VersionRef
     idempotency_key: str = Field(min_length=1)

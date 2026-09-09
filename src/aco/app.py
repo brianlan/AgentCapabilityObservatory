@@ -21,6 +21,7 @@ from .models import (
     ConfigContent,
     ExperimentCreate,
     ExperimentOut,
+    ScorerContent,
     SubmitRequest,
     SuiteContent,
     TrialOut,
@@ -99,6 +100,11 @@ def register_version(conn: sqlite3.Connection, reg: VersionRegistration) -> tupl
             ConfigContent.model_validate(reg.content)
         except ValueError as exc:
             raise AppError(422, "invalid_content", f"config content invalid: {exc}") from exc
+    elif reg.kind == "scorer":
+        try:
+            ScorerContent.model_validate(reg.content)
+        except ValueError as exc:
+            raise AppError(422, "invalid_content", f"scorer content invalid: {exc}") from exc
 
     digest = version_digest(reg.kind, reg.name, reg.version, reg.content, reg.assets)
     row = fetch_version(conn, reg.kind, reg.name, reg.version)
@@ -334,6 +340,10 @@ def create_app(data_root: str | None = None) -> FastAPI:
     conn = db.connect(root / "aco.db")
     db.migrate(conn)
 
+    # imported here, not at module top: the routes module imports AppError
+    # and canonical from this module
+    from .api.verifications import register_routes
+
     app = FastAPI(title="Agent Capability Observatory", version="0.1.0")
 
     @app.exception_handler(AppError)
@@ -404,6 +414,9 @@ def create_app(data_root: str | None = None) -> FastAPI:
     @app.get("/v1/session/submission")
     async def get_session_submission(request: Request):
         return session_submission(conn, trial_from_token(conn, request))
+
+    # management path: independent scoring of the sealed answer (#15)
+    register_routes(app, conn)
 
     return app
 
