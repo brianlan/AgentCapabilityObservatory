@@ -1,8 +1,9 @@
 """Pydantic request/response models. OpenAPI is generated from these."""
 
+import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class VersionRef(BaseModel):
@@ -78,4 +79,34 @@ class ExperimentOut(BaseModel):
 
 class SubmitRequest(BaseModel):
     answer: Any
+    idempotency_key: str = Field(min_length=1)
+
+
+# ponytail: no registry-with-port support in the repo pattern (localhost:5000/x);
+# widen the character class if a private registry ever needs it
+_IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$")
+
+
+class ScorerContent(BaseModel):
+    """Verifier bundle contract: digest-pinned image, entrypoint, and the
+    machine-readable result schema the bundle must emit (#15)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    image: str  # anchored digest-pinned reference: repo@sha256:<64 hex>
+    entrypoint: list[str] = Field(min_length=1)
+    result_schema: str = Field(min_length=1)
+
+    @field_validator("image")
+    @classmethod
+    def _digest_pinned(cls, value: str) -> str:
+        if not _IMAGE_RE.match(value):
+            raise ValueError("image must be digest-pinned (repo@sha256:<64 hex>)")
+        return value
+
+
+class VerificationCreate(BaseModel):
+    """Create a scoring job for the trial's registered Sealed Answer."""
+
+    verifier: VersionRef
     idempotency_key: str = Field(min_length=1)

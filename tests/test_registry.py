@@ -17,8 +17,11 @@ def test_register_task_computes_content_digest(client, register):
 
 
 def test_register_idempotent_for_same_content(client, register):
-    first = register("scorer", "exact-match", "v1", {"matcher": "exact"})
-    second = register("scorer", "exact-match", "v1", {"matcher": "exact"})
+    content = {"image": "python@sha256:" + "0" * 64,
+               "entrypoint": ["python", "/verifier/run.py"],
+               "result_schema": "aco.verification-result/v1"}
+    first = register("scorer", "exact-match", "v1", content)
+    second = register("scorer", "exact-match", "v1", content)
     assert second.status_code == 200
     assert second.json()["id"] == first.json()["id"]
 
