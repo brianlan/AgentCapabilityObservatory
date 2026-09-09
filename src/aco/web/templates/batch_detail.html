@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}批次 {{ experiment.id[:8] }} · ACO 管理面板{% endblock %}
+{% block breadcrumb %}<li><a href="/dashboard/experiments/{{ experiment.id }}" aria-current="page">批次 {{ experiment.id[:8] }}</a></li>{% endblock %}
+{% block content %}
+<h1>批次 {{ experiment.id[:8] }} <span class="badge badge-{{ experiment.status }}">{{ experiment.status }}</span></h1>
+<p>创建于 {{ experiment.created_at }}，全部 {{ trials | length }} 个试验。完整请求记录：</p>
+<pre>{{ experiment.requested | tojson(indent=2) }}</pre>
+<table>
+  <caption>试验计划与执行进度</caption>
+  <thead>
+    <tr>
+      <th scope="col">序号</th><th scope="col">重复</th><th scope="col">任务</th>
+      <th scope="col">目标配置</th><th scope="col">状态</th><th scope="col">封存</th>
+      <th scope="col">评分记录</th><th scope="col">详情</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for t in trials %}
+    <tr>
+      <td>{{ t.plan_order }}</td>
+      <td>{{ t.repetition }}</td>
+      <td>{{ t.task }}</td>
+      <td>{{ t.config }}</td>
+      <td><span class="badge badge-{{ t.status }}">{{ t.status }}</span></td>
+      <td>{% if t.seal %}<span class="badge badge-{{ t.seal }}">{{ t.seal }}</span>{% else %}<span class="unknown">未封存</span>{% endif %}</td>
+      <td>{{ t.verifications.succeeded }} 成功 / {{ t.verifications.error }} 错误 / {{ t.verifications.open }} 进行中（共 {{ t.verifications.total }}）</td>
+      <td><a href="/dashboard/trials/{{ t.id }}">查看证据链</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

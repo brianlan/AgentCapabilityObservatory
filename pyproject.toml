@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "harbor==0.22.0",
+    "jinja2>=3.1",
     "pydantic>=2.7",
     "uvicorn>=0.30",
 ]
@@ -24,7 +25,7 @@ test = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-aco = ["migrations/*.sql"]
+aco = ["migrations/*.sql", "web/templates/*.html"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

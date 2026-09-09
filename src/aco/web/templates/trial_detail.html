@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}试验 {{ t.id[:8] }} · ACO 管理面板{% endblock %}
+{% block breadcrumb %}<li><a href="/dashboard/experiments/{{ t.experiment_id }}">批次 {{ t.experiment_id[:8] }}</a></li>
+<li><a href="/dashboard/trials/{{ t.id }}" aria-current="page">试验 {{ t.id[:8] }}</a></li>{% endblock %}
+{% block content %}
+<h1>试验 {{ t.id[:8] }} <span class="badge badge-{{ t.status }}">{{ t.status }}</span></h1>
+
+<section aria-labelledby="h-eligibility">
+<h2 id="h-eligibility">资格</h2>
+{% if t.seal is none %}
+  <p><span class="unknown">未封存</span>：尚无官方答案，无法参与评分。</p>
+{% elif t.seal.status == 'sealed' %}
+  <p>执行条件合格（已封存）：官方答案有效，可参与评分与能力统计。</p>
+{% else %}
+  <p>执行条件异常（不计入能力曲线）：{{ t.seal.anomaly or '未知原因' }}</p>
+{% endif %}
+</section>
+
+<section aria-labelledby="h-timeline">
+<h2 id="h-timeline">时间线</h2>
+<dl class="timeline">
+  {% for label, at in t.timeline %}
+  <dt>{{ label }}</dt>
+  <dd>{% if at %}{{ at }}{% else %}<span class="unknown">未知（未发生）</span>{% endif %}</dd>
+  {% endfor %}
+</dl>
+</section>
+
+<section aria-labelledby="h-requested">
+<h2 id="h-requested">请求配置（计划快照）</h2>
+<p>任务 <strong>{{ t.task.name }}@{{ t.task.version }}</strong>，目标配置 <strong>{{ t.config.name }}@{{ t.config.version }}</strong>，重复第 {{ t.repetition }} 次。</p>
+<pre>{{ t.requested }}</pre>
+<p>provider 内部的模型/身份信息不在本记录中，页面不展示也无法证明。</p>
+</section>
+
+<section aria-labelledby="h-runs">
+<h2 id="h-runs">运行观测</h2>
+{% if not t.runs %}<p><span class="unknown">未知（尚未启动运行）</span></p>{% endif %}
+{% for r in t.runs %}
+<article>
+  <h3>运行 {{ r.run_id[:8] }} <span class="badge badge-{{ r.status }}">{{ r.status }}</span></h3>
+  <p>启动 {{ r.launched_at or '未知' }}，结束 {{ r.finished_at or '未知' }}</p>
+  <table>
+    <caption>请求侧与观测侧对照</caption>
+    <thead><tr><th scope="col">项目</th><th scope="col">观测值</th></tr></thead>
+    <tbody>
+      {% for label, value in r.observed %}
+      <tr><th scope="row">{{ label }}</th><td>{% if value %}{{ value }}{% else %}<span class="unknown">未知</span>{% endif %}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p>请求侧启动配置：</p>
+  <pre>{{ r.requested_profile }}</pre>
+  {% if r.phases %}
+  <table>
+    <caption>运行阶段事件</caption>
+    <thead><tr><th scope="col">事件</th><th scope="col">时间</th><th scope="col">详情</th></tr></thead>
+    <tbody>
+      {% for p in r.phases %}
+      <tr><td>{{ p.event }}</td><td>{{ p.at }}</td><td>{{ p.get('detail') or '' }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+  <p>退出：{% if r.exit_kind %}{{ r.exit_kind }}{% else %}<span class="unknown">未知</span>{% endif %}
+     {% if r.exit_detail %}（{{ r.exit_detail }}）{% endif %}
+     {% if r.log_dir %}日志：{{ r.log_dir }}{% endif %}</p>
+</article>
+{% endfor %}
+</section>
+
+<section aria-labelledby="h-sealed">
+<h2 id="h-sealed">封存答案</h2>
+{% if t.seal is none %}
+<p><span class="unknown">未封存</span></p>
+{% else %}
+<p>摘要 <code>{{ t.seal.digest }}</code>（<span class="badge badge-{{ t.seal.status }}">{{ t.seal.status }}</span>），
+   封存触发 {{ t.seal.seal_trigger }}，回执 <code>{{ t.seal.receipt_id }}</code>。</p>
+{% if t.seal.status == 'anomaly' %}<p>异常说明：{{ t.seal.anomaly or '未知' }}</p>{% endif %}
+<table>
+  <caption>封存清单（manifest 文件）</caption>
+  <thead><tr><th scope="col">路径</th><th scope="col">字节数</th><th scope="col">类型</th><th scope="col">SHA-256</th></tr></thead>
+  <tbody>
+    {% for f in t.manifest_files %}
+    <tr><td>{{ f.path }}</td><td>{{ f.bytes }}</td><td>{{ f.type }}</td><td><code>{{ f.sha256[:16] }}…</code></td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p>
+  <a href="/dashboard/artifacts/answers/{{ t.seal.digest }}/manifest">下载 manifest（按 ID）</a>
+  {% if t.patch_available %} · <a href="/dashboard/artifacts/trials/{{ t.id }}/patch">下载诊断 patch（按 ID）</a>{% endif %}
+</p>
+<pre>{{ t.manifest_changes | tojson(indent=2) }}</pre>
+{% endif %}
+</section>
+
+<section aria-labelledby="h-verifications">
+<h2 id="h-verifications">评分历史（全部记录，不按最高分筛选）</h2>
+{% if not t.verifications %}
+<p><span class="unknown">无评分记录</span></p>
+{% else %}
+<table>
+  <caption>该试验的每次评分尝试与结果</caption>
+  <thead>
+    <tr>
+      <th scope="col">评分器</th><th scope="col">状态</th><th scope="col">结果</th>
+      <th scope="col">子指标</th><th scope="col">错误</th><th scope="col">结果一致</th>
+      <th scope="col">开始</th><th scope="col">结束</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for v in t.verifications %}
+    <tr>
+      <td>{{ v.verifier.name }}@{{ v.verifier.version }}</td>
+      <td><span class="badge badge-{{ v.status }}">{{ v.status }}</span></td>
+      <td>{% if v.status == 'succeeded' %}{{ '通过' if v.pass else '未通过' }}{% else %}<span class="unknown">未知（无有效判定）</span>{% endif %}</td>
+      <td>{% if v.submetrics %}{{ v.submetrics | tojson }}{% else %}<span class="unknown">未知</span>{% endif %}</td>
+      <td>{% if v.error_kind %}{{ v.error_kind }}: {{ v.error_detail }}{% else %}—{% endif %}</td>
+      <td>{% if v.stable %}是{% else %}否（同版本评分结果冲突，需人工核查）{% endif %}</td>
+      <td>{{ v.started_at or '未知' }}</td>
+      <td>{{ v.finished_at or '未知' }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+</section>
+{% endblock %}
