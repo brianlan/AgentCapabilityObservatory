@@ -16,7 +16,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from . import artifacts, db, runs, verification
+from . import artifacts, db, lifecycle, runs, verification
 from .supervisor import cleanup_container
 
 POLL_INTERVAL_SEC = 1.0
@@ -37,10 +37,12 @@ def mint_token(api_url: str, trial_id: str) -> str | None:
 
 
 def claim_next_planned(conn) -> str | None:
-    """Atomically move the oldest planned trial to claimed; single winner."""
+    """Atomically move the oldest planned trial of a planned experiment to
+    claimed; single winner. Paused/cancelled experiments never start work."""
     row = conn.execute(
         "UPDATE trials SET status = 'claimed'"
-        " WHERE id = (SELECT id FROM trials WHERE status = 'planned' ORDER BY rowid LIMIT 1)"
+        " WHERE id = (SELECT t.id FROM trials t JOIN experiments e ON e.id = t.experiment_id"
+        "             WHERE t.status = 'planned' AND e.status = 'planned' ORDER BY t.rowid LIMIT 1)"
         " RETURNING id"
     ).fetchone()
     conn.commit()
@@ -142,6 +144,9 @@ def main() -> int:
     recover_stale_claims(conn)
     reap_lost_supervisors(conn)
     artifacts.recover(conn, root)  # finish or flag interrupted seals from disk truth (#14)
+    lifecycle.adopt_live_supervisors(conn)  # surviving supervisors keep running, never rerun (#16)
+    verification.requeue_stuck_running(conn)  # scoring has no side effects; requeue is safe (#16)
+    lifecycle.pause_unstarted_on_restart(conn)  # unstarted plans wait for explicit resume (#16)
     print(f"execution manager watching {root}", flush=True)
     while True:
         reap_lost_supervisors(conn)

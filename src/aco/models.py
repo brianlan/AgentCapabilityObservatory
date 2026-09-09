@@ -75,6 +75,7 @@ class ExperimentOut(BaseModel):
     requested: dict[str, Any]
     created_at: str
     trials: list[TrialOut]
+    progress: dict[str, int]  # plan/cancel/anomaly coverage counts (#16)
 
 
 class SubmitRequest(BaseModel):

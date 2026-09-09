@@ -15,7 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import db, runs
+from . import db, lifecycle, runs
 from .models import (
     AssetRef,
     ConfigContent,
@@ -220,6 +220,7 @@ def get_experiment(conn: sqlite3.Connection, experiment_id: str) -> dict:
         requested=json.loads(row["requested"]),
         created_at=row["created_at"],
         trials=[TrialOut(**trial_out(t)) for t in trials],
+        progress=lifecycle.progress(conn, experiment_id),
     ).model_dump()
 
 
@@ -289,6 +290,10 @@ def claim_session_task(conn: sqlite3.Connection, trial: sqlite3.Row) -> dict:
 
 
 def submit_session(conn: sqlite3.Connection, trial: sqlite3.Row, req: SubmitRequest) -> tuple[int, dict]:
+    # a late submit can never extend a deadline or revive a cancelled trial (#16)
+    if trial["status"] == "cancelled":
+        logger.info("session_submit_rejected_cancelled trial_id=%s", trial["id"])
+        raise AppError(409, "trial_cancelled", "this trial was explicitly cancelled")
     request_digest = hashlib.sha256(
         canonical({"answer": req.answer, "idempotency_key": req.idempotency_key}).encode()
     ).hexdigest()
@@ -381,6 +386,17 @@ def create_app(data_root: str | None = None) -> FastAPI:
     @app.get("/v1/experiments/{experiment_id}", response_model=ExperimentOut)
     async def get_experiment_route(experiment_id: str):
         return get_experiment(conn, experiment_id)
+
+    # management path: explicit, persistent, idempotent plan changes (#16)
+    @app.post("/v1/experiments/{experiment_id}/cancel")
+    async def cancel_experiment_route(experiment_id: str):
+        status_code, summary = lifecycle.cancel_experiment(conn, experiment_id)
+        return JSONResponse(status_code=status_code, content=summary)
+
+    @app.post("/v1/experiments/{experiment_id}/resume")
+    async def resume_experiment_route(experiment_id: str):
+        status_code, body = lifecycle.resume_experiment(conn, experiment_id)
+        return JSONResponse(status_code=status_code, content=body)
 
     @app.get("/v1/trials/{trial_id}", response_model=TrialOut)
     async def get_trial(trial_id: str):

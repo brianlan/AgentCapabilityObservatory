@@ -17,6 +17,7 @@ EXIT_AGENT_ERROR = "agent_error"
 EXIT_TIMEOUT = "timeout"
 EXIT_SUPERVISOR_LOST = "supervisor_lost"
 EXIT_UNSUPPORTED_TARGET = "unsupported_target"
+EXIT_CANCELLED = "cancelled"
 
 
 def new_run_id() -> str:
@@ -56,7 +57,7 @@ def mark_running(
     conn.commit()
 
 
-def add_phase(conn: sqlite3.Connection, run_id: str, event: str, **detail) -> None:
+def add_phase(conn: sqlite3.Connection, run_id: str, event: str, **detail) -> dict:
     row = conn.execute("SELECT phases FROM trial_runs WHERE run_id = ?", (run_id,)).fetchone()
     phases = json.loads(row["phases"]) if row["phases"] else []
     entry = {"event": event, "at": utcnow(), **detail}
@@ -64,6 +65,7 @@ def add_phase(conn: sqlite3.Connection, run_id: str, event: str, **detail) -> No
     conn.execute("UPDATE trial_runs SET phases = ? WHERE run_id = ?",
                  (json.dumps(phases), run_id))
     conn.commit()
+    return entry
 
 
 def observe_run(
