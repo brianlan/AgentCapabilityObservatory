@@ -18,8 +18,6 @@ from .client import ApiError, ApiUnavailable, Client
 DEFAULT_API_URL = "http://127.0.0.1:8000"
 POLL_INTERVAL = 2.0
 
-VERSION_KINDS = ("task", "suite", "config", "scorer")
-
 
 def state_file() -> Path:
     """Local run ledger for --idempotency-key replays (key -> experiment id)."""
@@ -84,6 +82,8 @@ def cmd_run(args) -> int:
         previous = load_state().get(args.idempotency_key)
         if previous:
             _, experiment = client.get(f"/v1/experiments/{previous}")
+            if args.wait:
+                return wait_loop(client, experiment, args)
             if args.json:
                 emit(args, experiment)
             else:
@@ -109,6 +109,8 @@ def cmd_run(args) -> int:
         save_state(state)
 
     if args.json:
+        if args.wait:
+            return wait_loop(client, experiment, args)  # emits the single terminal document
         emit(args, experiment)
     else:
         print(f"Experiment {experiment['id']}（{len(experiment['trials'])} 个样本，服务端异步执行）")
@@ -119,22 +121,30 @@ def cmd_run(args) -> int:
 
 def wait_loop(client: Client, experiment: dict, args) -> int:
     """Poll progress until every trial has a terminal answer. Ctrl-C only
-    stops the local watcher — it never sends a cancel request."""
+    stops the local watcher — it never sends a cancel request.
+
+    JSON contract: stdout carries exactly ONE machine-readable JSON document
+    (the last observed experiment state, on normal completion or Ctrl-C);
+    progress lines and the interruption notice go to stderr. Human mode
+    prints everything to stdout."""
     exp_id = experiment["id"]
+    stream = sys.stderr if args.json else sys.stdout
     try:
         while True:
-            if args.json:
-                emit(args, experiment)
-            else:
-                print(progress_line(experiment))
+            print(progress_line(experiment), file=stream)
             if finished(experiment):
-                return 0
+                break
             time.sleep(POLL_INTERVAL)
             _, experiment = client.get(f"/v1/experiments/{exp_id}")
     except KeyboardInterrupt:
         print(f"\n已停止等待（本地查看已退出）。批次 {exp_id} 仍在服务端运行；"
-              f"如需取消请显式执行: aco cancel {exp_id}")
-        return 130
+              f"如需取消请显式执行: aco cancel {exp_id}", file=stream)
+        code = 130
+    else:
+        code = 0
+    if args.json:
+        emit(args, experiment)  # stdout: a single parseable JSON document
+    return code
 
 
 def cmd_status(args) -> int:
@@ -180,8 +190,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aco", description="ACO 评测管理 CLI（API 客户端）")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("register", parents=[common], help="登记一个版本（task/suite/config/scorer）")
-    p.add_argument("kind", choices=VERSION_KINDS)
+    p = sub.add_parser("register", parents=[common],
+                       help="登记一个版本（task/suite/config/scorer）")
+    p.add_argument("kind", choices=("task", "suite", "config", "scorer"))
     p.add_argument("name")
     p.add_argument("version")
     p.add_argument("file", help="内容 JSON 文件路径")

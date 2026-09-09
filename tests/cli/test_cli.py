@@ -172,6 +172,64 @@ def test_ctrl_c_stops_watcher_without_cancelling(api, state, tmp_path, capsys, m
     real_sleep(0)
 
 
+def test_wait_json_stdout_is_single_parseable_document(api, state, tmp_path, capsys, monkeypatch):
+    """--wait --json: stdout carries exactly one JSON value even across polls
+    and a Ctrl-C interruption; progress and the notice stay on stderr."""
+    write(tmp_path, "t.json", {"prompt": "WJ", "tests": []})
+    write(tmp_path, "c.json", {"harness": "fake", "model": "fake-model"})
+    main(["register", "task", "wj-task", "v1", str(tmp_path / "t.json"), "--api-url", api])
+    main(["register", "config", "wj-cfg", "v1", str(tmp_path / "c.json"), "--api-url", api])
+    main(["run", "--task", "wj-task@v1", "--target", "wj-cfg@v1", "--api-url", api])
+    capsys.readouterr()
+    # register/run above print human lines; --wait --json itself must not
+
+    real_sleep = time.sleep
+    calls = {"n": 0}
+
+    def one_poll_then_interrupt(_seconds):
+        calls["n"] += 1
+        if calls["n"] >= 2:  # first sleep passes → one real GET poll happens
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("aco.cli.time.sleep", one_poll_then_interrupt)
+    assert main(["run", "--task", "wj-task@v1", "--target", "wj-cfg@v1",
+                 "--api-url", api, "--wait", "--json"]) == 130
+    captured = capsys.readouterr()
+    doc = json.loads(captured.out)  # the COMPLETE stdout is one JSON document
+    assert {"id", "status", "requested", "created_at", "trials", "progress"} == set(doc)
+    assert doc["progress"]["cancelled"] == 0  # no cancel request was ever sent
+    assert "aco cancel" in captured.err       # interruption notice on stderr
+    assert calls["n"] >= 2                    # at least one real poll occurred
+    real_sleep(0)
+
+
+def test_wait_json_terminal_output_is_single_document(api, state, tmp_path, capsys):
+    """A batch whose trials are all terminal finishes immediately; stdout is
+    still exactly one JSON document."""
+    from urllib.request import Request, urlopen
+
+    write(tmp_path, "t.json", {"prompt": "WT", "tests": []})
+    write(tmp_path, "c.json", {"harness": "fake", "model": "fake-model"})
+    main(["register", "task", "wt-task", "v1", str(tmp_path / "t.json"), "--api-url", api])
+    main(["register", "config", "wt-cfg", "v1", str(tmp_path / "c.json"), "--api-url", api])
+    main(["run", "--task", "wt-task@v1", "--target", "wt-cfg@v1", "--api-url", api,
+          "--idempotency-key", "wt-wait"])
+    captured = capsys.readouterr()
+    exp_id = captured.out.split("Experiment ")[1].split("（")[0]
+    main(["cancel", exp_id, "--api-url", api])  # single trial → cancelled → terminal
+    capsys.readouterr()
+
+    # replay the same key with --wait: the watcher starts on the already
+    # terminal (cancelled) batch and finishes immediately
+    assert main(["run", "--task", "wt-task@v1", "--target", "wt-cfg@v1",
+                 "--api-url", api, "--wait", "--json",
+                 "--idempotency-key", "wt-wait"]) == 0
+    out = capsys.readouterr().out
+    doc = json.loads(out)  # one document, not a concatenation
+    assert doc["progress"]["cancelled"] == 1
+    assert doc["id"] == exp_id  # idempotency replay targeted the same batch
+
+
 def test_output_never_contains_credentials(api, state, capsys):
     secret = "super-secret-token-value"
     assert main(["status", "no-such-experiment", "--api-url", api,
