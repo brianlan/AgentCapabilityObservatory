@@ -247,6 +247,18 @@ def run_pending(conn: sqlite3.Connection, root: Path) -> bool:
     return True
 
 
+def requeue_stuck_running(conn: sqlite3.Connection) -> int:
+    """Manager-startup recovery (#16): scoring rows left in 'running' by a
+    manager crash go back to 'queued'. A verifier container never calls a
+    model, so requeueing is not an agent rerun; the row's history stays
+    append-only."""
+    cur = conn.execute(
+        "UPDATE verifications SET status = 'queued', started_at = NULL WHERE status = 'running'"
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 if __name__ == "__main__":  # operator helper: compute a bundle digest for registration
     import sys
 

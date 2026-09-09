@@ -152,6 +152,31 @@ def _seal_after_run(conn: sqlite3.Connection, run: sqlite3.Row, container_id: st
                    answer_digest=receipt["digest"])
 
 
+def _record_timeout_verdict(conn: sqlite3.Connection, run: sqlite3.Row,
+                            agent_started_at: dict | None, agent_timeout_sec: int) -> None:
+    """Deadline, actual freeze, and tolerance verdict for a timeout seal (#16).
+
+    The planned deadline anchors at the observed agent start plus the agent
+    timeout; an answer frozen beyond that plus the trial grace window is a
+    diagnostic anomaly, never a capability-curve sample.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from . import lifecycle
+
+    if agent_started_at is None:
+        return  # the agent never started; no deadline to compare against
+    started = datetime.fromisoformat(agent_started_at["at"])
+    deadline = started + timedelta(seconds=agent_timeout_sec)
+    trial = conn.execute(
+        "SELECT experiment_id FROM trials WHERE id = ?", (run["trial_id"],)
+    ).fetchone()
+    lifecycle.record_timeout_verdict(
+        conn, trial["experiment_id"], run["trial_id"], run["run_id"],
+        deadline, timedelta(seconds=TRIAL_GRACE_SEC),
+    )
+
+
 async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) -> None:
     run_id = run["run_id"]
     trial = conn.execute("SELECT * FROM trials WHERE id = ?", (run["trial_id"],)).fetchone()
@@ -184,14 +209,15 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     task_dir = build_task_dir(work_dir, task_content.get("prompt", ""), agent_timeout_sec, run_id)
     trials_dir = work_dir / "trials"
     container_id = None
+    agent_started_at: dict | None = None
 
     async def on_agent_start(_event):
-        nonlocal container_id
+        nonlocal container_id, agent_started_at
         container_id = await asyncio.to_thread(discover_container, run_id)
         runs.mark_running(conn, run_id, container_id=container_id, image=IMAGE)
         security = await asyncio.to_thread(container_security_summary, container_id)
-        runs.add_phase(conn, run_id, "agent_start", container_id=container_id,
-                       container_security=security)
+        agent_started_at = runs.add_phase(conn, run_id, "agent_start", container_id=container_id,
+                                          container_security=security)
         # pre-agent baseline for the manifest's added/modified/deleted diff
         await asyncio.to_thread(artifacts.snapshot_baseline, container_id, baseline_dir)
 
@@ -221,6 +247,7 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         runs.add_phase(conn, run_id, "trial_timeout")
         await asyncio.to_thread(_seal_after_run, conn, run, container_id,
                                 "timeout", root, baseline_dir)
+        _record_timeout_verdict(conn, run, agent_started_at, agent_timeout_sec)
         runs.finish_run(conn, run_id, "error", runs.EXIT_TIMEOUT,
                         f"trial exceeded {agent_timeout_sec + TRIAL_GRACE_SEC}s")
         return
