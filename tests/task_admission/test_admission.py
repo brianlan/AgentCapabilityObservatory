@@ -279,6 +279,51 @@ def test_scorer_registration_conflict_leaves_no_versions(bundle, root, monkeypat
     assert not (root / "verifiers" / scorer_id).exists()  # imported bundle removed
 
 
+def test_idempotent_task_row_survives_registration_failure(bundle, root, monkeypatch):
+    """Regression (review finding): a row handed back as idempotent (200) must
+    never be rolled back — simulates a concurrent admission inserting the
+    identical task between this attempt's snapshot and its failure."""
+    from aco.app import register_version, version_digest
+    from aco.models import AssetRef, VersionRegistration
+
+    b = admission.Bundle.load(bundle)
+    conflicting = dict(b.verifier.model_dump())
+    conflicting["entrypoint"] = ["python", "other.py"]  # same name@version, different content
+    conn = db.connect(root / "aco.db")
+    db.migrate(conn)
+    register_version(conn, VersionRegistration(
+        kind="scorer", name=f"{b.manifest['name']}-verifier", version=b.manifest["version"],
+        content=conflicting))
+    conn.close()
+
+    real_register = admission.register_version
+    interleaved = {"task": False}
+
+    def register_with_concurrent_task_insert(conn, reg):
+        if reg.kind == "task" and not interleaved["task"]:
+            interleaved["task"] = True
+            real_register(conn, reg)  # concurrent admission creates the identical row
+            return real_register(conn, reg)  # this attempt gets it back as 200
+        return real_register(conn, reg)
+
+    monkeypatch.setattr(admission, "register_version", register_with_concurrent_task_insert)
+    bundle_digest = runner_bundle_digest(b.verifier_bundle)
+    scorer_id = version_digest(
+        "scorer", f"{b.manifest['name']}-verifier", b.manifest["version"],
+        b.verifier.model_dump(), [AssetRef(name="bundle", digest=bundle_digest)])
+    patch_containers(monkeypatch, root, lambda gate, index: PASS if gate == "oracle" else FAIL)
+    report = run_report(bundle, root)
+    assert report["gates"]["registration"]["ok"] is False
+    assert "registry rejected" in report["gates"]["registration"]["detail"]
+    conn = sqlite3.connect(root / "aco.db")
+    rows = sorted(conn.execute("SELECT kind, name FROM versions").fetchall())
+    conn.close()
+    # the idempotent task row and the pre-existing conflicting scorer survive
+    assert rows == sorted([("task", b.manifest["name"]),
+                           ("scorer", f"{b.manifest['name']}-verifier")])
+    assert not (root / "verifiers" / scorer_id).exists()  # bundle still cleaned up
+
+
 def test_admission_leaves_verifier_bundle_usable_for_runtime(bundle, root, monkeypatch):
     """A successful admission must leave the trusted verifier bundle where
     verification.runner loads it, with a digest matching the registered asset."""

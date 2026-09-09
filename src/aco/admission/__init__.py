@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import artifacts, db
-from ..app import AppError, fetch_version, register_version, version_digest
+from ..app import AppError, register_version, version_digest
 from ..models import AssetRef, ScorerContent, VersionRegistration
 from ..verification import runner
 from ..db import utcnow
@@ -481,9 +481,9 @@ def _register_candidate(conn, bundle: Bundle, data_root: Path,
     the executable bundle goes to verifiers/<scorer_id> — exactly where
     verification.runner loads it. Any failure leaves no apparently usable
     candidate: the bundle digest is verified before registration, and a
-    failed attempt removes the imported bundle plus any version rows this
-    attempt created (rows that already existed stay untouched — the version
-    ids are content addresses, so pre-existing rows are detectable).
+    failed attempt removes the imported bundle plus exactly the version rows
+    its register_version calls inserted (status 201); rows returned
+    idempotently (status 200) are never touched.
     """
     scorer_name = f"{bundle.manifest['name']}-verifier"
     scorer_version = bundle.manifest["version"]
@@ -518,26 +518,26 @@ def _register_candidate(conn, bundle: Bundle, data_root: Path,
         if created:
             shutil.rmtree(dest, ignore_errors=True)
         raise AdmissionError("imported verifier bundle digest mismatch")
-    # rows that already exist before this attempt: a failed registration must
-    # roll back its own inserts but never a concurrently identical row
-    pre_existing = {row["id"] for row in (
-        fetch_version(conn, "task", task_name, task_version),
-        fetch_version(conn, "scorer", scorer_name, scorer_version)) if row is not None}
+    # register_version returns 201 only when the call itself inserted the row,
+    # so rollback can be scoped exactly to this attempt's inserts: rows that
+    # already existed (idempotent re-admission or a concurrent identical
+    # registration) come back as 200 and are never deleted
     created_rows: list[str] = []
     try:
-        task_record, _ = register_version(conn, VersionRegistration(
+        task_record, status = register_version(conn, VersionRegistration(
             kind="task", name=task_name, version=task_version,
             content=task_content, assets=task_assets))
-        created_rows.append(task_record["id"])
-        scorer_record, _ = register_version(conn, VersionRegistration(
+        if status == 201:
+            created_rows.append(task_record["id"])
+        scorer_record, status = register_version(conn, VersionRegistration(
             kind="scorer", name=scorer_name, version=scorer_version,
             content=scorer_content, assets=scorer_assets))
-        created_rows.append(scorer_record["id"])
+        if status == 201:
+            created_rows.append(scorer_record["id"])
     except AppError as exc:
         with conn:  # roll the partial registration back, atomically
-            for row_id in created_rows:
-                if row_id not in pre_existing:
-                    conn.execute("DELETE FROM versions WHERE id = ?", (row_id,))
+            for row_id in created_rows:  # 201-inserts only, see above
+                conn.execute("DELETE FROM versions WHERE id = ?", (row_id,))
         if created:
             shutil.rmtree(dest, ignore_errors=True)
         raise AdmissionError(f"registry rejected the candidate: {exc.message}") from exc
