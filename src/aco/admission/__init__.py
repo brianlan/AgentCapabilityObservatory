@@ -538,9 +538,9 @@ def _register_candidate_locked(conn, bundle: Bundle, verifier_bundle_digest: str
         raise AdmissionError(f"verifier bundle already present with different content: {dest}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     staging = dest.parent / f".import-{uuid.uuid4().hex}"
-    shutil.copytree(bundle.verifier_bundle, staging)
     created_rows: list[str] = []
     try:
+        shutil.copytree(bundle.verifier_bundle, staging)
         if runner.bundle_digest(staging) != verifier_bundle_digest:
             raise AdmissionError("imported verifier bundle digest mismatch")
         task_record, status = register_version(conn, VersionRegistration(
@@ -565,7 +565,9 @@ def _register_candidate_locked(conn, bundle: Bundle, verifier_bundle_digest: str
     except AppError as exc:
         _rollback_candidate(conn, created_rows, staging)
         raise AdmissionError(f"registry rejected the candidate: {exc.message}") from exc
-    except AdmissionError:
+    except BaseException:
+        # copy/digest/unexpected filesystem failures must not leave a partial
+        # staging directory behind; BaseException also covers Ctrl-C cleanup
         _rollback_candidate(conn, created_rows, staging)
         raise
     return {"version_id": task_record["id"], "scorer_id": scorer_record["id"]}

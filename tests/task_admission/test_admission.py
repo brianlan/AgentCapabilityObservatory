@@ -395,6 +395,52 @@ def test_failed_admission_serializes_and_keeps_concurrent_attempt_working(bundle
                            ("scorer", f"{b.manifest['name']}-verifier")])  # B's rows only
 
 
+def test_partial_copy_failure_leaves_no_staging_or_rows(bundle, root, monkeypatch):
+    """Regression (review finding): a filesystem failure during the staging
+    copy must not leave a partial .import-* directory or registered rows."""
+    real_copytree = shutil.copytree
+
+    def copy_then_fail(src, dst, **kwargs):
+        real_copytree(src, dst, **kwargs)  # complete the copy...
+        (Path(dst) / "run.py").unlink()    # ...then simulate a mid-copy error
+        raise OSError("injected disk failure mid-copy")
+
+    monkeypatch.setattr(admission.shutil, "copytree", copy_then_fail)
+    patch_containers(monkeypatch, root, lambda gate, index: PASS if gate == "oracle" else FAIL)
+    with pytest.raises(OSError, match="injected disk failure"):
+        run_report(bundle, root)
+
+    assert [p.name for p in (root / "verifiers").iterdir()
+            if p.name.startswith(".import-")] == []
+    conn = sqlite3.connect(root / "aco.db")
+    assert conn.execute("SELECT kind, name FROM versions").fetchall() == []
+    conn.close()
+
+
+def test_staging_digest_failure_leaves_no_staging_or_rows(bundle, root, monkeypatch):
+    """Regression (review finding): a failing staging digest check must roll
+    back rows and remove the staging directory — no apparently usable or
+    orphaned candidate state."""
+    real_digest = admission.runner.bundle_digest
+
+    def wrong_for_staging(path):
+        if ".import-" in str(path):
+            return "0" * 64  # digest check fails only for the staging copy
+        return real_digest(path)
+
+    monkeypatch.setattr(admission.runner, "bundle_digest", wrong_for_staging)
+    patch_containers(monkeypatch, root, lambda gate, index: PASS if gate == "oracle" else FAIL)
+    report = run_report(bundle, root)
+    assert report["gates"]["registration"]["ok"] is False
+    assert "digest mismatch" in report["gates"]["registration"]["detail"]
+
+    assert [p.name for p in (root / "verifiers").iterdir()
+            if p.name.startswith(".import-")] == []
+    conn = sqlite3.connect(root / "aco.db")
+    assert conn.execute("SELECT kind, name FROM versions").fetchall() == []
+    conn.close()
+
+
 def test_admission_leaves_verifier_bundle_usable_for_runtime(bundle, root, monkeypatch):
     """A successful admission must leave the trusted verifier bundle where
     verification.runner loads it, with a digest matching the registered asset."""
