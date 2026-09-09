@@ -20,6 +20,9 @@ test = [
     "httpx>=0.27",
 ]
 
+[project.scripts]
+aco = "aco.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
