@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}ACO 管理面板{% endblock %}</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0 auto; padding: 1rem; max-width: 60rem; color: #1a1a1a; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { border: 1px solid #bbb; padding: 0.35rem 0.6rem; text-align: left; vertical-align: top; }
+  caption { text-align: left; font-weight: 600; padding-bottom: 0.3rem; }
+  .badge { display: inline-block; border: 1px solid #666; border-radius: 3px; padding: 0 0.35rem; font-size: 0.85rem; background: #f4f4f4; }
+  .badge-sealed { background: #e0f0e0; } .badge-anomaly { background: #f0e0e0; }
+  .badge-error { background: #f0e0e0; } .badge-succeeded { background: #e0f0e0; }
+  .badge-cancelled { background: #eee; } .badge-planned { background: #f4f4f4; }
+  .unknown { color: #666; font-style: italic; }
+  pre { background: #f6f6f6; border: 1px solid #ddd; padding: 0.6rem; overflow-x: auto; }
+  dl.timeline dt { font-weight: 600; } dl.timeline dd { margin: 0 0 0.5rem 1rem; }
+  section { margin: 1.5rem 0; } h1 { font-size: 1.3rem; } h2 { font-size: 1.1rem; }
+  nav ol { list-style: none; padding: 0; display: flex; gap: 0.4rem; }
+</style>
+</head>
+<body>
+<nav aria-label="面包屑">
+  <ol>
+    <li><a href="/dashboard">批次列表</a></li>
+    {% block breadcrumb %}{% endblock %}
+  </ol>
+</nav>
+<main>{% block content %}{% endblock %}</main>
+</body>
+</html>

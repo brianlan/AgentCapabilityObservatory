@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}批次列表 · ACO 管理面板{% endblock %}
+{% block content %}
+<h1>批次列表</h1>
+{% if rows %}
+<table>
+  <caption>全部评估批次及其计划、封存与评分进度</caption>
+  <thead>
+    <tr>
+      <th scope="col">批次</th><th scope="col">创建时间</th><th scope="col">状态</th>
+      <th scope="col">试验数</th><th scope="col">按状态分布</th>
+      <th scope="col">已封存</th><th scope="col">异常</th>
+      <th scope="col">评分成功</th><th scope="col">评分错误</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td><a href="/dashboard/experiments/{{ r.id }}">{{ r.id[:8] }}</a></td>
+      <td>{{ r.created_at }}</td>
+      <td><span class="badge badge-{{ r.status }}">{{ r.status }}</span></td>
+      <td>{{ r.trials_total }}</td>
+      <td>{% for status, n in r.trial_counts.items() %}<span class="badge badge-{{ status }}">{{ status }}×{{ n }}</span> {% endfor %}</td>
+      <td>{{ r.sealed }}</td>
+      <td>{{ r.anomalies }}</td>
+      <td>{{ r.scored }}</td>
+      <td>{{ r.score_errors }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>尚无批次。</p>
+{% endif %}
+{% endblock %}
