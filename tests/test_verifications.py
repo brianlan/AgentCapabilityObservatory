@@ -415,15 +415,33 @@ class TestVerificationAPI:
         assert resp.status_code == 422
         assert resp.json()["error"]["code"] == "not_verifiable"
 
-    def test_image_must_be_digest_pinned_at_registration(self, client):
+    @pytest.mark.parametrize("image", [
+        "python:3.12",                       # mutable tag, no digest
+        "python@sha256:",                    # empty digest
+        "python@sha256:abc123",              # short digest
+        "python@sha256:" + "g" * 64,         # non-hex digest
+        "python@sha256:" + "A" * 64,         # uppercase hex digest
+        "python:3.12@sha256:" + "a" * 64,    # tag-plus-digest
+        "@sha256:" + "a" * 64,               # empty repository
+    ])
+    def test_image_must_be_digest_pinned_at_registration(self, client, image):
         resp = client.post("/v1/versions", json={
             "kind": "scorer", "name": "scorer", "version": "v1",
-            "content": {"image": "python:3.12", "entrypoint": ["python", "/verifier/run.py"],
+            "content": {"image": image, "entrypoint": ["python", "/verifier/run.py"],
                         "result_schema": SCHEMA},
         })
         assert resp.status_code == 422
         assert resp.json()["error"]["code"] == "invalid_content"
         assert "digest-pinned" in resp.json()["error"]["message"]
+
+    def test_valid_digest_pinned_image_accepted(self, client):
+        resp = client.post("/v1/versions", json={
+            "kind": "scorer", "name": "scorer", "version": "v1",
+            "content": {"image": "python@sha256:" + "a" * 64,
+                        "entrypoint": ["python", "/verifier/run.py"],
+                        "result_schema": SCHEMA},
+        })
+        assert resp.status_code == 201, resp.text
 
     def test_idempotent_same_request(self, client, tmp_path):
         self.register_scorer(client)
