@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}结果趋势与矩阵 — ACO 管理面板{% endblock %}
+{% block breadcrumb %}<li><a href="/dashboard/results">结果趋势与矩阵</a></li>{% endblock %}
+{% block content %}
+<h1>结果趋势与题目 × 配置矩阵</h1>
+
+<section>
+  <form method="get" action="/dashboard/results">
+    <label>题组 <input name="task_set" value="{{ filters.task_set or '' }}" placeholder="name@version"></label>
+    <label>配置 <input name="config" value="{{ filters.config or '' }}" placeholder="name@version"></label>
+    <label>评分 <input name="scorer" value="{{ filters.scorer or '' }}" placeholder="name@version"></label>
+    <label>视图
+      <select name="view">
+        <option value="raw" {% if filters.view != 'unified' %}selected{% endif %}>raw（按评分版本分线）</option>
+        <option value="unified" {% if filters.view == 'unified' %}selected{% endif %}>unified（统一重评口径）</option>
+      </select>
+    </label>
+    <label>批次 <input name="batch" value="{{ filters.batch or '' }}" size="36"></label>
+    <button type="submit">查询</button>
+  </form>
+  {% if error %}<p class="badge badge-error">{{ error }}</p>{% endif %}
+</section>
+
+<section>
+  <h2>趋势（横轴 = 作答批次时间）</h2>
+  {% if series_views %}
+  <svg viewBox="0 0 640 230" width="640" height="230" role="img" aria-label="能力趋势图">
+    <line x1="40" y1="185" x2="630" y2="185" stroke="#999"/>
+    <line x1="40" y1="15" x2="40" y2="185" stroke="#999"/>
+    <text x="8" y="20" font-size="10">1.0</text>
+    <text x="8" y="188" font-size="10">0.0</text>
+    {% for sv in series_views %}{{ sv.marks | join('') | safe }}{% endfor %}
+    {% for x in x_ticks %}
+    <line x1="{{ x + 0.0 }}" y1="185" x2="{{ x + 0.0 }}" y2="189" stroke="#666"/>
+    {% endfor %}
+    {% for x, label in x_labels.items() %}
+    <text x="{{ x + 0.0 }}" y="202" font-size="9" text-anchor="middle">{{ label }}</text>
+    {% endfor %}
+  </svg>
+  <ul>
+    {% for sv in series_views %}
+    <li><span class="badge" style="color: {{ sv.color }};">■</span>
+      {{ sv.key.task_set }} × {{ sv.key.config }} × {{ sv.key.scorer or "未评分" }}
+      — {{ sv.points | length }} 个批次点</li>
+    {% endfor %}
+  </ul>
+  <p class="unknown">实心点 = 完整批次主分；竖线 = 缺失界限（下界—上界，非置信区间）。
+    不同题组版本、配置、评分口径默认分线，不自动混合。</p>
+  {% else %}
+  <p class="unknown">无匹配的评分记录。</p>
+  {% endif %}
+</section>
+
+{% if data.matrix %}
+<section>
+  <h2>题目 × 配置矩阵（{{ data.matrix.scorer }}）</h2>
+  <table>
+    <caption>{{ data.matrix.note }}</caption>
+    <tr><th>题目</th>{% for cfg in matrix_cols %}<th>{{ cfg }}</th>{% endfor %}</tr>
+    {% for task, row in data.matrix.cells.items() %}
+    <tr><th>{{ task }}</th>
+      {% for cfg in matrix_cols %}{% set cell = row.get(cfg) %}
+      <td>{% if cell %}
+        {{ '%.2f' | format(cell.lower) }}–{{ '%.2f' | format(cell.upper) }}
+        （{{ cell.pass }}/{{ cell.planned }}，覆盖 {{ '%.0f' | format(cell.coverage * 100) }}%）
+        {% for tid in cell.trial_ids %}<a href="/dashboard/trials/{{ tid }}">试验</a>{% endfor %}
+      {% else %}<span class="unknown">无数据</span>{% endif %}</td>
+      {% endfor %}
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+{% endif %}
+
+{% for sv in series_views %}
+<section>
+  <h2>原始计数 — {{ sv.key.task_set }} × {{ sv.key.config }} × {{ sv.key.scorer or "未评分" }}</h2>
+  <table>
+    <tr><th>批次</th><th>完整</th><th>主分</th><th>覆盖</th><th>界限(下–上)</th>
+        <th>有效</th><th>通过</th><th>计划</th><th>异常</th><th>取消</th><th>待完成</th>
+        <th>冲突</th><th>评分错误</th><th>实际起止</th></tr>
+    {% for point in sv.points %}
+    <tr>
+      <td><a href="/dashboard/experiments/{{ point.batch_id }}">{{ point.batch_id[:12] }}</a></td>
+      <td>{{ "是" if point.complete else "否（部分结果）" }}</td>
+      <td>{{ '%.2f' | format(point.main_score) if point.main_score is not none else "—" }}</td>
+      <td>{{ '%.0f' | format(point.coverage * 100) }}%</td>
+      <td>{{ '%.2f' | format(point.bounds.lower) }}–{{ '%.2f' | format(point.bounds.upper) }}</td>
+      <td>{{ point.counts.valid }}</td><td>{{ point.pass }}</td><td>{{ point.planned }}</td>
+      <td>{{ point.counts.anomaly }}</td><td>{{ point.counts.cancelled }}</td>
+      <td>{{ point.counts.pending }}</td><td>{{ point.counts.conflict }}</td>
+      <td>{{ point.counts.score_error }}</td>
+      <td>{{ point.span.start or "—" }} … {{ point.span.end or "—" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% set diag = sv.diagnostics[0] %}
+  {% set last = sv.points[-1] %}
+  <p>延迟/令牌/费用（来源与缺失分开显示，不计入能力分）：
+    latency = {{ diag.latency.detail }}；token = {{ diag.token.detail }}；cost = {{ diag.cost.detail }}。</p>
+  {% if last.submetrics %}
+  <p>verifier submetrics（最新批次 {{ last.batch_created_at[:16] }}，原始口径，按评分版本归组）：
+    {% for name, s in last.submetrics.items() %}{{ name }}={{ '%.4g' | format(s.mean) }} (n={{ s.samples }}) {% endfor %}</p>
+  {% endif %}
+</section>
+{% endfor %}
+{% endblock %}

@@ -58,3 +58,18 @@ FastAPI 进程只保存计划与状态；长运行由独立进程承担：
 - **假 target**：V1 只执行 `harness: "fake"`（config 版本内容 `{"harness": "fake", "model": "none"}`）。`aco.fake_agent:FakeAgent` 仅供测试（领题 → 写普通文件 → 按指令场景提交/前台退出/后台写入），不代表真实 harness 接入；其他 harness 或模型/provider/skills/credentials 组合显式失败，不静默回退。
 
 e2e 测试（需要本机 Docker）：`/ssd4/envs/aco_py312/bin/python -m pytest tests/e2e`。
+
+## 结果查询、趋势与题目 × 配置矩阵（#19）
+
+`GET /v1/results`（可选过滤：`task_set`、`config`、`scorer`、`batch`，均 `name@version`；`view=raw|unified`）在服务端完成过滤与聚合，dashboard `/dashboard/results` 只渲染其返回值，统计公式不进前端：
+
+- **分母来自实验计划**（trials 表的计划重复数），成功评分行从不充当分母；异常封存、取消、待完成样本保留在分母中并分别计数（`counts.anomaly` / `cancelled` / `pending` / `conflict` / `score_error`）。
+- **主分按题等权**：每题先算预定重复的通过率，再对题目等权平均——不是按 Trial 总数的简单合并平均。
+- **缺失界限**：任一计划样本无有效判定时不标主分，输出固定权重下界（确认通过/计划）与"未知全通过"上界；界限是缺失界限，不是置信区间。
+- **分线**：题组版本、target 配置、评分口径（scorer 版本）任一不同即不同序列，允许叠加、不自动混合；同题跨序列比较需显式过滤。
+- **raw 与 unified**：raw 视图按实际产生判定的 scorer 版本分线（重评过的试验在两个 grader 下各出现一次）；unified 视图必须显式指定 `scorer`，只统计该重评口径。同版本成功判定互相冲突时该样本保持未知并单独计数，绝不自动挑选"最高分"。
+- **时间轴**：每批次点以作答批次创建时间为横轴并给出实际起止范围；部分批次明确标"否（部分结果）"。
+- **矩阵与下钻**：单 grader 口径下给出题目 × 配置矩阵（跨批次合并计数 + 缺失界限），趋势点/矩阵格/计数表链接到批次与试验详情页。
+- **延迟/令牌/费用**：仅当 verifier submetrics 上报时按名称展示均值与样本数（来源：verifier submetrics），未上报显示缺失——不填零、不混入能力分。
+
+测试（含手算分母、覆盖率与上下界的 fixture）：`/ssd4/envs/aco_py312/bin/python -m pytest tests/results tests/web`。
