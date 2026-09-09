@@ -34,9 +34,11 @@ all-passed report and an explicit --reviewed-by human name.
 
 import argparse
 import hashlib
+import os
 import uuid
 import io
 import json
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -45,7 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import artifacts, db
-from ..app import AppError, register_version
+from ..app import AppError, register_version, version_digest
 from ..models import AssetRef, ScorerContent, VersionRegistration
 from ..verification import runner
 from ..db import utcnow
@@ -142,10 +144,10 @@ class Bundle:
 
 
 def _exempt_digests(bundle: Bundle) -> set[str]:
-    """Digests of private files that are byte-identical to their same-path
-    counterpart in the initial public environment — overlay-unchanged starter
-    files under reference/ or a wrong-answer workspace. Everything under
-    private/verifier is a hidden asset, always."""
+    """Digests of private files that are byte-identical to their same logical
+    workspace path in the initial public environment — overlay-unchanged
+    starter files under reference/ or a wrong-answer workspace. Everything
+    under private/verifier is a hidden asset, always."""
     public = _tree_digests(bundle.public_env)
     exempt = set()
     for rel in (REFERENCE_DIR, WRONG_DIR):
@@ -155,9 +157,13 @@ def _exempt_digests(bundle: Bundle) -> set[str]:
         for p in tree.rglob("*"):
             if not p.is_file() or p.is_symlink():
                 continue
-            tail = p.relative_to(bundle.path / rel).as_posix()
-            # the public environment uses the same workspace/ prefix
-            if public.get(tail) == _digest(p.read_bytes()):
+            # map .../workspace/<logical> (reference has no case component,
+            # wrong answers nest one) to public/environment/workspace/<logical>
+            parts = p.relative_to(tree).parts
+            if "workspace" not in parts:
+                continue
+            logical = "/".join(parts[parts.index("workspace"):])
+            if public.get(logical) == _digest(p.read_bytes()):
                 exempt.add(_digest(p.read_bytes()))
     return exempt
 
@@ -427,10 +433,19 @@ def run_admission(bundle_path: Path, data_root: Path) -> dict:
             gates[name] = {"ok": False, "detail": "skipped: static gates failed"}
         # ponytail: report digests only; DB registration stays out until gates pass
 
+    if all(g["ok"] for g in gates.values()):
+        # import + registration is itself gated: a candidate must leave the
+        # admission with a usable verifier bundle in the data root
+        try:
+            registered = _register_candidate(runner_conn, bundle, data_root,
+                                             verifier_bundle_digest, environment_digest)
+            gates["registration"] = {"ok": True, "detail": "verifier bundle imported and versions registered"}
+        except AdmissionError as exc:
+            gates["registration"] = {"ok": False, "detail": str(exc)}
+    else:
+        gates["registration"] = {"ok": False, "detail": "skipped: earlier gates failed"}
+
     all_passed = all(g["ok"] for g in gates.values())
-    if all_passed:
-        registered = _register_candidate(runner_conn, bundle, data_root,
-                                         verifier_bundle_digest, environment_digest)
 
     task_registration_digest = registered["version_id"] if registered else None
     report = {
@@ -459,8 +474,37 @@ def run_admission(bundle_path: Path, data_root: Path) -> dict:
 
 def _register_candidate(conn, bundle: Bundle, data_root: Path,
                         verifier_bundle_digest: str, environment_digest: str) -> dict:
-    """Register the task and scorer versions through the normal registry —
-    the DB keeps only versions, digests, provenance, and a report reference."""
+    """Import the trusted verifier bundle into the runtime data root and
+    register the task and scorer versions through the normal registry.
+
+    The DB keeps only versions, digests, provenance, and a report reference;
+    the executable bundle goes to verifiers/<scorer_id> — exactly where
+    verification.runner loads it. Any failure leaves no apparently usable
+    candidate: an import made for a failed registration is removed again.
+    """
+    scorer_name = f"{bundle.manifest['name']}-verifier"
+    scorer_version = bundle.manifest["version"]
+    scorer_content = bundle.verifier.model_dump()
+    scorer_assets = [AssetRef(name="bundle", digest=verifier_bundle_digest)]
+    # the version id is deterministic (content-addressed), so the bundle can
+    # be imported before registration and removed again if registration fails
+    scorer_id = version_digest("scorer", scorer_name, scorer_version,
+                               scorer_content, scorer_assets)
+    dest = data_root / "verifiers" / scorer_id
+    created = False
+    if dest.is_dir():
+        if runner.bundle_digest(dest) != verifier_bundle_digest:
+            raise AdmissionError(f"verifier bundle already present with different content: {dest}")
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        staging = dest.parent / f".import-{uuid.uuid4().hex}"
+        shutil.copytree(bundle.verifier_bundle, staging)
+        try:
+            os.replace(staging, dest)  # same filesystem by construction
+        except OSError:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        created = True
     try:
         task_reg = VersionRegistration(
             kind="task", name=bundle.manifest["name"], version=bundle.manifest["version"],
@@ -471,14 +515,16 @@ def _register_candidate(conn, bundle: Bundle, data_root: Path,
         )
         task_record, _ = register_version(conn, task_reg)
         scorer_reg = VersionRegistration(
-            kind="scorer", name=f"{bundle.manifest['name']}-verifier",
-            version=bundle.manifest["version"],
-            content=bundle.verifier.model_dump(),
-            assets=[AssetRef(name="bundle", digest=verifier_bundle_digest)],
+            kind="scorer", name=scorer_name, version=scorer_version,
+            content=scorer_content, assets=scorer_assets,
         )
         scorer_record, _ = register_version(conn, scorer_reg)
     except AppError as exc:
+        if created:
+            shutil.rmtree(dest, ignore_errors=True)
         raise AdmissionError(f"registry rejected the candidate: {exc.message}") from exc
+    if runner.bundle_digest(dest) != verifier_bundle_digest:
+        raise AdmissionError("imported verifier bundle digest mismatch after registration")
     return {"version_id": task_record["id"], "scorer_id": scorer_record["id"]}
 
 

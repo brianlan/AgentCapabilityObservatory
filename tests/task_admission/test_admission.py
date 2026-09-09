@@ -16,6 +16,11 @@ import pytest
 
 from aco import admission, db
 from aco.admission import AdmissionError
+from aco.verification import runner as verification_runner
+
+
+def runner_bundle_digest(bundle_dir):
+    return verification_runner.bundle_digest(bundle_dir)
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "tasks" / "synthetic-add"
 PASS = {"status": "succeeded", "pass": True}
@@ -74,8 +79,28 @@ def test_report_schema_and_gate_names(bundle, root, monkeypatch):
     patch_containers(monkeypatch, root, lambda gate, index: PASS if gate == "oracle" else FAIL)
     report = run_report(bundle, root)
     assert report["schema"] == admission.SCHEMA
-    assert set(report["gates"]) == {"static", "oracle", "nop", "cheats", "rescore"}
+    assert set(report["gates"]) == {"static", "oracle", "nop", "cheats", "rescore", "registration"}
     assert set(report["digests"]) == {"verifier_bundle", "environment", "artifact_contract", "task_version"}
+
+
+def test_clean_fixture_passes_leak_scan(bundle):
+    """Regression: the unmodified committed fixture must pass the public
+    leak scan — unchanged starter files shared with private workspaces are
+    exempt, not leaks (review finding on the same-path mapping)."""
+    checks = admission.static_checks(admission.Bundle.load(bundle))
+    leak = next(c for c in checks if c["name"] == "no_hidden_assets_in_public_bundle")
+    assert leak["ok"] is True, leak["detail"]
+
+
+def test_unchanged_public_file_inside_cheat_case_is_not_a_leak(bundle):
+    """A wrong-answer workspace may repeat unchanged public files (e.g. the
+    README) without tripping the leak scan; only genuinely hidden content
+    appearing in the public tree is a leak."""
+    shutil.copy(bundle / "public/environment/workspace/README.md",
+                bundle / "private/wrong_answers/deleted-feature/workspace/README.md")
+    checks = admission.static_checks(admission.Bundle.load(bundle))
+    leak = next(c for c in checks if c["name"] == "no_hidden_assets_in_public_bundle")
+    assert leak["ok"] is True, leak["detail"]
 
 
 def test_good_bundle_passes_all_gates(bundle, root, monkeypatch):
@@ -205,11 +230,55 @@ def test_report_written_as_json_and_markdown(bundle, root, monkeypatch):
 def test_static_failure_never_registers_versions(bundle, root):
     text = (bundle / "task.toml").read_text().replace('license = "MIT"\n', "")
     (bundle / "task.toml").write_text(text)
-    run_report(bundle, root)
+    report = run_report(bundle, root)
+    assert report["gates"]["registration"]["detail"].startswith("skipped")
     conn = sqlite3.connect(root / "aco.db")
     count = conn.execute("SELECT COUNT(*) FROM versions").fetchone()[0]
     conn.close()
     assert count == 0  # failed admission registers nothing
+
+
+def scorer_row(root):
+    conn = sqlite3.connect(root / "aco.db")
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT id, assets FROM versions WHERE kind = 'scorer'").fetchone()
+    conn.close()
+    return row
+
+
+def test_admission_leaves_verifier_bundle_usable_for_runtime(bundle, root, monkeypatch):
+    """A successful admission must leave the trusted verifier bundle where
+    verification.runner loads it, with a digest matching the registered asset."""
+    from aco.app import version_digest
+    from aco.models import AssetRef
+
+    b = admission.Bundle.load(bundle)
+    bundle_digest = runner_bundle_digest(b.verifier_bundle)
+    scorer_id = version_digest(
+        "scorer", f"{b.manifest['name']}-verifier", b.manifest["version"],
+        b.verifier.model_dump(), [AssetRef(name="bundle", digest=bundle_digest)])
+    # pre-create a conflicting bundle: registration must refuse and record it
+    (root / "verifiers" / scorer_id).mkdir(parents=True)
+    (root / "verifiers" / scorer_id / "run.py").write_text("CORRUPTED")
+    patch_containers(monkeypatch, root, lambda gate, index: PASS if gate == "oracle" else FAIL)
+    report = run_report(bundle, root)
+    assert report["gates"]["registration"]["ok"] is False
+    assert "different content" in report["gates"]["registration"]["detail"]
+    assert report["all_passed"] is False
+    conn = sqlite3.connect(root / "aco.db")
+    assert conn.execute("SELECT COUNT(*) FROM versions").fetchone()[0] == 0
+    conn.close()
+
+    # now the clean path: bundle imported, digest matches the registered asset
+    shutil.rmtree(root / "verifiers" / scorer_id)
+    report = run_report(bundle, root)
+    assert report["gates"]["registration"]["ok"] is True
+    assert report["all_passed"] is True
+    row = scorer_row(root)
+    declared = [a["digest"] for a in json.loads(row["assets"]) if a["name"] == "bundle"]
+    dest = root / "verifiers" / row["id"]
+    assert dest.is_dir()
+    assert runner_bundle_digest(dest) == declared[0] == bundle_digest
 
 
 def test_promote_requires_human_review_and_passing_report(bundle, root, tmp_path):

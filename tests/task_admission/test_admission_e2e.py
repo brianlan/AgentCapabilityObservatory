@@ -56,9 +56,18 @@ def test_full_admission_of_synthetic_fixture(bundle, tmp_path):
 
     # the task and scorer versions are registered through the normal registry
     conn = sqlite3.connect(root / "aco.db")
+    conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT kind, name, version FROM versions ORDER BY kind").fetchall()
+    scorer = conn.execute("SELECT id, assets FROM versions WHERE kind = 'scorer'").fetchone()
     conn.close()
-    assert rows == [("scorer", "synthetic-add-verifier", "v1"), ("task", "synthetic-add", "v1")]
+    assert [tuple(r) for r in rows] == [("scorer", "synthetic-add-verifier", "v1"), ("task", "synthetic-add", "v1")]
+
+    # the verifier bundle is imported where the normal scoring path loads it,
+    # with a digest matching the registered asset (runtime usability)
+    declared = [a["digest"] for a in json.loads(scorer["assets"]) if a["name"] == "bundle"]
+    bundle_dir = root / "verifiers" / scorer["id"]
+    assert bundle_dir.is_dir()
+    assert admission.runner.bundle_digest(bundle_dir) == declared[0]
 
     # the report records task/verifier/environment/contract digests + provenance
     assert all(report["digests"][key] for key in
