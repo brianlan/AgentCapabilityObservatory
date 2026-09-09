@@ -321,7 +321,11 @@ def session_submission(conn: sqlite3.Connection, trial: sqlite3.Row) -> dict:
     ).fetchone()
     if row is None:
         raise AppError(404, "not_found", "no submission for this trial")
-    return {"receipt_id": row["receipt_id"], "status": row["status"], "submitted_at": row["created_at"]}
+    sealed = conn.execute(
+        "SELECT digest FROM sealed_answers WHERE trial_id = ?", (trial["id"],)
+    ).fetchone()
+    return {"receipt_id": row["receipt_id"], "status": row["status"], "submitted_at": row["created_at"],
+            "answer_digest": sealed["digest"] if sealed else None}
 
 
 def create_app(data_root: str | None = None) -> FastAPI:

@@ -16,7 +16,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from . import db, runs
+from . import artifacts, db, runs
 from .supervisor import cleanup_container
 
 POLL_INTERVAL_SEC = 1.0
@@ -141,6 +141,7 @@ def main() -> int:
     db.migrate(conn)  # idempotent; manager may start before the API's first migrate
     recover_stale_claims(conn)
     reap_lost_supervisors(conn)
+    artifacts.recover(conn, root)  # finish or flag interrupted seals from disk truth (#14)
     print(f"execution manager watching {root}", flush=True)
     while True:
         reap_lost_supervisors(conn)
