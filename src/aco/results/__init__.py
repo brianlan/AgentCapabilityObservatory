@@ -30,11 +30,13 @@ version, ignoring rows from any other scorer version.
 
 Verdict resolution per (trial, scorer version), append-only aware:
 
-- succeeded verdicts that agree -> a valid verdict (pass 0/1, including a
-  failing one);
-- succeeded verdicts that disagree -> conflict: the trial stays unknown and
-  is counted separately (no highest result is ever selected);
-- rows present but none succeeded -> scoring error (unknown, counted);
+- re-evaluation appends rows; the latest row (created_at, then insertion
+  order) is the current verdict and fully supersedes older ones — stale
+  rows never influence verdicts, counts, pass rates, bounds, or
+  submetrics;
+- latest row succeeded -> a valid verdict (pass 0/1, including a failing
+  one);
+- latest row errored -> scoring error (unknown, counted);
 - no rows for this scorer version -> pending / anomaly / cancelled per the
   trial and seal state.
 
@@ -60,7 +62,7 @@ TRIAL_FACTS_SELECT = (
     " JOIN versions cv ON cv.id = t.config_version_id"
 )
 
-BUCKETS = ("valid", "conflict", "score_error", "anomaly", "cancelled", "pending")
+BUCKETS = ("valid", "score_error", "anomaly", "cancelled", "pending")
 
 
 def parse_ref(value: str) -> tuple[str, str]:
@@ -78,36 +80,27 @@ def _task_set_of(requested: dict) -> str:
 
 def _verdicts(conn: sqlite3.Connection) -> dict[str, list[dict]]:
     """Resolve one verdict per (trial, scorer version) from append-only rows,
-    grouped by trial id."""
+    grouped by trial id. The latest row per (trial, scorer version) — by
+    created_at, then insertion order — is the verdict and supersedes any
+    older row, so regrades and retries replace rather than conflict."""
     rows = conn.execute(
-        "SELECT v.trial_id, v.scorer_version_id, v.status, v.pass, v.id, v.submetrics,"
+        "SELECT v.trial_id, v.scorer_version_id, v.status, v.pass, v.submetrics,"
         " v.finished_at, sv.name AS scorer_name, sv.version AS scorer_version"
         " FROM verifications v JOIN versions sv ON sv.id = v.scorer_version_id"
-        " ORDER BY v.created_at, v.id"
+        " ORDER BY v.created_at, v.rowid"
     ).fetchall()
     resolved: dict[tuple[str, str], dict] = {}
-    for row in rows:
-        key = (row["trial_id"], row["scorer_version_id"])
-        state = resolved.setdefault(key, {
+    for row in rows:  # append-only order: each row replaces any earlier one
+        resolved[(row["trial_id"], row["scorer_version_id"])] = {
             "trial_id": row["trial_id"],
             "scorer": f'{row["scorer_name"]}@{row["scorer_version"]}',
-            "pass": None, "conflict": False, "score_error": False,
-            "submetrics": [], "finished_at": None,
-        })
-        if row["status"] == "succeeded":
-            if state["pass"] is not None and state["pass"] != bool(row["pass"]):
-                state["conflict"] = True
-            state["pass"] = bool(row["pass"])
-            if row["submetrics"]:
-                state["submetrics"].append(json.loads(row["submetrics"]))
-            if row["finished_at"]:
-                state["finished_at"] = max(state["finished_at"] or "", row["finished_at"])
-        elif row["status"] == "error":
-            state["score_error"] = True
+            "pass": bool(row["pass"]) if row["status"] == "succeeded" else None,
+            "score_error": row["status"] == "error",
+            "submetrics": [json.loads(row["submetrics"])] if row["submetrics"] else [],
+            "finished_at": row["finished_at"],
+        }
     by_trial: dict[str, list[dict]] = defaultdict(list)
     for state in resolved.values():
-        if state["conflict"]:
-            state["pass"] = None  # conflicting verdicts are not a valid verdict
         by_trial[state["trial_id"]].append(state)
     return by_trial
 
@@ -117,8 +110,6 @@ def _classify(trial: dict, state: dict | None) -> str:
     if state is not None:
         if state["pass"] is not None:
             return "valid"
-        if state["conflict"]:
-            return "conflict"
         if state["score_error"]:
             return "score_error"
     if trial["anomaly"]:
@@ -208,7 +199,7 @@ def _batch_point(items: list[dict]) -> dict:
 def _empty_state(scorer: str, trial_id: str) -> dict:
     """State shape for a trial with no scoring row under this scorer version:
     it stays in the plan denominator as an unknown."""
-    return {"trial_id": trial_id, "scorer": scorer, "pass": None, "conflict": False,
+    return {"trial_id": trial_id, "scorer": scorer, "pass": None,
             "score_error": False, "submetrics": [], "finished_at": None}
 
 

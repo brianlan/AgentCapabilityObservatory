@@ -78,7 +78,7 @@
   <table>
     <tr><th>批次</th><th>完整</th><th>主分</th><th>覆盖</th><th>界限(下–上)</th>
         <th>有效</th><th>通过</th><th>计划</th><th>异常</th><th>取消</th><th>待完成</th>
-        <th>冲突</th><th>评分错误</th><th>实际起止</th></tr>
+        <th>评分错误</th><th>实际起止</th></tr>
     {% for point in sv.points %}
     <tr>
       <td><a href="/dashboard/experiments/{{ point.batch_id }}">{{ point.batch_id[:12] }}</a></td>
@@ -88,7 +88,7 @@
       <td>{{ '%.2f' | format(point.bounds.lower) }}–{{ '%.2f' | format(point.bounds.upper) }}</td>
       <td>{{ point.counts.valid }}</td><td>{{ point.pass }}</td><td>{{ point.planned }}</td>
       <td>{{ point.counts.anomaly }}</td><td>{{ point.counts.cancelled }}</td>
-      <td>{{ point.counts.pending }}</td><td>{{ point.counts.conflict }}</td>
+      <td>{{ point.counts.pending }}</td>
       <td>{{ point.counts.score_error }}</td>
       <td>{{ point.span.start or "—" }} … {{ point.span.end or "—" }}</td>
     </tr>

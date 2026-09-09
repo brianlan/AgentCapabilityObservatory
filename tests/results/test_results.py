@@ -139,7 +139,7 @@ def test_equal_weight_across_tasks_not_pooled(tmp_path):
     point = single_series(results(client))["points"][0]
     assert point["main_score"] == 0.5
     assert point["complete"] is True
-    assert point["counts"] == {"valid": 3, "conflict": 0, "score_error": 0,
+    assert point["counts"] == {"valid": 3, "score_error": 0,
                                "anomaly": 0, "cancelled": 0, "pending": 0}
     assert point["per_task"]["t1@v1"]["pass"] == 2
     assert point["per_task"]["t1@v1"]["planned"] == 2
@@ -232,22 +232,75 @@ def test_raw_view_shows_regrade_under_both_graders_unified_picks_one(tmp_path):
     assert client.get("/v1/results", params={"view": "unified"}).status_code == 422
 
 
-def test_conflicting_same_version_verdicts_stay_unknown(tmp_path):
-    """Two same-version successful verdicts that disagree are a conflict: no
-    verdict is selected, the trial stays unknown and is counted."""
+def test_later_verdict_supersedes_older_one(tmp_path):
+    """Append-only regrade: a newer same-version verdict replaces the older
+    one (never a conflict, never a stale readout)."""
     client = make_client(tmp_path)
     ids = register_versions(client, tasks=["arith"], configs=["cfg-a"], scorers=["ver"])
     exp = make_experiment(client, task="arith")
-    add_verification(tmp_path, exp["trials"][0]["id"], ids["scorer:ver"], pass_=1,
+    trial_id = exp["trials"][0]["id"]
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=1,
                      idempotency_key="first")
-    add_verification(tmp_path, exp["trials"][0]["id"], ids["scorer:ver"], pass_=0,
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=0,
                      idempotency_key="second")
     point = single_series(results(client))["points"][0]
-    assert point["counts"]["conflict"] == 1
-    assert point["counts"]["valid"] == 0
+    assert point["counts"]["valid"] == 1
+    assert point["pass"] == 0  # the later verdict wins
+    assert point["complete"] is True
+    assert point["main_score"] == 0.0
+    assert point["bounds"] == {"lower": 0.0, "upper": 0.0}
+
+
+def test_later_verdict_wins_on_created_at_tie(tmp_path):
+    """Same created_at: insertion order (rowid) decides the latest row."""
+    client = make_client(tmp_path)
+    ids = register_versions(client, tasks=["arith"], configs=["cfg-a"], scorers=["ver"])
+    exp = make_experiment(client, task="arith")
+    trial_id = exp["trials"][0]["id"]
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=1,
+                     idempotency_key="first")
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=0,
+                     idempotency_key="second")
+    point = single_series(results(client))["points"][0]
+    assert point["pass"] == 0  # second insert is the latest even on a tie
+
+
+def test_later_error_supersedes_older_success(tmp_path):
+    """A newer scoring error replaces an older success — including its
+    submetrics, which must not leak from the superseded row."""
+    client = make_client(tmp_path)
+    ids = register_versions(client, tasks=["arith"], configs=["cfg-a"], scorers=["ver"])
+    exp = make_experiment(client, task="arith")
+    trial_id = exp["trials"][0]["id"]
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=1,
+                     submetrics={"accuracy": 1.0}, idempotency_key="first")
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], status="error",
+                     idempotency_key="second")
+    point = single_series(results(client))["points"][0]
+    assert point["counts"] == {"valid": 0, "score_error": 1,
+                               "anomaly": 0, "cancelled": 0, "pending": 0}
     assert point["complete"] is False
     assert point["main_score"] is None
     assert point["bounds"] == {"lower": 0.0, "upper": 1.0}
+    assert point["submetrics"] == {}
+
+
+def test_later_success_supersedes_older_error(tmp_path):
+    """A retry that succeeds replaces an earlier scoring error."""
+    client = make_client(tmp_path)
+    ids = register_versions(client, tasks=["arith"], configs=["cfg-a"], scorers=["ver"])
+    exp = make_experiment(client, task="arith")
+    trial_id = exp["trials"][0]["id"]
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], status="error",
+                     idempotency_key="first")
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=1,
+                     submetrics={"accuracy": 0.8}, idempotency_key="second")
+    point = single_series(results(client))["points"][0]
+    assert point["counts"]["valid"] == 1
+    assert point["counts"]["score_error"] == 0
+    assert point["complete"] is True
+    assert point["main_score"] == 1.0
+    assert point["submetrics"] == {"accuracy": {"mean": 0.8, "samples": 1}}
 
 
 def test_partial_batch_is_marked_and_batches_form_time_points(tmp_path):
