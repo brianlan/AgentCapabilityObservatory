@@ -227,7 +227,13 @@ class TestHarborExecution:
         assert run["launched_at"]
         assert run["requested_profile"] == {"harness": "fake", "model": "none"}
         assert run["container_id"]
-        assert container_ids(run["run_id"]) == []  # bounded label-based cleanup
+        # bounded label-based cleanup is asynchronous — wait for it
+        deadline = time.monotonic() + 30
+        leftover = container_ids(run["run_id"])
+        while leftover and time.monotonic() < deadline:
+            time.sleep(0.5)
+            leftover = container_ids(run["run_id"])
+        assert leftover == [], f"containers not reaped after supervisor crash: {leftover}"
 
     def test_foreground_exit_recorded_as_agent_error(self, stack):
         base = stack["base"]

@@ -434,6 +434,16 @@ def create_app(data_root: str | None = None) -> FastAPI:
     # management path: independent scoring of the sealed answer (#15)
     register_routes(app, conn)
 
+    # results query and aggregation (#19)
+    from .api.results import register_routes as register_results_routes
+
+    register_results_routes(app, conn)
+
+    # management dashboard: server-rendered, read-only audit pages (#18)
+    from .web import register_routes as register_dashboard_routes
+
+    register_dashboard_routes(app, conn, root)
+
     return app
 
 
