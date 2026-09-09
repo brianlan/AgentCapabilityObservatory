@@ -246,6 +246,39 @@ def scorer_row(root):
     return row
 
 
+def test_scorer_registration_conflict_leaves_no_versions(bundle, root, monkeypatch):
+    """Regression (review finding): the task insert commits independently, so
+    a scorer-registration conflict after it must not leave a partially
+    registered candidate. The failed attempt rolls back its own rows, keeps
+    pre-existing ones, and removes the imported verifier bundle."""
+    from aco.app import register_version, version_digest
+    from aco.models import AssetRef, VersionRegistration
+
+    b = admission.Bundle.load(bundle)
+    conflicting = dict(b.verifier.model_dump())
+    conflicting["entrypoint"] = ["python", "other.py"]  # same name@version, different content
+    conn = db.connect(root / "aco.db")
+    db.migrate(conn)
+    register_version(conn, VersionRegistration(
+        kind="scorer", name=f"{b.manifest['name']}-verifier", version=b.manifest["version"],
+        content=conflicting))
+    conn.close()
+    bundle_digest = runner_bundle_digest(b.verifier_bundle)
+    scorer_id = version_digest(
+        "scorer", f"{b.manifest['name']}-verifier", b.manifest["version"],
+        b.verifier.model_dump(), [AssetRef(name="bundle", digest=bundle_digest)])
+    patch_containers(monkeypatch, root, lambda gate, index: PASS if gate == "oracle" else FAIL)
+    report = run_report(bundle, root)
+    assert report["gates"]["registration"]["ok"] is False
+    assert "registry rejected" in report["gates"]["registration"]["detail"]
+    assert report["all_passed"] is False
+    conn = sqlite3.connect(root / "aco.db")
+    rows = conn.execute("SELECT kind, name FROM versions").fetchall()
+    conn.close()
+    assert rows == [("scorer", f"{b.manifest['name']}-verifier")]  # only the pre-existing row
+    assert not (root / "verifiers" / scorer_id).exists()  # imported bundle removed
+
+
 def test_admission_leaves_verifier_bundle_usable_for_runtime(bundle, root, monkeypatch):
     """A successful admission must leave the trusted verifier bundle where
     verification.runner loads it, with a digest matching the registered asset."""
