@@ -58,3 +58,35 @@ FastAPI 进程只保存计划与状态；长运行由独立进程承担：
 - **假 target**：V1 只执行 `harness: "fake"`（config 版本内容 `{"harness": "fake", "model": "none"}`）。`aco.fake_agent:FakeAgent` 仅供测试（领题 → 写普通文件 → 按指令场景提交/前台退出/后台写入），不代表真实 harness 接入；其他 harness 或模型/provider/skills/credentials 组合显式失败，不静默回退。
 
 e2e 测试（需要本机 Docker）：`/ssd4/envs/aco_py312/bin/python -m pytest tests/e2e`。
+
+## API 驱动评测 CLI（#17）
+
+`aco` 命令是统一管理 API 的薄客户端（stdlib `argparse` + `urllib`，无 CLI 框架；不直接访问数据库或执行引擎）。所有输出来自 API；关闭或 Ctrl-C CLI 绝不取消服务端运行，只有显式 `aco cancel` 会取消。
+
+```bash
+# 安装后使用（console script）
+/ssd4/envs/aco_py312/bin/python -m pip install -e . && aco run --api-url http://127.0.0.1:8000 --help
+# 免安装运行
+/ssd4/envs/aco_py312/bin/python -m aco.cli --help   # 或 PYTHONPATH=src python -m aco.cli
+
+# 登记版本（内容为 JSON 文件）
+aco register task demo-task v1 task.json
+aco register config demo-cfg v1 config.json
+
+# 创建批次：立即返回 Experiment ID，服务端异步执行
+aco run --task demo-task@v1 --target demo-cfg@v1 --repetitions 3
+aco run --suite my-suite@v1 --target demo-cfg@v1 --idempotency-key run-2026-09-10
+
+# 查看进度（Ctrl-C --wait 只停止本地等待，批次继续运行）
+aco status <experiment-id>
+aco run --task demo-task@v1 --target demo-cfg@v1 --wait
+
+# 显式生命周期（#16 语义：取消幂等；已取消批次 resume 返回明确错误）
+aco cancel <experiment-id>
+aco resume <experiment-id>
+```
+
+- 连接配置：`--api-url` / 环境变量 `ACO_API_URL`（默认 `http://127.0.0.1:8000`）；可选 `--token` / `ACO_API_TOKEN` 以 bearer 头发送，任何输出与错误信息都不包含凭证。
+- 脚本使用：任意命令加 `--json` 得到稳定 JSON（stdout 仅含 JSON，创建前估算输出走 stderr）；API/HTTP 错误返回非零退出码（Ctrl-C 中断 `--wait` 返回 `130`）。
+- 幂等键：`--idempotency-key` 在本地记录键 → Experiment ID（`ACO_CLI_STATE`，默认 `~/.config/aco/cli.json`），同键重复 `run` 返回既有批次，不重复创建。
+
