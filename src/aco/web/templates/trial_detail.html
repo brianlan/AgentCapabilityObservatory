@@ -7,13 +7,16 @@
 
 <section aria-labelledby="h-eligibility">
 <h2 id="h-eligibility">资格</h2>
-{% if t.seal is none %}
-  <p><span class="unknown">未封存</span>：尚无官方答案，无法参与评分。</p>
-{% elif t.seal.status == 'sealed' %}
+{% if t.seal and t.seal.status == 'sealed' %}
   <p>执行条件合格（已封存）：官方答案有效，可参与评分与能力统计。</p>
-{% else %}
+{% elif t.seal and t.seal.status == 'anomaly' %}
   <p>执行条件异常（不计入能力曲线）：{{ t.seal.anomaly or '未知原因' }}</p>
+{% elif t.status == 'cancelled' %}
+  <p>已显式取消：该试验被显式取消，未产生官方答案，不计入能力统计。</p>
+{% else %}
+  <p><span class="unknown">未封存</span>：尚无官方答案，无法参与评分。</p>
 {% endif %}
+<p>人工辅助：<span class="unknown">{{ t.human_assistance }}</span></p>
 </section>
 
 <section aria-labelledby="h-timeline">
@@ -41,11 +44,11 @@
   <h3>运行 {{ r.run_id[:8] }} <span class="badge badge-{{ r.status }}">{{ r.status }}</span></h3>
   <p>启动 {{ r.launched_at or '未知' }}，结束 {{ r.finished_at or '未知' }}</p>
   <table>
-    <caption>请求侧与观测侧对照</caption>
-    <thead><tr><th scope="col">项目</th><th scope="col">观测值</th></tr></thead>
+    <caption>请求侧与观测侧对照（观测值附来源）</caption>
+    <thead><tr><th scope="col">项目</th><th scope="col">观测值</th><th scope="col">来源</th></tr></thead>
     <tbody>
-      {% for label, value in r.observed %}
-      <tr><th scope="row">{{ label }}</th><td>{% if value %}{{ value }}{% else %}<span class="unknown">未知</span>{% endif %}</td></tr>
+      {% for label, value, source in r.observed %}
+      <tr><th scope="row">{{ label }}</th><td>{% if value %}{{ value }}{% else %}<span class="unknown">未知</span>{% endif %}</td><td>{{ source }}</td></tr>
       {% endfor %}
     </tbody>
   </table>

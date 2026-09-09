@@ -35,7 +35,8 @@ def conn(root):
 
 
 def seed(conn):
-    """One experiment, three trials: normal sealed+scored, anomaly, untouched."""
+    """One experiment, four trials: normal sealed+scored, anomaly, cancelled
+    before execution, untouched."""
     conn.execute(
         "INSERT INTO versions (id, kind, name, version, content, created_at) VALUES"
         " ('v-task', 'task', 'task', 'v1', '{}', 'now'),"
@@ -52,6 +53,11 @@ def seed(conn):
             " repetition, plan_order, status, requested) VALUES (?, 'e1', 'v-task', 'v-cfg', ?, ?, 'claimed', '{}')",
             (tid, order, order),
         )
+    # explicitly cancelled before any run or submission (#16 lifecycle)
+    conn.execute(
+        "INSERT INTO trials (id, experiment_id, task_version_id, config_version_id,"
+        " repetition, plan_order, status, requested) VALUES ('t-cancelled', 'e1', 'v-task', 'v-cfg', 4, 4, 'cancelled', '{}')"
+    )
     conn.commit()
     # t-normal: observed run, submission, sealed answer, mixed verification history
     run_id = runs.create_run(conn, "t-normal", {"harness": "fake"}, supervisor_pid=1)
@@ -152,6 +158,35 @@ def test_eligibility_and_anomaly_visible(client, conn):
     assert "执行条件异常" in anomaly
     assert "container was paused for too long" in anomaly
     assert "不计入能力曲线" in anomaly
+
+
+def test_cancelled_trial_rendering(client, conn):
+    seed(conn)
+    detail = client.get("/dashboard/experiments/e1")
+    assert detail.status_code == 200
+    assert 'href="/dashboard/trials/t-cancelled"' in detail.text  # navigable like any trial
+    assert "badge-cancelled" in detail.text
+
+    page = client.get("/dashboard/trials/t-cancelled")
+    assert page.status_code == 200
+    assert "已显式取消" in page.text
+    assert "不计入能力统计" in page.text
+    # cancellation is not a score or a sealed eligibility result
+    assert "执行条件合格" not in page.text
+    # batch progress carries the cancelled count in the per-status chips
+    home = client.get("/dashboard").text
+    assert "cancelled×1" in home
+
+
+def test_observation_provenance_and_human_assistance_visible(client, conn):
+    seed(conn)
+    page = client.get("/dashboard/trials/t-normal").text
+    # every observed value carries its source, matching supervisor semantics
+    for source in ("监督进程上报", "按运行标签从容器运行时发现", "启动配置 + 运行时记录"):
+        assert source in page
+    # human assistance is explicit, not inferred: the schema records no flag
+    assert "人工辅助" in page
+    assert "未知（当前 schema 未记录人工辅助标志）" in page
 
 
 def test_timeline_shows_seal_and_scoring_times(client, conn):

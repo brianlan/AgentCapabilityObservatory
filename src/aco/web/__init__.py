@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, Response
 from starlette.templating import Jinja2Templates
 
-from .. import artifacts, runs
+from .. import runs
 from ..api.verifications import list_verifications
 from ..app import AppError, TRIAL_SELECT, get_experiment
 from pathlib import Path
@@ -100,18 +100,21 @@ def trial_summary(conn, experiment_id: str) -> list[dict]:
 
 
 def _run_view(run: dict) -> dict:
-    """Requested launch profile next to what was actually observed; unknowns stay unknown."""
+    """Requested launch profile next to what was actually observed, each
+    observation annotated with where the recorded value came from (the
+    supervisor's own record: observe_run / mark_running / label discovery).
+    Unknowns stay unknown."""
     observed = [
-        ("adapter 版本", run["adapter_version"]),
-        ("harbor 版本", run["harbor_version"]),
-        ("容器镜像", run["image"]),
-        ("容器 ID", run["container_id"]),
+        ("adapter 版本", run["adapter_version"], "监督进程上报（observe_run）"),
+        ("harbor 版本", run["harbor_version"], "监督进程上报（固定版本）"),
+        ("容器镜像", run["image"], "启动配置 + 运行时记录（mark_running）"),
+        ("容器 ID", run["container_id"], "按运行标签从容器运行时发现（discover_container）"),
     ]
     return {
         "run_id": run["run_id"],
         "status": run["status"],
         "requested_profile": json.dumps(run["requested_profile"], ensure_ascii=False, indent=2),
-        "observed": [(label, value if value is not None else None) for label, value in observed],
+        "observed": observed,
         "phases": run["phases"],
         "exit_kind": run["exit_kind"],
         "exit_detail": run["exit_detail"],
@@ -153,6 +156,9 @@ def trial_detail(conn, root: Path, trial_id: str) -> dict:
         "requested": json.dumps(json.loads(row["requested"]), ensure_ascii=False, indent=2),
         # eligibility is displayed from the stored facts, never recomputed
         "seal": dict(sealed) if sealed else None,
+        # the current schema records no human-assistance flag: it stays
+        # explicitly unknown, never inferred as "none"
+        "human_assistance": "未知（当前 schema 未记录人工辅助标志）",
         "manifest_files": manifest["files"] if manifest else [],
         "manifest_changes": manifest.get("changes") if manifest else None,
         "runs": [_run_view(r) for r in (runs.run_out(r) for r in runs.list_runs(conn, trial_id))],
