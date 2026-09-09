@@ -10,11 +10,13 @@ paths are never accepted from the URL.
 
 import json
 import re
+from datetime import datetime
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, Response
 from starlette.templating import Jinja2Templates
 
+from .. import results
 from .. import runs
 from ..api.verifications import list_verifications
 from ..app import AppError, TRIAL_SELECT, get_experiment
@@ -169,6 +171,101 @@ def trial_detail(conn, root: Path, trial_id: str) -> dict:
     }
 
 
+def results_view(conn, task_set=None, config=None, scorer=None, view="raw", batch=None) -> dict:
+    """Trend/matrix page model. All statistics and SVG coordinates are
+    computed here — templates render values only, they never re-implement
+    the aggregation (#19 reviewer checklist)."""
+    data = results.collect(conn, task_set=task_set, config=config,
+                           scorer=scorer, view=view, batch=batch)
+    palette = ["#2563eb", "#dc2626", "#059669", "#d97706", "#7c3aed", "#0891b2"]
+    # shared x scale across all series: batch answering time
+    times = sorted(t for t in (_parse_ts(p["batch_created_at"])
+                               for s in data["series"] for p in s["points"]) if t)
+    tmin, tmax = (times[0], times[-1]) if times else (None, None)
+
+    def x_of(ts: str) -> float | None:
+        t = _parse_ts(ts)
+        if t is None or tmin is None:
+            return None
+        if tmax == tmin:
+            return 330.0  # single batch: centered point
+        return 50.0 + (t - tmin).total_seconds() / (tmax - tmin).total_seconds() * 570.0
+
+    def y_of(score: float) -> float:
+        return 15.0 + (1.0 - score) * 170.0
+
+    series_views = []
+    for index, s in enumerate(data["series"]):
+        color = palette[index % len(palette)]
+        main_segments, marks = [], []
+        previous_x = previous_y = None
+        for p in s["points"]:
+            x = x_of(p["batch_created_at"])
+            lower, upper = p["bounds"]["lower"], p["bounds"]["upper"]
+            if x is None or lower is None:
+                continue
+            y_low, y_up = y_of(lower), y_of(upper if upper is not None else lower)
+            tooltip = (f'{p["batch_created_at"]} '
+                       f'main={p["main_score"] if p["main_score"] is not None else "—"} '
+                       f'bounds=[{lower:.2f}, {upper if upper is not None else lower:.2f}] '
+                       f'coverage={p["coverage"]}')
+            marks.append(f'<line x1="{x:.1f}" y1="{y_low:.1f}" x2="{x:.1f}" y2="{y_up:.1f}" '
+                         f'stroke="{color}" stroke-width="3" opacity="0.35">'
+                         f'<title>{tooltip}</title></line>')
+            if p["main_score"] is not None:
+                y = y_of(p["main_score"])
+                marks.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="{color}">'
+                             f'<title>{tooltip}</title></circle>')
+                if previous_x is not None:
+                    main_segments.append(f'<line x1="{previous_x:.1f}" y1="{previous_y:.1f}" '
+                                         f'x2="{x:.1f}" y2="{y:.1f}" stroke="{color}" stroke-width="2"/>')
+                previous_x, previous_y = x, y
+            else:
+                previous_x = previous_y = None
+        # x tick labels: one per batch position (deduplicated)
+        series_views.append({
+            "key": s["key"], "color": color, "marks": marks,
+            "points": s["points"],
+            "diagnostics": [_diagnostics(p) for p in s["points"]],
+        })
+    x_ticks = sorted({round(x_of(p["batch_created_at"]), 1)
+                      for s in data["series"] for p in s["points"] if x_of(p["batch_created_at"]) is not None})
+    matrix = data["matrix"]
+    return {
+        "data": data,
+        "series_views": series_views,
+        "x_ticks": x_ticks,
+        "x_labels": {round(x_of(p["batch_created_at"]), 1): p["batch_created_at"][:16]
+                     for s in data["series"] for p in s["points"]
+                     if x_of(p["batch_created_at"]) is not None},
+        "filters": data["filters"] | {"view": view},
+        "matrix_cols": sorted({cfg for row in matrix["cells"].values() for cfg in row})
+        if matrix else [],
+    }
+
+
+def _parse_ts(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _diagnostics(point: dict) -> dict:
+    """latency / token / cost shown separately with their source; a verifier
+    that does not report them leaves them missing — never zero, and never
+    part of the capability score."""
+    submetrics = point["submetrics"]
+    out = {}
+    for label in ("latency", "token", "cost"):
+        hits = {name: value for name, value in submetrics.items() if label in name}
+        out[label] = ({"detail": "；".join(
+            f'{name} mean={value["mean"]:.4g} (n={value["samples"]})'
+            for name, value in hits.items()), "source": "verifier submetrics"}
+            if hits else {"detail": "缺失（verifier 未上报）", "source": None})
+    return out
+
+
 def register_routes(app: FastAPI, conn, root: Path) -> None:
     @app.get("/dashboard")
     async def dashboard_home(request: Request):
@@ -188,6 +285,19 @@ def register_routes(app: FastAPI, conn, root: Path) -> None:
     async def dashboard_trial(request: Request, trial_id: str):
         data = trial_detail(conn, root, trial_id)
         return templates.TemplateResponse(request, "trial_detail.html", {"t": data})
+
+    # trends + task × config matrix (#19): renders aco.results output only
+    @app.get("/dashboard/results")
+    async def dashboard_results(request: Request, task_set: str | None = None,
+                                config: str | None = None, scorer: str | None = None,
+                                view: str = "raw", batch: str | None = None):
+        try:
+            data = results_view(conn, task_set=task_set, config=config,
+                                scorer=scorer, view=view, batch=batch)
+        except AppError as exc:
+            data = {"error": exc.message, "series_views": [], "data": {"series": [], "matrix": None},
+                    "x_ticks": [], "x_labels": {}, "filters": {}}
+        return templates.TemplateResponse(request, "results.html", data)
 
     # artifact reads address database IDs only (#18): the manifest is served
     # from the sealed_answers row; a host path in the URL can never reach disk
