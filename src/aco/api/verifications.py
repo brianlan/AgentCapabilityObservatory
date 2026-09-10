@@ -20,7 +20,27 @@ from ..db import utcnow
 from ..models import ScorerContent, VerificationCreate
 
 
-def verification_out(row: sqlite3.Row, conflicting: set[str] | None = None) -> dict:
+def attempt_out(row: sqlite3.Row) -> dict:
+    """One actual verifier-container execution (#15 reopened): append-only
+    per-attempt record with its own times and diagnostics."""
+    return {
+        "attempt_no": row["attempt_no"],
+        "status": row["status"],
+        "pass": bool(row["pass"]) if row["pass"] is not None else None,
+        "submetrics": json.loads(row["submetrics"]) if row["submetrics"] else None,
+        "error_kind": row["error_kind"],
+        "error_detail": row["error_detail"],
+        "raw_output_dir": row["raw_output_dir"],
+        "scorer_digest": row["scorer_digest"],
+        "image": row["image"],
+        "evidence": json.loads(row["evidence"]) if row["evidence"] else None,
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+    }
+
+
+def verification_out(row: sqlite3.Row, conflicting: set[str] | None = None,
+                     attempts: list[sqlite3.Row] = ()) -> dict:
     return {
         "id": row["id"],
         "trial_id": row["trial_id"],
@@ -37,6 +57,7 @@ def verification_out(row: sqlite3.Row, conflicting: set[str] | None = None) -> d
         # no highest result is ever selected: conflicting same-version
         # successful verdicts are flagged, all records stay queryable
         "stable": (row["id"] not in conflicting) if conflicting else True,
+        "attempts": [attempt_out(a) for a in attempts],
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
         "created_at": row["created_at"],
@@ -62,6 +83,11 @@ def _conflicting_ids(rows: list[sqlite3.Row]) -> set[str]:
         if row["status"] == "succeeded" and len(by_version.get(row["scorer_version_id"], ())) > 1:
             conflicting.add(row["id"])
     return conflicting
+
+
+def _single_out(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    attempts = _attempts_by_verification(conn, row["trial_id"]).get(row["id"], [])
+    return verification_out(row, None, attempts)
 
 
 def create_verification(conn: sqlite3.Connection, trial_id: str, req: VerificationCreate) -> tuple[int, dict]:
@@ -95,7 +121,7 @@ def create_verification(conn: sqlite3.Connection, trial_id: str, req: Verificati
     if existing is not None:
         if existing["request_digest"] == request_digest:
             row = conn.execute(f"{VERIFICATION_SELECT} WHERE v.id = ?", (existing["id"],)).fetchone()
-            return 200, verification_out(row)
+            return 200, _single_out(conn, row)
         raise AppError(409, "idempotency_conflict", "same idempotency key with different payload")
 
     verification_id = uuid.uuid4().hex
@@ -115,10 +141,22 @@ def create_verification(conn: sqlite3.Connection, trial_id: str, req: Verificati
         ).fetchone()
         if existing is not None and existing["request_digest"] == request_digest:
             row = conn.execute(f"{VERIFICATION_SELECT} WHERE v.id = ?", (existing["id"],)).fetchone()
-            return 200, verification_out(row)
+            return 200, _single_out(conn, row)
         raise AppError(409, "idempotency_conflict", "same idempotency key with different payload") from None
     row = conn.execute(f"{VERIFICATION_SELECT} WHERE v.id = ?", (verification_id,)).fetchone()
-    return 202, verification_out(row)
+    return 202, _single_out(conn, row)
+
+
+def _attempts_by_verification(conn: sqlite3.Connection, trial_id: str) -> dict[str, list[sqlite3.Row]]:
+    rows = conn.execute(
+        "SELECT a.* FROM verification_attempts a"
+        " JOIN verifications v ON v.id = a.verification_id"
+        " WHERE v.trial_id = ? ORDER BY a.attempt_no", (trial_id,)
+    ).fetchall()
+    grouped: dict[str, list[sqlite3.Row]] = {}
+    for row in rows:
+        grouped.setdefault(row["verification_id"], []).append(row)
+    return grouped
 
 
 def list_verifications(conn: sqlite3.Connection, trial_id: str) -> list[dict]:
@@ -128,7 +166,8 @@ def list_verifications(conn: sqlite3.Connection, trial_id: str) -> list[dict]:
         f"{VERIFICATION_SELECT} WHERE v.trial_id = ? ORDER BY v.created_at, v.rowid", (trial_id,)
     ).fetchall()
     conflicting = _conflicting_ids(rows)
-    return [verification_out(row, conflicting) for row in rows]
+    attempts = _attempts_by_verification(conn, trial_id)
+    return [verification_out(row, conflicting, attempts.get(row["id"], [])) for row in rows]
 
 
 def register_routes(app: FastAPI, conn: sqlite3.Connection) -> None:
