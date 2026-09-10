@@ -88,7 +88,13 @@ def reap_lost_supervisors(conn) -> None:
         artifacts.mark_anomaly(conn, run["trial_id"], run["run_id"],
                                f"supervisor pid {pid} disappeared without recording an outcome",
                                trigger="supervisor_lost")
-        lifecycle.finish_trial(conn, run["trial_id"], "supervisor_lost", "anomaly",
+        # the outcome follows the answer row, not the supervisor's death: a
+        # seal recovered from disk truth stays officially sealed (ADR 0003)
+        answer = conn.execute(
+            "SELECT status FROM sealed_answers WHERE trial_id = ?", (run["trial_id"],)
+        ).fetchone()
+        outcome = answer["status"] if answer is not None and answer["status"] in ("sealed", "anomaly") else "anomaly"
+        lifecycle.finish_trial(conn, run["trial_id"], "supervisor_lost", outcome,
                                run_id=run["run_id"],
                                detail=f"supervisor pid {pid} lost")
 
@@ -173,13 +179,14 @@ def reconcile_terminal_trials(conn) -> int:
 
 def startup_recovery(conn, root: Path) -> None:
     """One-time reconciliation at manager startup (#16), in order: stale
-    claims (launch intent is authoritative), lost supervisors, interrupted
-    seals from disk truth (#14), terminal-answer reconciliation, adoption of
-    live supervisors, requeue of stuck scoring, and pausing unstarted plans
-    until explicit resume."""
+    claims (launch intent is authoritative), interrupted seals from disk
+    truth (#14 — disk truth wins before supervisor reaping flags an anomaly),
+    lost supervisors, terminal-answer reconciliation, adoption of live
+    supervisors, requeue of stuck scoring, and pausing unstarted plans until
+    explicit resume."""
     recover_stale_claims(conn)
-    reap_lost_supervisors(conn)
     artifacts.recover(conn, root)
+    reap_lost_supervisors(conn)
     reconcile_terminal_trials(conn)
     lifecycle.adopt_live_supervisors(conn)  # surviving supervisors keep running, never rerun (#16)
     verification.requeue_stuck_running(conn)  # scoring has no side effects; requeue is safe (#16)

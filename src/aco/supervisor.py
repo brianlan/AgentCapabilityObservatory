@@ -207,6 +207,19 @@ def _record_timeout_verdict(conn: sqlite3.Connection, run: sqlite3.Row,
     )
 
 
+def _retrigger_answer(conn: sqlite3.Connection, trial_id: str, run_id: str) -> None:
+    """Correct an AGENT_END-hook seal to 'timeout' when the deadline won the
+    termination race (#16 reopen). The hook seals with the best trigger known
+    at that moment ('exit' when nothing was submitted) — but a harbor agent
+    timeout fires AGENT_END too, and the first legal termination reason is
+    the timeout, not the mechanical agent end. Content, receipt, and a
+    submit-won seal are never touched."""
+    conn.execute(
+        "UPDATE sealed_answers SET seal_trigger = 'timeout' WHERE trial_id = ?"
+        " AND status = 'sealed' AND seal_trigger = 'exit'", (trial_id,))
+    conn.commit()
+
+
 async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) -> None:
     run_id = run["run_id"]
     trial = conn.execute("SELECT * FROM trials WHERE id = ?", (run["trial_id"],)).fetchone()
@@ -266,6 +279,10 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         await asyncio.to_thread(artifacts.snapshot_baseline, container_id, baseline_dir, contract)
 
     async def on_agent_end(_event):
+        # the seal lives here because the container only exists while harbor's
+        # run() is in flight — harbor reaps it afterwards. The trigger is the
+        # best knowledge at this moment; handle_timeout corrects it to
+        # 'timeout' when the deadline actually won the termination race.
         runs.add_phase(conn, run_id, "agent_end")
         trigger = "submit" if _has_submission(conn, run["trial_id"]) else "exit"
         await asyncio.to_thread(_seal_after_run, conn, run, container_id,
@@ -305,6 +322,7 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         runs.add_phase(conn, run_id, "trial_timeout", source=source)
         await asyncio.to_thread(_seal_after_run, conn, run, container_id,
                                 "timeout", root, baseline_dir, contract)
+        await asyncio.to_thread(_retrigger_answer, conn, run["trial_id"], run_id)
         _record_timeout_verdict(conn, run, agent_started_at, agent_timeout_sec)
         runs.finish_run(conn, run_id, "error", runs.EXIT_TIMEOUT, detail)
         await asyncio.to_thread(_finish_trial_from_answer, conn, run["trial_id"], run_id, "timeout")
@@ -318,6 +336,11 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
             await handle_timeout("outer_deadline",
                                  f"trial exceeded {agent_timeout_sec + TRIAL_GRACE_SEC}s")
             return
+        except Exception as exc:  # noqa: BLE001 — Harbor may raise the agent timeout
+            if "AgentTimeoutError" in f"{type(exc).__name__}: {exc}":
+                await handle_timeout("harbor_agent_timeout", str(exc))
+                return
+            raise
 
         exception = result.exception_info.exception_type if result.exception_info else None
         if exception and "AgentTimeoutError" in str(exception):

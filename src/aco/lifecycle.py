@@ -325,7 +325,8 @@ def record_timeout_verdict(conn: sqlite3.Connection, experiment_id: str, trial_i
 def progress(conn: sqlite3.Connection, experiment_id: str) -> dict:
     """Batch-progress counts: plan, execution, cancellation, and anomaly
     coverage. `attempted` counts every trial that ever produced a launch
-    intent — anything not planned, terminal or not."""
+    intent (a trial_runs row) — a trial cancelled before launch was never
+    attempted."""
     counts = {"planned": 0, "claimed": 0, "running": 0,
               "sealed": 0, "anomaly": 0, "cancelled": 0}
     for row in conn.execute(
@@ -341,6 +342,10 @@ def progress(conn: sqlite3.Connection, experiment_id: str) -> dict:
     ).fetchall()
     sealed = sum(r["n"] for r in answers if r["st"] == "sealed")
     anomaly = sum(r["n"] for r in answers if r["st"] == "anomaly")
-    attempted = sum(v for k, v in counts.items() if k != "planned")
+    attempted = conn.execute(
+        "SELECT COUNT(*) FROM trials t JOIN trial_runs r ON r.trial_id = t.id"
+        " WHERE t.experiment_id = ?",
+        (experiment_id,),
+    ).fetchone()[0]
     return {**counts, "sealed": sealed, "anomaly": anomaly,
             "attempted": attempted}

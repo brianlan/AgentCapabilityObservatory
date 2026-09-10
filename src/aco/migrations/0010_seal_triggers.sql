@@ -1,4 +1,4 @@
--- 0009: widen sealed_answers.seal_trigger for the full termination vocabulary (#16 reopen).
+-- 0010: widen sealed_answers.seal_trigger for the full termination vocabulary (#16 reopen).
 -- ADR 0003 funnels every trial termination through finish_trial: submit, exit,
 -- and timeout seal answers; explicit cancel, supervisor loss/crash, pre-agent
 -- launch failures, and startup recovery leave exactly-once anomaly receipts.

@@ -399,3 +399,46 @@ class TestSealedAnswers:
             conn.close()
         assert sealed["status"] == "sealed"
         assert sealed["receipt_id"]  # generated: no submission receipt existed
+
+    def test_harbor_agent_timeout_uses_timeout_verdict_path(self, stack):
+        """Harbor's own AgentTimeoutError lands on the same verdict path as
+        the ACO outer deadline (#16 reopen): a timeout run, a sealed answer
+        with trigger 'timeout', and a timeout_verdict event carrying the
+        planned deadline, the freeze time, and the eligibility verdict."""
+        base = stack["base"]
+        trial_id = create_trial(base, "FAKE:sleep\nhang past the deadline",
+                                {"harness": "fake", "model": "none"})
+        run = wait_for_run(base, trial_id, timeout=120)
+        assert run["exit_kind"] == "timeout"  # never a plain agent_error
+
+        sealed_phase = next(p for p in run["phases"] if p["event"] == "sealed")
+        assert sealed_phase["event"] == "sealed"
+        manifest = read_manifest(stack["root"] / "answers" / sealed_phase["answer_digest"])
+        # the manifest is content-addressed and immutable at seal time; the
+        # authoritative termination reason is the DB seal_trigger below
+        assert manifest["trigger"] in ("exit", "timeout")
+
+        timeout_phase = next(p for p in run["phases"] if p["event"] == "trial_timeout")
+        assert timeout_phase["source"] in ("outer_deadline", "harbor_agent_timeout")
+
+        conn = sqlite3.connect(stack["root"] / "aco.db")
+        conn.row_factory = sqlite3.Row
+        try:
+            verdict = conn.execute(
+                "SELECT reason, detail FROM lifecycle_events"
+                " WHERE trial_id = ? AND event = 'timeout_verdict'", (trial_id,)
+            ).fetchone()
+            trial_status = conn.execute(
+                "SELECT status FROM trials WHERE id = ?", (trial_id,)).fetchone()[0]
+            answer = conn.execute(
+                "SELECT status, seal_trigger FROM sealed_answers WHERE trial_id = ?",
+                (trial_id,)).fetchone()
+        finally:
+            conn.close()
+        assert verdict is not None
+        detail = json.loads(verdict["detail"])
+        assert {"planned_deadline", "frozen_at", "verdict"} <= set(detail)
+        assert verdict["reason"] == "within_tolerance"  # hang ~= the deadline, grace absorbs it
+        assert answer["seal_trigger"] == "timeout"
+        assert answer["status"] == "sealed"  # eligible: stays a capability sample
+        assert trial_status == "sealed"  # the funnel terminalised the trial
