@@ -36,6 +36,7 @@ ACO_MANAGEMENT_TOKEN=<管理凭证> /ssd4/envs/aco_py312/bin/python -m uvicorn a
 - 数据根目录：默认 `./data`，可用环境变量 `ACO_DATA_ROOT` 覆盖；SQLite 数据库位于 `<data-root>/aco.db`，是唯一元数据权威。
 - Migration：`src/aco/migrations/` 内有序 SQL 文件 + `schema_version` 表，重复执行是 no-op。
 - 端点：`POST /v1/versions`（登记不可变版本，内容寻址 digest，重复登记幂等，同标识不同内容返回 `409`）、`POST /v1/experiments`（返回 `202` 与原子展开的 Trial 计划）、`GET /v1/experiments/{id}`、`GET /v1/trials/{id}`。管理面所有路由（含 dashboard）都要求 `Authorization: Bearer $ACO_MANAGEMENT_TOKEN`，缺失或错误返回 `401`；未设置该环境变量时管理面拒绝启动。
+- Experiment 创建幂等（#35，服务端权威）：`POST /v1/experiments` 支持携带 `Idempotency-Key` 头。同一管理主体（bearer token 的 sha256 指纹，明文永不入库）用相同 key 与相同规范请求体重试，返回原 Experiment（`200`）；相同 key 但请求体不同返回 `409 idempotency_conflict`。幂等键与计划在同一 SQLite 事务中登记，失败不残留 key 或半个计划。不携带该头时每次调用都创建新 Experiment——API 不会把无 key 请求伪装成幂等。
 - 凭证只允许逻辑引用（config 的 `credentials` 名称列表），任何凭证值都不会入库；Trial 的 `runtime_observation` 在未观测前保持 `null`。
 
 ## 受限 Session API（#12）
@@ -92,7 +93,7 @@ aco resume <experiment-id>
 
 - 连接配置：`--api-url` / 环境变量 `ACO_API_URL`（默认 `http://127.0.0.1:8000`）；`--token` / 环境变量 `ACO_MANAGEMENT_TOKEN` 以 bearer 头发送（服务端校验，缺失返回 `401`），任何输出与错误信息都不包含凭证。
 - 脚本使用：任意命令加 `--json` 得到稳定 JSON（stdout 仅含 JSON，创建前估算输出走 stderr）；API/HTTP 错误返回非零退出码（Ctrl-C 中断 `--wait` 返回 `130`）。
-- 幂等键：`--idempotency-key` 在本地记录键 → Experiment ID（`ACO_CLI_STATE`，默认 `~/.config/aco/cli.json`），同键重复 `run` 返回既有批次，不重复创建。
+- 幂等键：`--idempotency-key` 同时发送给服务端与本地 ledger（`ACO_CLI_STATE`，默认 `~/.config/aco/cli.json`）。服务端是幂等权威（#35）：相同 key 重试返回既有批次（即使本地 ledger 丢失）；相同 key 但参数不同返回 `409`。本地 ledger 只是便利缓存，同键重复 `run` 命中缓存时直接查询既有批次。
 
 ## 结果查询、趋势与题目 × 配置矩阵（#19）
 
