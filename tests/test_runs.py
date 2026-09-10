@@ -6,7 +6,7 @@ import shutil
 
 import pytest
 
-from aco import db, runs
+from aco import db, runs, supervisor
 from aco.execution import claim_next_planned, recover_stale_claims, reap_lost_supervisors
 from aco.supervisor import UnsupportedTarget, translate_profile
 
@@ -307,3 +307,58 @@ def test_pi_task_dir_defaults_allowlist_to_gateway(tmp_path, monkeypatch):
                    gateway=gateway_config(tmp_path, "run-3"))
     toml = (tmp_path / "task" / "task.toml").read_text()
     assert f'"{supervisor.gateway_ip("run-3")}"' in toml
+
+
+# ------------------------------------------- stale-network sweep guard (#52)
+
+class TestStaleSweepGuard:
+    """The subnet-overlap retry must never remove a live sibling's network
+    (#52); leftovers (no attached containers) are still cleaned up."""
+
+    def _fake_docker(self, monkeypatch, containers_by_net):
+        """containers_by_net maps network name -> attached container count."""
+        import types
+        nets = list(containers_by_net)
+        ls = types.SimpleNamespace(stdout="\n".join(nets) + "\n")
+        monkeypatch.setattr(supervisor.subprocess, "run",
+                            lambda *a, **k: ls)
+        removed = []
+        def fake_command(*args, check=True):
+            if args[1] == "network" and args[2] == "inspect":
+                name = args[5]
+                count = containers_by_net.get(name, 0)
+                return types.SimpleNamespace(stdout=f"{count}\n", returncode=0)
+            if args[1] == "network" and args[2] == "rm":
+                removed.append(args[3])
+            return types.SimpleNamespace(stdout="", returncode=0)
+        monkeypatch.setattr(supervisor, "command", fake_command)
+        return removed
+
+    def test_leftover_network_is_removed(self, monkeypatch):
+        removed = self._fake_docker(
+            monkeypatch, {"aco-deadbeef1234__env_default": 0})
+        preserved = supervisor._remove_stale_trial_networks("current-run")
+        assert removed == ["aco-deadbeef1234__env_default"]
+        assert preserved == []
+
+    def test_live_sibling_network_is_preserved(self, monkeypatch):
+        removed = self._fake_docker(
+            monkeypatch, {"aco-livecont9999__env_default": 2,
+                          "aco-deadbeef1234__env_default": 0})
+        preserved = supervisor._remove_stale_trial_networks("current-run")
+        assert removed == ["aco-deadbeef1234__env_default"]
+        assert preserved == ["aco-livecont9999__env_default"]
+
+    def test_own_network_never_touched(self, monkeypatch):
+        own = supervisor._trial_network_name("current-run")
+        removed = self._fake_docker(monkeypatch, {own: 1})
+        preserved = supervisor._remove_stale_trial_networks("current-run")
+        assert removed == []
+        assert preserved == []
+
+    def test_blocked_subnet_diagnostic_names_octet_and_survivor(self):
+        err = supervisor._subnet_blocked_error(
+            "current-run", ["aco-livecont9999__env_default"])
+        msg = str(err)
+        assert supervisor.gateway_subnet("current-run") in msg
+        assert "aco-livecont9999__env_default" in msg
