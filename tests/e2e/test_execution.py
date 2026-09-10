@@ -349,6 +349,42 @@ class TestSealedAnswers:
         # takes the answers/ place
         assert answer_dir in published_dirs(stack["root"])
 
+    def test_sealed_answer_excludes_post_submit_writes(self, stack):
+        """The agent keeps writing after its submit intent (#16 reopen): the
+        watchdog stops the container, and the sealed answer contains nothing
+        written after the submit. The late writes start >= 2s after the POST
+        (vs a 0.5s poll), so exclusion is deterministic; if the watchdog ever
+        stops firing, late.txt appears in the sealed answer and this fails."""
+        base = stack["base"]
+        trial_id = create_trial(base, "FAKE:submit-late-write\nlate writes stay out",
+                                {"harness": "fake", "model": "none"})
+        run = wait_for_run(base, trial_id, timeout=60)
+        assert run["exit_kind"] == "submit"
+
+        events = [p["event"] for p in run["phases"]]
+        # non-vacuous proof the watchdog stopped a live agent: the poll fired
+        # while the agent was still mid-run (sleeping past its submit)
+        assert "submit_watch_fired" in events, run["phases"]
+        sealed_phase = next(p for p in run["phases"] if p["event"] == "sealed")
+        answer_dir = stack["root"] / "answers" / sealed_phase["answer_digest"]
+        manifest = read_manifest(answer_dir)
+        assert manifest["trigger"] == "submit"
+
+        # the sealed workspace froze at submit time: pre-submit answer.txt,
+        # no post-submit late.txt
+        assert (answer_dir / "workspace" / "answer.txt").is_file()
+        assert list(answer_dir.glob("workspace/late*")) == []
+
+        conn = sqlite3.connect(stack["root"] / "aco.db")
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT seal_trigger, status FROM sealed_answers WHERE trial_id = ?",
+                (trial_id,)).fetchone()
+        finally:
+            conn.close()
+        assert row["status"] == "sealed" and row["seal_trigger"] == "submit"
+
     def test_background_writer_cannot_change_sealed_answer(self, stack):
         """Parent (agent) exits while a background writer keeps writing:
         the sealed snapshot freezes at pause time and stays byte-stable, while
@@ -399,3 +435,46 @@ class TestSealedAnswers:
             conn.close()
         assert sealed["status"] == "sealed"
         assert sealed["receipt_id"]  # generated: no submission receipt existed
+
+    def test_harbor_agent_timeout_uses_timeout_verdict_path(self, stack):
+        """Harbor's own AgentTimeoutError lands on the same verdict path as
+        the ACO outer deadline (#16 reopen): a timeout run, a sealed answer
+        with trigger 'timeout', and a timeout_verdict event carrying the
+        planned deadline, the freeze time, and the eligibility verdict."""
+        base = stack["base"]
+        trial_id = create_trial(base, "FAKE:sleep\nhang past the deadline",
+                                {"harness": "fake", "model": "none"})
+        run = wait_for_run(base, trial_id, timeout=120)
+        assert run["exit_kind"] == "timeout"  # never a plain agent_error
+
+        sealed_phase = next(p for p in run["phases"] if p["event"] == "sealed")
+        assert sealed_phase["event"] == "sealed"
+        manifest = read_manifest(stack["root"] / "answers" / sealed_phase["answer_digest"])
+        # the manifest is content-addressed and immutable at seal time; the
+        # authoritative termination reason is the DB seal_trigger below
+        assert manifest["trigger"] in ("exit", "timeout")
+
+        timeout_phase = next(p for p in run["phases"] if p["event"] == "trial_timeout")
+        assert timeout_phase["source"] in ("outer_deadline", "harbor_agent_timeout")
+
+        conn = sqlite3.connect(stack["root"] / "aco.db")
+        conn.row_factory = sqlite3.Row
+        try:
+            verdict = conn.execute(
+                "SELECT reason, detail FROM lifecycle_events"
+                " WHERE trial_id = ? AND event = 'timeout_verdict'", (trial_id,)
+            ).fetchone()
+            trial_status = conn.execute(
+                "SELECT status FROM trials WHERE id = ?", (trial_id,)).fetchone()[0]
+            answer = conn.execute(
+                "SELECT status, seal_trigger FROM sealed_answers WHERE trial_id = ?",
+                (trial_id,)).fetchone()
+        finally:
+            conn.close()
+        assert verdict is not None
+        detail = json.loads(verdict["detail"])
+        assert {"planned_deadline", "frozen_at", "verdict"} <= set(detail)
+        assert verdict["reason"] == "within_tolerance"  # hang ~= the deadline, grace absorbs it
+        assert answer["seal_trigger"] == "timeout"
+        assert answer["status"] == "sealed"  # eligible: stays a capability sample
+        assert trial_status == "sealed"  # the funnel terminalised the trial

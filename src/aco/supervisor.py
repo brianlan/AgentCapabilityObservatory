@@ -15,7 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import artifacts, db, runs
+from . import artifacts, db, lifecycle, runs
 
 # pinned at adoption; prototype verified the installed package against this
 # source commit byte-for-byte (prototypes/harbor-freeze evidence).
@@ -28,6 +28,7 @@ IMAGE = "python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c
 RUN_LABEL = "aco.run"
 DEFAULT_AGENT_TIMEOUT_SEC = 20
 TRIAL_GRACE_SEC = 90
+SUBMIT_POLL_SEC = 0.5
 
 FAKE_HARNESS = "fake"
 # the fake target calls no model; anything model-shaped is unsupported, never
@@ -130,6 +131,29 @@ def _has_submission(conn: sqlite3.Connection, trial_id: str) -> bool:
     ).fetchone() is not None
 
 
+def _finish_trial_from_answer(conn: sqlite3.Connection, trial_id: str,
+                              run_id: str, trigger: str) -> None:
+    """Route the trial's terminal state through the one funnel, using the
+    outcome the seal actually recorded (sealed or anomaly). First legal
+    trigger wins inside finish_trial; a losing trigger cannot rewrite."""
+    row = conn.execute(
+        "SELECT status FROM sealed_answers WHERE trial_id = ?", (trial_id,)
+    ).fetchone()
+    outcome = row["status"] if row is not None and row["status"] in ("sealed", "anomaly") else "anomaly"
+    lifecycle.finish_trial(conn, trial_id, trigger, outcome, run_id=run_id)
+
+
+def _fail_before_agent_start(conn: sqlite3.Connection, run: sqlite3.Row,
+                             trigger: str, detail: str) -> None:
+    """A run that can never start the agent (invalid contract, unsupported
+    target) is terminal: a diagnostic anomaly — never a rerun, never a
+    capability sample (#16)."""
+    artifacts.mark_anomaly(conn, run["trial_id"], run["run_id"],
+                           f"{trigger}: {detail}", trigger=trigger)
+    lifecycle.finish_trial(conn, run["trial_id"], trigger, "anomaly",
+                           run_id=run["run_id"], detail=detail)
+
+
 def _seal_after_run(conn: sqlite3.Connection, run: sqlite3.Row, container_id: str | None,
                     trigger: str, root: Path, baseline_dir: Path,
                     contract: artifacts.ArtifactContract) -> None:
@@ -183,6 +207,19 @@ def _record_timeout_verdict(conn: sqlite3.Connection, run: sqlite3.Row,
     )
 
 
+def _retrigger_answer(conn: sqlite3.Connection, trial_id: str, run_id: str) -> None:
+    """Correct an AGENT_END-hook seal to 'timeout' when the deadline won the
+    termination race (#16 reopen). The hook seals with the best trigger known
+    at that moment ('exit' when nothing was submitted) — but a harbor agent
+    timeout fires AGENT_END too, and the first legal termination reason is
+    the timeout, not the mechanical agent end. Content, receipt, and a
+    submit-won seal are never touched."""
+    conn.execute(
+        "UPDATE sealed_answers SET seal_trigger = 'timeout' WHERE trial_id = ?"
+        " AND status = 'sealed' AND seal_trigger = 'exit'", (trial_id,))
+    conn.commit()
+
+
 async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) -> None:
     run_id = run["run_id"]
     trial = conn.execute("SELECT * FROM trials WHERE id = ?", (run["trial_id"],)).fetchone()
@@ -202,6 +239,7 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     except artifacts.SealError as exc:
         runs.finish_run(conn, run_id, "error", runs.EXIT_CONTRACT_INVALID,
                         f"task artifact contract invalid: {exc}")
+        _fail_before_agent_start(conn, run, "contract_invalid", str(exc))
         return
 
     # fail before any side effect on unsupported profiles
@@ -209,6 +247,7 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         agent_timeout_sec = translate_profile(profile)
     except UnsupportedTarget as exc:
         runs.finish_run(conn, run_id, "error", runs.EXIT_UNSUPPORTED_TARGET, str(exc))
+        _fail_before_agent_start(conn, run, "unsupported_target", str(exc))
         return
 
     from harbor.models.trial.config import (
@@ -232,13 +271,23 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         nonlocal container_id, agent_started_at
         container_id = await asyncio.to_thread(discover_container, run_id)
         runs.mark_running(conn, run_id, container_id=container_id, image=IMAGE)
+        lifecycle.mark_trial_running(conn, run["trial_id"])  # claimed -> running (#16)
         security = await asyncio.to_thread(container_security_summary, container_id)
         agent_started_at = runs.add_phase(conn, run_id, "agent_start", container_id=container_id,
                                           container_security=security)
         # pre-agent baseline for the manifest's added/modified/deleted diff
         await asyncio.to_thread(artifacts.snapshot_baseline, container_id, baseline_dir, contract)
 
+    submit_stopped = False
+    agent_ended = False
+
     async def on_agent_end(_event):
+        # the seal lives here because the container only exists while harbor's
+        # run() is in flight — harbor reaps it afterwards. The trigger is the
+        # best knowledge at this moment; handle_timeout corrects it to
+        # 'timeout' when the deadline actually won the termination race.
+        nonlocal agent_ended
+        agent_ended = True
         runs.add_phase(conn, run_id, "agent_end")
         trigger = "submit" if _has_submission(conn, run["trial_id"]) else "exit"
         await asyncio.to_thread(_seal_after_run, conn, run, container_id,
@@ -258,25 +307,79 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     trial_obj.add_hook(TrialEvent.AGENT_END, on_agent_end)
 
     runs.observe_run(conn, run_id, ADAPTER_VERSION, HARBOR_VERSION, str(trials_dir))
-    try:
-        result = await asyncio.wait_for(trial_obj.run(), timeout=agent_timeout_sec + TRIAL_GRACE_SEC)
-    except asyncio.TimeoutError:
-        runs.add_phase(conn, run_id, "trial_timeout")
+
+    submit_stopped = False
+
+    async def watch_submit():
+        """First legal trigger wins (#16 reopen): the moment a persisted
+        submit intent exists, stop the agent container. Writes racing the
+        SUBMIT_POLL_SEC window land in the frozen post-stop state; nothing
+        written after the stop can reach the sealed answer."""
+        nonlocal submit_stopped
+        while True:
+            await asyncio.sleep(SUBMIT_POLL_SEC)
+            # agent_ended check: once the agent ended, the AGENT_END hook owns
+            # the terminal seal — stopping a sealing container would only
+            # misattribute the run's exit
+            if _has_submission(conn, run["trial_id"]) and not agent_ended:
+                runs.add_phase(conn, run_id, "submit_watch_fired")
+                if container_id is not None:
+                    await asyncio.to_thread(
+                        command, "docker", "stop", "-t", "1", container_id, check=False)
+                    submit_stopped = True
+                return
+
+    async def handle_timeout(source: str, detail: str) -> None:
+        """One path for the ACO outer deadline and Harbor's own agent
+        timeout (#16 reopen): seal, planned deadline / actual freeze /
+        tolerance verdict, terminal run and trial."""
+        runs.add_phase(conn, run_id, "trial_timeout", source=source)
         await asyncio.to_thread(_seal_after_run, conn, run, container_id,
                                 "timeout", root, baseline_dir, contract)
+        await asyncio.to_thread(_retrigger_answer, conn, run["trial_id"], run_id)
         _record_timeout_verdict(conn, run, agent_started_at, agent_timeout_sec)
-        runs.finish_run(conn, run_id, "error", runs.EXIT_TIMEOUT,
-                        f"trial exceeded {agent_timeout_sec + TRIAL_GRACE_SEC}s")
-        return
-    finally:
-        if container_id is None:
-            cleanup_container(run_id)
+        runs.finish_run(conn, run_id, "error", runs.EXIT_TIMEOUT, detail)
+        await asyncio.to_thread(_finish_trial_from_answer, conn, run["trial_id"], run_id, "timeout")
 
-    exception = result.exception_info.exception_type if result.exception_info else None
-    exit_kind = runs.EXIT_AGENT_ERROR if exception else runs.EXIT_NORMAL
-    runs.add_phase(conn, run_id, "trial_finished", exception=exception,
-                   verifier_scored=result.verifier_result is not None)
-    runs.finish_run(conn, run_id, "finished", exit_kind, exception)
+    run_task = asyncio.create_task(trial_obj.run())
+    watcher = asyncio.create_task(watch_submit())
+    try:
+        try:
+            result = await asyncio.wait_for(run_task, timeout=agent_timeout_sec + TRIAL_GRACE_SEC)
+        except asyncio.TimeoutError:
+            await handle_timeout("outer_deadline",
+                                 f"trial exceeded {agent_timeout_sec + TRIAL_GRACE_SEC}s")
+            return
+        except Exception as exc:  # noqa: BLE001 — Harbor may raise the agent timeout
+            if "AgentTimeoutError" in f"{type(exc).__name__}: {exc}":
+                await handle_timeout("harbor_agent_timeout", str(exc))
+                return
+            raise
+
+        exception = result.exception_info.exception_type if result.exception_info else None
+        if exception and "AgentTimeoutError" in str(exception):
+            # Harbor's own agent timeout lands on the same verdict path as the
+            # outer deadline — it never bypasses eligibility (#16 reopen)
+            await handle_timeout("harbor_agent_timeout", str(exception))
+            return
+
+        trigger = "submit" if _has_submission(conn, run["trial_id"]) else "exit"
+        if trigger == "submit" and (exception or submit_stopped):
+            # the supervisor ended the run: the submit watchdog stopped the
+            # container (a harbor-stopped container raises no exception), or
+            # the agent died after submit — submit is the termination reason
+            exit_kind, detail = runs.EXIT_SUBMIT, "agent ended by submit-won container stop"
+        else:
+            exit_kind, detail = (runs.EXIT_AGENT_ERROR, exception) if exception else (runs.EXIT_NORMAL, None)
+        runs.add_phase(conn, run_id, "trial_finished", exception=exception,
+                       verifier_scored=result.verifier_result is not None)
+        runs.finish_run(conn, run_id, "finished", exit_kind, detail)
+        await asyncio.to_thread(_finish_trial_from_answer, conn, run["trial_id"], run_id, trigger)
+    finally:
+        watcher.cancel()
+        if container_id is None:
+            # never discovered: no seal can reference it; remove labeled leftovers
+            cleanup_container(run_id)
 
 
 def main() -> int:
@@ -298,6 +401,13 @@ def main() -> int:
         if runs.get_run(conn, args.run_id)["status"] in ("launching", "running"):
             runs.finish_run(conn, args.run_id, "error", runs.EXIT_AGENT_ERROR,
                             f"{type(exc).__name__}: {exc}")
+        # the trial must land in a terminal state even when the supervisor
+        # itself crashes: a diagnostic anomaly, never a rerun (#16). A seal
+        # that already won stays sealed (mark_anomaly is exactly-once).
+        artifacts.mark_anomaly(conn, run["trial_id"], args.run_id,
+                               f"supervisor crash: {type(exc).__name__}: {exc}",
+                               trigger="supervisor_crash")
+        _finish_trial_from_answer(conn, run["trial_id"], args.run_id, "supervisor_crash")
         cleanup_container(args.run_id)
         return 1
     return 0

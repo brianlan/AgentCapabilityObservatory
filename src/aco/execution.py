@@ -39,31 +39,44 @@ def mint_token(api_url: str, trial_id: str, token: str) -> str | None:
 
 
 def claim_next_planned(conn) -> str | None:
-    """Atomically move the oldest planned trial of a planned experiment to
-    claimed; single winner. Paused/cancelled experiments never start work."""
+    """Atomically move the oldest planned trial of an active experiment to
+    claimed; single winner. Paused/cancelled/completed experiments never
+    start work. First claim flips the experiment planned -> running."""
     row = conn.execute(
         "UPDATE trials SET status = 'claimed'"
         " WHERE id = (SELECT t.id FROM trials t JOIN experiments e ON e.id = t.experiment_id"
-        "             WHERE t.status = 'planned' AND e.status = 'planned' ORDER BY t.rowid LIMIT 1)"
-        " RETURNING id"
+        "             WHERE t.status = 'planned' AND e.status IN ('planned', 'running')"
+        "             ORDER BY t.rowid LIMIT 1)"
+        " RETURNING id, experiment_id"
     ).fetchone()
+    if row is None:
+        conn.commit()
+        return None
+    conn.execute(
+        "UPDATE experiments SET status = 'running' WHERE id = ? AND status = 'planned'",
+        (row["experiment_id"],),
+    )
     conn.commit()
-    return row["id"] if row else None
+    return row["id"]
 
 
 def recover_stale_claims(conn) -> None:
     """Manager crash between claim and spawn leaves claimed trials without a
-    run; reset them so they are picked up again."""
+    run; reset only those. A trial with a launch intent (any trial_runs row,
+    active or finished) is never reset — an attempted trial can never be
+    silently re-answered (#16 reopen)."""
     conn.execute(
         "UPDATE trials SET status = 'planned' WHERE status = 'claimed' AND id NOT IN"
-        " (SELECT trial_id FROM trial_runs WHERE status IN ('launching', 'running'))"
+        " (SELECT trial_id FROM trial_runs)"
     )
     conn.commit()
 
 
 def reap_lost_supervisors(conn) -> None:
     """Supervisor died without recording an outcome: keep the intent, record
-    the loss, and clean up only containers carrying our label."""
+    the loss, clean up only containers carrying our label, and terminal the
+    trial as an execution-condition anomaly — never a rerun, never a
+    capability sample."""
     for run in runs.unfinished_runs(conn):
         pid = run["supervisor_pid"]
         if os.path.exists(f"/proc/{pid}"):
@@ -72,6 +85,18 @@ def reap_lost_supervisors(conn) -> None:
         runs.finish_run(conn, run["run_id"], "error", runs.EXIT_SUPERVISOR_LOST,
                         f"supervisor pid {pid} disappeared without recording an outcome")
         cleanup_container(run["run_id"])
+        artifacts.mark_anomaly(conn, run["trial_id"], run["run_id"],
+                               f"supervisor pid {pid} disappeared without recording an outcome",
+                               trigger="supervisor_lost")
+        # the outcome follows the answer row, not the supervisor's death: a
+        # seal recovered from disk truth stays officially sealed (ADR 0003)
+        answer = conn.execute(
+            "SELECT status FROM sealed_answers WHERE trial_id = ?", (run["trial_id"],)
+        ).fetchone()
+        outcome = answer["status"] if answer is not None and answer["status"] in ("sealed", "anomaly") else "anomaly"
+        lifecycle.finish_trial(conn, run["trial_id"], "supervisor_lost", outcome,
+                               run_id=run["run_id"],
+                               detail=f"supervisor pid {pid} lost")
 
 
 def run_one(conn, root: Path, api_url: str, api_token: str, session_api_url: str) -> bool:
@@ -126,14 +151,43 @@ def run_one(conn, root: Path, api_url: str, api_token: str, session_api_url: str
     return True
 
 
+def reconcile_terminal_trials(conn) -> int:
+    """A crash between sealing and the trial-state write leaves a terminal
+    answer on a non-terminal trial. Recovery trusts the answer rows (disk +
+    database truth), never re-collects, and moves each such trial through
+    the same finish_trial funnel (#16 reopen)."""
+    reconciled = 0
+    rows = conn.execute(
+        "SELECT s.trial_id, s.status FROM sealed_answers s JOIN trials t ON t.id = s.trial_id"
+        " WHERE s.status IN ('sealed', 'anomaly')"
+        " AND t.status NOT IN ('sealed', 'anomaly', 'cancelled')"
+    ).fetchall()
+    for row in rows:
+        if lifecycle.finish_trial(conn, row["trial_id"], "startup_recovery", row["status"]):
+            reconciled += 1
+    # experiments whose trials all finished across the crash still complete
+    for row in conn.execute(
+        "SELECT DISTINCT t.experiment_id AS eid FROM trials t"
+        " JOIN experiments e ON e.id = t.experiment_id"
+        " WHERE e.status IN ('planned', 'running', 'paused')"
+        " AND t.status NOT IN ('planned', 'claimed', 'running')"
+    ).fetchall():
+        lifecycle.complete_experiment_if_done(conn, row["eid"])
+    conn.commit()
+    return reconciled
+
+
 def startup_recovery(conn, root: Path) -> None:
     """One-time reconciliation at manager startup (#16), in order: stale
-    claims (launch intent is authoritative), lost supervisors, interrupted
-    seals from disk truth (#14), adoption of live supervisors, requeue of
-    stuck scoring, and pausing unstarted plans until explicit resume."""
+    claims (launch intent is authoritative), interrupted seals from disk
+    truth (#14 — disk truth wins before supervisor reaping flags an anomaly),
+    lost supervisors, terminal-answer reconciliation, adoption of live
+    supervisors, requeue of stuck scoring, and pausing unstarted plans until
+    explicit resume."""
     recover_stale_claims(conn)
-    reap_lost_supervisors(conn)
     artifacts.recover(conn, root)
+    reap_lost_supervisors(conn)
+    reconcile_terminal_trials(conn)
     lifecycle.adopt_live_supervisors(conn)  # surviving supervisors keep running, never rerun (#16)
     verification.requeue_stuck_running(conn)  # scoring has no side effects; requeue is safe (#16)
     lifecycle.pause_unstarted_on_restart(conn)  # unstarted plans wait for explicit resume (#16)

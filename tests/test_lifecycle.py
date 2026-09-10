@@ -127,7 +127,9 @@ class TestCancel:
         resp = client.post("/v1/experiments/e1/cancel")
         assert resp.status_code == 200
         assert resp.json() == {"status": "cancelled", "cancelled": 0, "stopped": 0, "untouched": 1}
-        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "claimed"
+        # the sealed answer keeps its official eligibility: the trial is
+        # terminal 'sealed', never retroactively cancelled
+        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "sealed"
         assert conn.execute("SELECT status FROM sealed_answers WHERE trial_id = 't1'").fetchone()[0] == "sealed"
 
     def test_cancel_stops_running_run_and_marks_anomaly(self, client, conn, monkeypatch):
@@ -183,8 +185,10 @@ class TestRestart:
         assert claim_next_planned(conn) is None  # paused plans never start implicitly
         resp = client.post("/v1/experiments/e1/resume")
         assert resp.status_code == 200
-        assert resp.json() == {"status": "planned", "resumed": 2}
+        assert resp.json() == {"status": "running", "resumed": 2}
         assert claim_next_planned(conn) == "t1"
+        # the first claim flips the experiment to running (state machine)
+        assert conn.execute("SELECT status FROM experiments WHERE id = 'e1'").fetchone()[0] == "running"
 
     def test_resume_without_pause_is_idempotent_noop(self, client, conn):
         make_experiment(conn)
@@ -210,18 +214,50 @@ class TestRestart:
         assert event["reason"] == "supervisor_survived_restart"
 
     def test_unknowable_start_is_never_rerun(self, conn):
-        """Run in 'launching' with an unreadable pid: the trial stays claimed
-        (diagnostics only) and never silently returns to the plan."""
+        """Run in 'launching' with an unreadable pid: the trial ends as an
+        execution-condition anomaly — explainable, terminal, never silently
+        returned to the plan, never re-answered."""
         make_experiment(conn, n_trials=1)
         runs.create_run(conn, "t1", {}, supervisor_pid=-1)
         conn.execute("UPDATE trials SET status = 'claimed' WHERE id = 't1'")
         conn.commit()
         recover_stale_claims(conn)
         reap_lost_supervisors(conn)
-        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "claimed"
+        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "anomaly"
         assert claim_next_planned(conn) is None
         run = runs.get_run(conn, runs.list_runs(conn, "t1")[0]["run_id"])
         assert run["exit_kind"] == "supervisor_lost"  # explainable, not rerun
+        row = conn.execute(
+            "SELECT status, seal_trigger FROM sealed_answers WHERE trial_id = 't1'").fetchone()
+        assert row["status"] == "anomaly" and row["seal_trigger"] == "supervisor_lost"
+
+    def test_sealed_trial_is_not_reclaimed_after_restart(self, conn, tmp_path):
+        """A trial sealed before the manager died: restart leaves it sealed,
+        claims nothing for it, and the experiment auto-completes (#16 reopen:
+        completed/sealed trials are never re-claimed)."""
+        from aco.execution import startup_recovery
+
+        make_experiment(conn, n_trials=1)
+        run_id = runs.create_run(conn, "t1", {}, supervisor_pid=-1)
+        conn.execute("UPDATE trials SET status = 'claimed' WHERE id = 't1'")
+        # a real published answer: the seal is content-addressed disk truth,
+        # not just a database row
+        staging = tmp_path / "sealing" / run_id / "staging"
+        (staging / "workspace").mkdir(parents=True)
+        (staging / "workspace" / "answer.txt").write_bytes(b"sealed before the crash")
+        manifest = artifacts.build_manifest(staging, "t1", run_id, "submit", None)
+        (staging / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+        artifacts.recover(conn, tmp_path)  # publish + register from disk truth
+        conn.commit()
+
+        startup_recovery(conn, tmp_path)  # the exact manager-startup sequence
+
+        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "sealed"
+        assert claim_next_planned(conn) is None  # terminal: never re-claimed
+        assert conn.execute("SELECT status FROM experiments WHERE id = 'e1'").fetchone()[0] == "completed"
+        events = [r["event"] for r in conn.execute(
+            "SELECT event FROM lifecycle_events WHERE experiment_id = 'e1' ORDER BY rowid")]
+        assert events[-1] == "completed"
 
     def test_stuck_running_verification_is_requeued(self, conn):
         make_experiment(conn, n_trials=1)
@@ -271,7 +307,7 @@ class TestTerminationRaces:
         # the official answer stands untouched: exactly one answer row, sealed
         assert conn.execute("SELECT COUNT(*) FROM sealed_answers").fetchone()[0] == 1
         assert conn.execute("SELECT status FROM sealed_answers WHERE trial_id = 't1'").fetchone()[0] == "sealed"
-        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "claimed"
+        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "sealed"
         # the in-flight run was still stopped (diagnostic only)
         assert runs.get_run(conn, run_id)["exit_kind"] == "cancelled"
 
@@ -378,7 +414,7 @@ class TestRestartDuringSealing:
         runs_rows = conn.execute("SELECT run_id FROM trial_runs WHERE trial_id = 't1'").fetchall()
         assert len(runs_rows) == 1  # no second run, no rerun
         trial = conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0]
-        assert trial == "claimed"  # never silently returns to the plan
+        assert trial == expected_status  # finished or flagged from disk truth, terminal
         answer = conn.execute(
             "SELECT status, digest, receipt_id FROM sealed_answers WHERE trial_id = 't1'").fetchone()
         assert answer["status"] == expected_status
@@ -414,6 +450,55 @@ def _session_client_for(conn):
     from aco.app import create_session_app
     db_file = Path(conn.execute("PRAGMA database_list").fetchone()[2])
     return TestClient(create_session_app(data_root=str(db_file.parent)))
+
+
+class TestFinishTrial:
+    """The one funnel to a terminal trial state (ADR 0003, #16 reopen):
+    first legal trigger wins, every trial terminalises, experiments
+    auto-complete — and a cancelled experiment never becomes completed."""
+
+    def test_first_legal_trigger_wins(self, conn):
+        make_experiment(conn, n_trials=1)
+        runs.create_run(conn, "t1", {}, supervisor_pid=-1)
+        conn.execute("UPDATE trials SET status = 'running' WHERE id = 't1'")
+        seal_row(conn, "t1", status="sealed")
+        conn.commit()
+
+        assert lifecycle.finish_trial(conn, "t1", "submit", "sealed") is True
+        # losing triggers cannot rewrite history or resurrect the trial
+        assert lifecycle.finish_trial(conn, "t1", "timeout", "anomaly") is False
+        assert lifecycle.finish_trial(conn, "t1", "explicit_cancel", "cancelled") is False
+
+        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "sealed"
+        reasons = [r["reason"] for r in conn.execute(
+            "SELECT reason FROM lifecycle_events"
+            " WHERE trial_id = 't1' AND event = 'trial_finished'")]
+        assert reasons == ["submit"]  # exactly one termination reason
+
+    def test_invalid_outcome_rejected(self, conn):
+        make_experiment(conn, n_trials=1)
+        with pytest.raises(ValueError):
+            lifecycle.finish_trial(conn, "t1", "exit", "finished")
+
+    def test_experiment_auto_completes_when_all_trials_terminal(self, conn):
+        make_experiment(conn, n_trials=2)
+        lifecycle.finish_trial(conn, "t1", "exit", "sealed")
+        # t2 is still open: the experiment is not completed yet
+        assert conn.execute("SELECT status FROM experiments WHERE id = 'e1'").fetchone()[0] == "planned"
+        lifecycle.finish_trial(conn, "t2", "timeout", "anomaly")
+        assert conn.execute("SELECT status FROM experiments WHERE id = 'e1'").fetchone()[0] == "completed"
+        event = conn.execute(
+            "SELECT reason FROM lifecycle_events"
+            " WHERE experiment_id = 'e1' AND event = 'completed'").fetchone()
+        assert event["reason"] == "all_trials_terminal"
+
+    def test_cancelled_experiment_stays_cancelled(self, conn):
+        make_experiment(conn, n_trials=1, status="cancelled")
+        lifecycle.finish_trial(conn, "t1", "exit", "sealed")
+        assert conn.execute("SELECT status FROM experiments WHERE id = 'e1'").fetchone()[0] == "cancelled"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM lifecycle_events"
+            " WHERE experiment_id = 'e1' AND event = 'completed'").fetchone()[0] == 0
 
 
 class TestTimeoutVerdict:
@@ -465,8 +550,9 @@ class TestProgress:
         seal_row(conn, "t2")
         conn.commit()
         body = client.get("/v1/experiments/e1").json()
-        assert body["progress"] == {"planned": 0, "claimed": 1, "cancelled": 1,
-                                    "sealed": 1, "anomaly": 0, "attempted": 1}
+        assert body["progress"] == {"planned": 0, "claimed": 1, "running": 0,
+                                    "cancelled": 1, "sealed": 1, "anomaly": 0,
+                                    "attempted": 1}  # t1 cancelled pre-launch: never attempted
 
 
 class TestEvents:
