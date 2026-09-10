@@ -43,7 +43,7 @@ def insert_trial(conn, trial_id="t1"):
 
 class TestTranslateProfile:
     def test_bare_fake_profile_is_supported(self):
-        assert translate_profile({"harness": "fake", "model": "none"}) == 20
+        assert translate_profile({"harness": "fake", "model": "none"}) == ("fake", 20)
 
     def test_real_harness_fails_explicitly(self):
         with pytest.raises(UnsupportedTarget, match="unsupported harness 'codex'"):
