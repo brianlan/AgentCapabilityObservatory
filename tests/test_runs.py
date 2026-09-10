@@ -238,13 +238,72 @@ class TestSkillMaterialization:
         assert state[0]["verified"] is False
         assert state[0]["observed"] == "bundle_missing"
 
-    def test_build_task_dir_mounts_declared_skills_readonly(self, tmp_path):
-        from aco.supervisor import build_task_dir, pi_agent
+    def test_build_task_dir_mounts_declared_skills_readonly(self, tmp_path, monkeypatch):
+        from aco.supervisor import build_task_dir, gateway_config, pi_agent
+        monkeypatch.setenv("ARK_AGENT_PLAN_BASE_URL", "https://ark.example.com/api/v3")
+        monkeypatch.setenv("ACO_BASE_URL", "http://127.0.0.1:8100")
         mounts = [{"name": "demo", "host_dir": "/data/skills/abc123"}]
-        task_dir = build_task_dir(tmp_path, "prompt", 30, "run1",
-                                  harness="pi", skill_mounts=mounts)
+        task_dir = build_task_dir(tmp_path, "prompt", 30, "run1", harness="pi",
+                                  skill_mounts=mounts,
+                                  gateway=gateway_config(tmp_path, "run1"))
         compose = (task_dir / "offline.yaml").read_text()
-        assert f'"/data/skills/abc123:{pi_agent._PI_CONTAINER_SKILL_ROOT}/demo:ro"' in compose
-        # the no-skill compose stays unchanged
-        plain = build_task_dir(tmp_path / "plain", "prompt", 30, "run2", harness="pi")
-        assert "volumes:" not in (plain / "offline.yaml").read_text()
+        main_block = compose.split("  main:")[1]
+        assert f'"/data/skills/abc123:{pi_agent._PI_CONTAINER_SKILL_ROOT}/demo:ro"' in main_block
+        # the no-skill compose mounts nothing into the evaluated container
+        plain = build_task_dir(tmp_path / "plain", "prompt", 30, "run2", harness="pi",
+                               gateway=gateway_config(tmp_path / "plain", "run2"))
+        plain_main = (plain / "offline.yaml").read_text().split("  main:")[1]
+        assert pi_agent._PI_CONTAINER_SKILL_ROOT not in plain_main
+
+
+# --------------------------------------------------- task network policy (#38)
+
+def test_fake_task_dir_stays_offline(tmp_path):
+    from aco.supervisor import build_task_dir
+
+    build_task_dir(tmp_path, "prompt", 20, "run-1")
+    toml = (tmp_path / "task" / "task.toml").read_text()
+    compose = (tmp_path / "task" / "offline.yaml").read_text()
+    assert 'network_mode = "public"' in toml
+    assert "allowlist" not in toml
+    assert "network_mode: none" in compose
+
+
+def test_pi_task_dir_declares_allowlist_and_no_explicit_networking(tmp_path, monkeypatch):
+    """#38: the pi target's restriction comes from harbor's egress sidecar —
+    task.toml allowlists exactly the gateway service, the compose override
+    adds NO explicit networking on main (the sidecar owns the network
+    namespace), and the gateway service carries the fixed upstreams."""
+    from aco import supervisor
+    from aco.supervisor import build_task_dir, gateway_config
+
+    monkeypatch.setenv("ARK_AGENT_PLAN_BASE_URL", "https://ark.example.com/api/v3")
+    monkeypatch.setenv("ACO_BASE_URL", "http://127.0.0.1:8100")
+    gateway = gateway_config(tmp_path, "run-2")
+    build_task_dir(tmp_path, "prompt", 120, "run-2", harness="pi", gateway=gateway)
+    toml = (tmp_path / "task" / "task.toml").read_text()
+    compose = (tmp_path / "task" / "offline.yaml").read_text()
+    ip, subnet = supervisor.gateway_ip("run-2"), supervisor.gateway_subnet("run-2")
+    assert 'network_mode = "allowlist"' in toml
+    assert f'allowed_hosts = ["{ip}"]' in toml
+    main_block = compose.split("  main:")[1]
+    assert "network_mode" not in main_block  # no bridge/none override on main
+    assert "aco-gateway" in main_block  # main depends on the gateway
+    assert subnet in compose  # per-run gateway subnet (crash-leak safe, #38)
+    # the gateway: pinned python, stdlib gateway module, fixed upstreams
+    assert f"ipv4_address: {ip}" in compose  # gateway on the trial net, not the sidecar netns
+    assert "ACO_GATEWAY_PROVIDER_UPSTREAM: \"https://ark.example.com/api/v3\"" in compose
+    assert "ACO_GATEWAY_SESSION_UPSTREAM: \"http://host.docker.internal:8100\"" in compose
+    assert "/aco/gateway.py:ro" in compose
+
+
+def test_pi_task_dir_defaults_allowlist_to_gateway(tmp_path, monkeypatch):
+    from aco import supervisor
+    from aco.supervisor import build_task_dir, gateway_config
+
+    monkeypatch.setenv("ARK_AGENT_PLAN_BASE_URL", "https://ark.example.com/api/v3")
+    monkeypatch.setenv("ACO_BASE_URL", "http://127.0.0.1:8100")
+    build_task_dir(tmp_path, "prompt", 120, "run-3", harness="pi",
+                   gateway=gateway_config(tmp_path, "run-3"))
+    toml = (tmp_path / "task" / "task.toml").read_text()
+    assert f'"{supervisor.gateway_ip("run-3")}"' in toml

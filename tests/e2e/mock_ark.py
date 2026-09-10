@@ -8,17 +8,26 @@ without ever containing a real secret.
 
 import json
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ANSWER_TEXT = "PI-E2E-OK"
 
 
 class MockArk:
-    """Threaded mock; scenario switches between 'tool_call' and 'auth_fail'."""
+    """Threaded mock; scenario switches between 'tool_call' and 'auth_fail'.
+    `delay` stalls each response (network tests hold the trial open while
+    they probe the container, #38)."""
 
     def __init__(self):
         self.requests = []  # {"path","auth","model"} per POST
         self.scenario = "tool_call"
+        # stall per turn: `delay` holds calls that will produce the tool call,
+        # `delay_after_tool` holds calls that follow a tool result (the window
+        # where the deliverable exists but the agent has not finished — the
+        # in-run submit test submits inside it, #38)
+        self.delay = 0.0
+        self.delay_after_tool = 0.0
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -31,6 +40,13 @@ class MockArk:
                 outer.requests.append({"path": self.path,
                                        "auth": self.headers.get("Authorization"),
                                        "model": body.get("model")})
+                has_tool_output = any(
+                    isinstance(item, dict) and item.get("type") == "function_call_output"
+                    for item in (body.get("input") or [])
+                )
+                stall = outer.delay_after_tool if has_tool_output else outer.delay
+                if stall:
+                    time.sleep(stall)
                 if outer.scenario == "auth_fail":
                     self.send_response(401)
                     self.send_header("Content-Type", "application/json")
@@ -38,10 +54,6 @@ class MockArk:
                     self.wfile.write(b'{"error": {"message": "Invalid API key provided"}}')
                     return
                 model = body.get("model", "unknown")
-                has_tool_output = any(
-                    isinstance(item, dict) and item.get("type") == "function_call_output"
-                    for item in (body.get("input") or [])
-                )
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
@@ -79,7 +91,7 @@ class MockArk:
                         "usage": {"input_tokens": 40, "output_tokens": 6, "total_tokens": 46},
                         "output": [msg]}})
 
-        self.server = HTTPServer(("0.0.0.0", 0), Handler)
+        self.server = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     @property

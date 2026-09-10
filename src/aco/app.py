@@ -25,6 +25,7 @@ from .models import (
     AssetRef,
     ExperimentCreate,
     ExperimentOut,
+    REAL_PROVIDER_HARNESSES,
     ScorerContent,
     SuiteContent,
     TargetProfile,
@@ -207,12 +208,24 @@ def create_experiment(
         task_refs = [req.task]
     task_rows = [resolve_version(conn, "task", ref) for ref in task_refs]
 
-    # dedupe targets preserving request order
+    # paid-run gate (#38): experiments targeting a real-provider harness are
+    # created only with the explicit allow_paid_run intent. CI, pytest, and
+    # default commands never set it, so they can never create a plan that
+    # would spend money.
     target_rows = []
     for ref in req.targets:
         row = resolve_version(conn, "config", ref)
         if all(r["id"] != row["id"] for r in target_rows):
             target_rows.append(row)
+    if not req.allow_paid_run and any(
+        parse_config_content(json.loads(row["content"])).harness in REAL_PROVIDER_HARNESSES
+        for row in target_rows
+    ):
+        raise AppError(
+            403, "paid_run_not_allowed",
+            "experiment targets a real-provider target; pass allow_paid_run=true"
+            " (CLI: --allow-paid-run) to accept possible paid model calls",
+        )
 
     experiment_id = uuid.uuid4().hex
     trial_rows = []
@@ -417,6 +430,16 @@ def create_management_app(data_root: str | None = None, token: str | None = None
     @app.get("/v1/experiments/{experiment_id}", response_model=ExperimentOut)
     async def get_experiment_route(experiment_id: str):
         return get_experiment(conn, experiment_id)
+
+    # read-side of the registry: the CLI's paid-run pre-flight (#38) fetches
+    # target config content to decide whether --allow-paid-run is required
+    @app.get("/v1/versions/{kind}/{name}/{version}", response_model=VersionRecord)
+    async def get_version_route(kind: str, name: str, version: str):
+        row = fetch_version(conn, kind, name, version)
+        if row is None:
+            raise AppError(404, "version_not_found",
+                           f"{kind} {name}@{version} is not registered")
+        return version_record(row)
 
     # management path: explicit, persistent, idempotent plan changes (#16)
     @app.post("/v1/experiments/{experiment_id}/cancel")

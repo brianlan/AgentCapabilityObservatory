@@ -68,9 +68,9 @@ MODEL_METADATA = {
 }
 DEFAULT_AGENT_TIMEOUT_SEC = 120
 
-# pi talks directly to the configured endpoint; inherited proxy vars would
-# hijack the connection (host-injected proxies are unreachable from the
-# container). The restricted-egress issue (#38) owns the real policy.
+# pi talks to the per-trial gateway (#38) directly; inherited proxy vars
+# would hijack the connection (host-injected proxies are unreachable from
+# the container network namespace)
 _UNSET_PROXIES = (
     "env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy"
     " -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy"
@@ -98,14 +98,29 @@ def render_agent_flags(profile: TargetProfile) -> str:
 
 
 def ark_base_url() -> str:
+    """The provider upstream the gateway forwards to (#38): the profile's
+    fixed endpoint (mock in tests), from the trusted supervisor environment."""
     return os.environ.get(ARK_BASE_URL_ENV, ARK_DEFAULT_BASE_URL).rstrip("/")
 
 
+def provider_base_url() -> str:
+    """The base URL rendered into pi's config: the per-trial gateway when the
+    supervisor provides one (#38), the profile endpoint otherwise (unit
+    renders without a gateway). The key travels as env either way."""
+    return os.environ.get("ACO_PROVIDER_BASE_URL", ark_base_url()).rstrip("/")
+
+
 def render_dockerfile() -> str:
-    """The pinned trial image: node at a digest, pi at an exact version."""
+    """The pinned trial image: node at a digest, pi at an exact version.
+
+    WORKDIR /workspace: the artifact contract seals /workspace (#14) and the
+    agent's deliverables land there — the dir must exist before the agent
+    runs, never depend on agent behavior (#38; harbor's task template does
+    the same)."""
     return (
         f"FROM {NODE_IMAGE}\n"
-        f"RUN npm install -g --ignore-scripts {PI_PACKAGE}@{PI_VERSION}"
+        f"RUN npm install -g --ignore-scripts {PI_PACKAGE}@{PI_VERSION}\n"
+        "WORKDIR /workspace"
     )
 
 
@@ -320,7 +335,7 @@ class PiAgent(BaseInstalledAgent):
         # never reach a model call.
         try:
             key = self._credential(profile)
-            models_json = render_models_json(profile, ark_base_url())
+            models_json = render_models_json(profile, provider_base_url())
         except NonZeroAgentExitCodeError as exc:
             self._record_failure(trial_id, "credential_missing", str(exc))
             raise
@@ -411,18 +426,18 @@ class PiAgent(BaseInstalledAgent):
 def ensure_image() -> str:
     """Idempotent local build of the pinned trial image.
 
+    Builds unconditionally: docker's layer cache makes an unchanged build a
+    no-op, and a tag-exists short-circuit would keep serving a stale image
+    after any Dockerfile change (e.g. the WORKDIR fix, #38).
+
     --network host: on hosts where the docker daemon injects an
     unreachable-into-container proxy, the default build network cannot reach
-    the npm registry; host networking sidesteps that and is harmless where
-    egress is open. Revisit with the restricted-egress issue (#38).
+    the npm registry; host networking sidesteps that. Build-time only — the
+    trial network itself is restricted by the egress sidecar (#38).
     """
     import subprocess
     import tempfile
 
-    inspect = subprocess.run(["docker", "image", "inspect", PI_IMAGE_TAG],
-                             capture_output=True, timeout=30)
-    if inspect.returncode == 0:
-        return PI_IMAGE_TAG
     with tempfile.TemporaryDirectory(prefix="aco-pi-image-") as temp:
         (Path(temp) / "Dockerfile").write_text(render_dockerfile())
         build = subprocess.run(

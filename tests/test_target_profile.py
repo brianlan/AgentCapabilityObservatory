@@ -45,10 +45,11 @@ def register_pi_skills(register):
             "bundle": {"digest": "0" * 64, "bytes": 1, "files": 1}})
 
 
-def create_trial(client, config_name="t1", version="v1"):
+def create_trial(client, config_name="t1", version="v1", allow_paid_run=False):
     experiment = client.post("/v1/experiments", json={
         "task": {"name": "arith", "version": "v1"},
         "targets": [{"name": config_name, "version": version}],
+        "allow_paid_run": allow_paid_run,
     }).json()
     return experiment["trials"][0]
 
@@ -73,7 +74,8 @@ class TestTargetProfileSchema:
         register_task(register)
         register_pi_skills(register)
         register("config", "pi-main", "v1", dict(PI_PROFILE))
-        trial = create_trial(client, "pi-main")
+        # the pinned-field flow is exercised through the paid gate (#38)
+        trial = create_trial(client, "pi-main", allow_paid_run=True)
         cfg = trial["requested"]["config"]
         assert cfg["harness"] == "pi" and cfg["harness_version"] == "0.84.1"
         assert cfg["model"] == "glm-5.3-flash" and cfg["thinking"] == "max"

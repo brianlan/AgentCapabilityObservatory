@@ -292,3 +292,46 @@ def test_json_run_output_is_stable(api, state, tmp_path, capsys):
     assert {"id", "status", "requested", "created_at", "trials", "progress"} == set(doc)
     assert main(["status", doc["id"], "--api-url", api, "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == doc
+
+
+# ------------------------------------------------------- paid-run gate (#38)
+
+PI_CONFIG = {
+    "schema_version": 1,
+    "harness": "pi",
+    "harness_version": "0.84.1",
+    "model": "glm-5.3-flash",
+    "thinking": "max",
+    "provider": "ark-agent-plan",
+    "provider_api_style": "openai-responses",
+    "adapter_version": "0.1.0",
+    "credentials": ["ark-agent-plan-main"],
+}
+
+
+def test_run_refuses_real_provider_target_without_flag(api, state, tmp_path, capsys):
+    task_file = write(tmp_path, "task.json", {"prompt": "Do the thing", "tests": []})
+    config_file = write(tmp_path, "config.json", PI_CONFIG)
+    assert main(["register", "task", "paid-task", "v1", task_file, "--api-url", api]) == 0
+    assert main(["register", "config", "paid-cfg", "v1", config_file, "--api-url", api]) == 0
+
+    with pytest.raises(SystemExit) as exc:
+        main(["run", "--task", "paid-task@v1", "--target", "paid-cfg@v1", "--api-url", api])
+    assert "--allow-paid-run" in str(exc.value)
+    # refusal happened before any plan creation: no experiment for this task
+    assert "Experiment" not in capsys.readouterr().out
+
+
+def test_run_with_allow_paid_run_creates_real_provider_plan(api, state, tmp_path, capsys):
+    task_file = write(tmp_path, "task.json", {"prompt": "Do the thing", "tests": []})
+    config_file = write(tmp_path, "config.json", PI_CONFIG)
+    assert main(["register", "task", "paid-task", "v1", task_file, "--api-url", api]) == 0
+    assert main(["register", "config", "paid-cfg", "v1", config_file, "--api-url", api]) == 0
+
+    assert main(["run", "--task", "paid-task@v1", "--target", "paid-cfg@v1",
+                 "--allow-paid-run", "--api-url", api]) == 0
+    experiment_id = capsys.readouterr().out.split("Experiment ")[1].split("（")[0]
+    from urllib.request import Request, urlopen
+    doc = json.loads(urlopen(
+        Request(f"{api}/v1/experiments/{experiment_id}", headers=MGMT_AUTH)).read())
+    assert doc["requested"]["allow_paid_run"] is True

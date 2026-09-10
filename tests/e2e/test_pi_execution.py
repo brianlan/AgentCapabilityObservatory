@@ -78,7 +78,8 @@ def start_stack(root, mgmt_port, session_port, extra_env):
              "--log-level", "warning"], env=server_env,
             stdout=subprocess.DEVNULL, stderr=open(logs / "mgmt.log", "w")),
         subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "aco.app:session_app", "--port", str(session_port),
+            [sys.executable, "-m", "uvicorn", "aco.app:session_app", "--host", "0.0.0.0",
+             "--port", str(session_port),
              "--log-level", "warning"], env=server_env,
             stdout=subprocess.DEVNULL, stderr=open(logs / "session.log", "w")),
         subprocess.Popen(
@@ -91,7 +92,8 @@ def start_stack(root, mgmt_port, session_port, extra_env):
         try:
             if (http("GET", mgmt + "/healthz")[0] == 200
                     and http("GET", session_base + "/healthz")[0] == 200):
-                return {"root": root, "base": mgmt, "session_base": session_base, "procs": procs}
+                return {"root": root, "base": mgmt, "session_base": session_base,
+                        "mgmt_port": mgmt_port, "session_port": session_port, "procs": procs}
         except Exception:
             time.sleep(0.2)
     for proc in procs:
@@ -114,7 +116,7 @@ def pi_stack(tmp_path_factory):
         "ACO_DATA_ROOT": str(root),
         "ARK_AGENT_PLAN_API_KEY": DUMMY_KEY,
         # container-reachable route to the host-side mock
-        "ARK_AGENT_PLAN_BASE_URL": f"http://host.docker.internal:{mock.port}",
+        "ARK_AGENT_PLAN_BASE_URL": f"http://host.docker.internal:{mock.port}/ark",
     })
     stack["mock"] = mock
     yield stack
@@ -140,7 +142,7 @@ class TestPiExecution:
         """Claim -> pi tool call -> submit -> sealed answer + observation."""
         base = pi_stack["base"]
         trial_id = create_trial(
-            base, "write the answer file", {**PI_PROFILE})
+            base, "write the answer file", {**PI_PROFILE}, allow_paid_run=True)
         run = wait_for_run(base, trial_id, timeout=900)  # first run builds the image
 
         assert run["status"] == "finished", run
@@ -187,7 +189,8 @@ class TestPiExecution:
 
         profile = {**PI_PROFILE,
                    "skills": [{"name": "e2e-skill", "version": "v1"}]}
-        trial_id = create_trial(base, "write the answer file", profile)
+        trial_id = create_trial(base, "write the answer file", profile,
+                                allow_paid_run=True)
         run = wait_for_run(base, trial_id, timeout=300)
 
         assert run["status"] == "finished", run
@@ -215,7 +218,8 @@ class TestPiExecution:
         base = pi_stack["base"]
         pi_stack["mock"].scenario = "auth_fail"
         try:
-            trial_id = create_trial(base, "write the answer file", {**PI_PROFILE})
+            trial_id = create_trial(base, "write the answer file", {**PI_PROFILE},
+                                    allow_paid_run=True)
             run = wait_for_run(base, trial_id, timeout=300)
         finally:
             pi_stack["mock"].scenario = "tool_call"
@@ -246,10 +250,11 @@ class TestPiCredentialMissing:
         stack = start_stack(root, free_port(), free_port(), {
             "ACO_DATA_ROOT": str(root),
             # ARK_AGENT_PLAN_API_KEY deliberately absent
-            "ARK_AGENT_PLAN_BASE_URL": f"http://host.docker.internal:{mock.port}",
+            "ARK_AGENT_PLAN_BASE_URL": f"http://host.docker.internal:{mock.port}/ark",
         })
         try:
-            trial_id = create_trial(stack["base"], "write the answer file", {**PI_PROFILE})
+            trial_id = create_trial(stack["base"], "write the answer file", {**PI_PROFILE},
+                                    allow_paid_run=True)
             run = wait_for_run(stack["base"], trial_id, timeout=300)
         finally:
             stop_stack(stack)
@@ -267,5 +272,204 @@ class TestPiCredentialMissing:
             answer = conn.execute(
                 "SELECT status FROM sealed_answers WHERE trial_id = ?", (trial_id,)).fetchone()
             assert answer["status"] == "anomaly"
+        finally:
+            conn.close()
+
+
+# --------------------------------------------------------------- network (#38)
+
+def container_probe(container_id: str, url: str) -> tuple[int, str]:
+    """HTTP probe from inside the agent container via node fetch. Returns
+    (exit_code, output); exit 0 = reachable, 1 = blocked/unreachable."""
+    script = (
+        "fetch(process.argv[1],{signal:AbortSignal.timeout(5000)})"
+        ".then(r=>{console.log('STATUS',r.status);process.exit(0)},"
+        "e=>{console.error(String(e && e.cause && e.cause.code || e).slice(0,120));"
+        "process.exit(1)})"
+    )
+    result = subprocess.run(
+        ["docker", "exec", container_id, "node", "-e", script, url],
+        capture_output=True, text=True, timeout=20)
+    return result.returncode, (result.stdout + result.stderr).strip()
+
+
+def wait_running_container(base: str, trial_id: str, timeout: float = 120) -> str:
+    """Poll the run record until the agent container exists (in-run probes
+    need a live container; harbor reaps it after the run)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status, runs = http("GET", base + f"/v1/trials/{trial_id}/runs")
+        assert status == 200, runs
+        if runs:
+            container_id = runs[-1].get("container_id")
+            if container_id:
+                return container_id
+        time.sleep(0.5)
+    raise AssertionError(f"run for {trial_id} never started a container")
+
+
+def wait_phase(base: str, trial_id: str, event: str, timeout: float = 60) -> dict:
+    """Wait until the run recorded a phase and return it, i.e. the supervisor
+    finished the agent-start hooks (probes and submits from the test must not
+    race them)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status, runs = http("GET", base + f"/v1/trials/{trial_id}/runs")
+        assert status == 200, runs
+        if runs:
+            for phase in runs[-1]["phases"]:
+                if phase.get("event") == event:
+                    return phase
+        time.sleep(0.5)
+    raise AssertionError(f"phase {event!r} never recorded for {trial_id}")
+
+
+class TestNetworkIsolation:
+    """Trial network restriction (#38): the agent container reaches only the
+    allowlisted provider route and the ACO session surface; management,
+    arbitrary public endpoints, direct IPs, and runtime installs are blocked
+    by harbor's egress sidecar — verified from inside the container."""
+
+    def test_allow_session_and_provider_deny_everything_else(self, pi_stack):
+        base = pi_stack["base"]
+        # hold the mock response so the trial stays open during the probes
+        pi_stack["mock"].delay = 25
+        try:
+            trial_id = create_trial(base, "write the answer file", {**PI_PROFILE},
+                                    allow_paid_run=True)
+            # the trial's single allowlisted target, from the recorded policy
+            gateway_ip = wait_phase(base, trial_id, "network_policy",
+                                    timeout=120)["allowed_targets"][0]
+            gateway_base = f"http://{gateway_ip}"
+            container_id = wait_running_container(base, trial_id)
+
+            # allow: the session surface, reached through the gateway —
+            # the unauthenticated task claim answers 401/403 (reachable),
+            # a network block would reject before any HTTP status
+            code, out = container_probe(container_id, f"{gateway_base}/v1/session/task")
+            assert code == 0 and "STATUS" in out, \
+                f"session surface unreachable from container: {out}"
+            assert "STATUS 200" not in out  # unauthenticated claims are rejected
+
+            # deny: the gateway refuses non-session, non-provider targets —
+            # an HTTP 403 egress_denied, never a relay to an upstream
+            code, out = container_probe(container_id, f"{gateway_base}/admin")
+            assert code == 0 and "STATUS 403" in out, \
+                f"gateway did not deny an unlisted target: {out}"
+
+            # deny: the management listener never joins the trial network
+            code, out = container_probe(
+                container_id, f"http://host.docker.internal:{pi_stack['mgmt_port']}/healthz")
+            assert code == 1, f"management listener reachable from container: {out}"
+
+            # deny: arbitrary public HTTP(S) endpoints and direct IPs (no DNS
+            # or IP-literal bypass of the allowlist)
+            for url in ("https://example.com/", "http://1.1.1.1/", "http://192.0.2.1/"):
+                code, out = container_probe(container_id, url)
+                assert code == 1, f"{url} reachable from container: {out}"
+
+            # deny: runtime package installation needs the npm registry
+            result = subprocess.run(
+                ["docker", "exec", container_id, "npm", "install", "--no-audit", "--no-fund",
+                 "--fetch-retries=0", "--fetch-timeout=6000", "--fetch-retry-mintimeout=1000",
+                 "--prefix", "/tmp/aco-npm-probe", "left-pad"],
+                capture_output=True, text=True, timeout=30)
+            assert result.returncode != 0, "npm install reached the registry from the container"
+
+            run = wait_for_run(base, trial_id, timeout=600)
+        finally:
+            pi_stack["mock"].delay = 0.0
+            pi_stack["mock"].delay_after_tool = 0.0
+        assert run["status"] == "finished", run
+
+        # auditable evidence: policy declaration + in-kernel deny probe
+        events = {phase["event"]: phase for phase in run["phases"]}
+        policy = events["network_policy"]
+        assert policy["policy"] == "allowlist"
+        assert policy["allowed_targets"] == [gateway_ip]
+        assert policy["enforcement"] == "harbor-egress-sidecar"
+        assert events["network_deny_probe"]["result"] == "blocked"
+        # the container shares the sidecar's network namespace, not a bridge
+        assert events["agent_start"]["container_security"]["network_mode"] != "bridge"
+        # the provider call traversed the restricted path and the seal won
+        assert pi_stack["mock"].requests, "mock provider received no model call"
+        for request in pi_stack["mock"].requests:
+            assert request["auth"] == f"Bearer {DUMMY_KEY}"
+        assert events["sealed"]["receipt_id"]
+
+        # gateway evidence log: connection results only — never the key value
+        evidence = "".join(
+            path.read_text() for path in (pi_stack["root"] / "gateway-logs").glob("*.jsonl"))
+        assert DUMMY_KEY not in evidence
+        assert '"route": "denied"' in evidence  # the /admin refusal is recorded
+
+    def test_submit_intent_works_from_container(self, pi_stack):
+        """The container can express the end-and-seal intent through the
+        session surface, and the receipt is stable (#12, #38)."""
+        base = pi_stack["base"]
+        # turn 1 answers fast so the deliverable lands on disk; turn 2 stalls
+        # 30s: the deterministic window where the answer exists but the agent
+        # has not finished — the container's submit intent wins inside it (#38)
+        pi_stack["mock"].delay = 0
+        pi_stack["mock"].delay_after_tool = 30
+        try:
+            trial_id = create_trial(base, "write the answer file", {**PI_PROFILE},
+                                    allow_paid_run=True)
+            container_id = wait_running_container(base, trial_id)
+            # the trial's single allowlisted target, from the recorded policy;
+            # DNS is unreliable inside the restricted netns, so no hostnames
+            policy = wait_phase(base, trial_id, "network_policy", timeout=120)
+            gateway_ip = policy["allowed_targets"][0]
+            wait_phase(base, trial_id, "network_deny_probe")  # agent-start hooks done
+
+            # the agent writes the required answer after turn 1 (stalled 25s);
+            # a submit before the deliverable exists is a contract anomaly,
+            # so submit inside the turn-2 stall, once the file is on disk
+            deadline = time.monotonic() + 90
+            while True:
+                probe = subprocess.run(
+                    ["docker", "exec", container_id, "test", "-f",
+                     "/workspace/answer.txt"], capture_output=True, timeout=10)
+                if probe.returncode == 0:
+                    break
+                if time.monotonic() > deadline:
+                    raise AssertionError("answer file never appeared before submit")
+                time.sleep(1)
+
+            # mint the trial's session token (management surface, test-side)
+            # and submit from inside the container with the agent's key
+            status, minted = http("POST", base + f"/v1/trials/{trial_id}/session-token")
+            assert status == 201, minted
+            script = (
+                "fetch(process.argv[1],{method:'POST',signal:AbortSignal.timeout(5000),"
+                "headers:{'Authorization':'Bearer '+process.argv[2],"
+                "'Content-Type':'application/json'},"
+                "body:JSON.stringify({idempotency_key:process.argv[3]})})"
+                ".then(async r=>{console.log('STATUS',r.status,await r.text());process.exit(0)},"
+                "e=>{console.error(String(e && e.cause && e.cause.code || e).slice(0,120));"
+                "process.exit(1)})"
+            )
+            result = subprocess.run(
+                ["docker", "exec", container_id, "node", "-e", script,
+                 f"http://{gateway_ip}/v1/session/submit",
+                 minted["token"], f"pi-{trial_id}"],
+                capture_output=True, text=True, timeout=20)
+        finally:
+            pi_stack["mock"].delay = 0.0
+            pi_stack["mock"].delay_after_tool = 0.0
+        assert result.returncode == 0, f"container submit failed: {result.stdout}{result.stderr}"
+        assert "STATUS 202" in result.stdout, result.stdout  # intent accepted
+
+        run = wait_for_run(base, trial_id, timeout=600)
+        # the submit intent won: submit-won termination and a sealed answer
+        assert run["exit_kind"] == "submit", run
+        conn = sqlite3.connect(str(pi_stack["root"] / "aco.db"))
+        conn.row_factory = sqlite3.Row
+        try:
+            answer = conn.execute(
+                "SELECT status, seal_trigger FROM sealed_answers WHERE trial_id = ?",
+                (trial_id,)).fetchone()
+            assert answer["status"] == "sealed"
+            assert answer["seal_trigger"] == "submit"
         finally:
             conn.close()

@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from .client import ApiError, ApiUnavailable, Client
+from .models import REAL_PROVIDER_HARNESSES, parse_config_content
 
 DEFAULT_API_URL = "http://127.0.0.1:8000"
 POLL_INTERVAL = 2.0
@@ -101,6 +102,23 @@ def cmd_import_skill(args) -> int:
     return 0
 
 
+def require_paid_run_consent(client: Client, targets: list[dict], allow_paid_run: bool) -> None:
+    """Pre-flight paid-run gate (#38): real-provider targets run only with an
+    explicit --allow-paid-run. The API enforces the same rule at creation;
+    this check fails fast with an actionable message before any plan exists."""
+    if allow_paid_run:
+        return
+    for target in targets:
+        _, record = client.get(
+            f"/v1/versions/config/{target['name']}/{target['version']}")
+        profile = parse_config_content(record["content"])
+        if profile.harness in REAL_PROVIDER_HARNESSES:
+            raise SystemExit(
+                f"error: target {target['name']}@{target['version']} uses real-provider"
+                f" harness {profile.harness!r} and may incur paid model calls;"
+                " pass --allow-paid-run to accept")
+
+
 def cmd_run(args) -> int:
     client = Client(args.api_url, token=args.token)
 
@@ -118,6 +136,7 @@ def cmd_run(args) -> int:
             return 0
 
     targets = [ref(t) for t in args.target]
+    require_paid_run_consent(client, targets, args.allow_paid_run)
     if args.task:
         estimate = f"计划样本数: {len(targets) * args.repetitions}"
         plan = {"task": ref(args.task)}
@@ -131,6 +150,7 @@ def cmd_run(args) -> int:
     # the server is the idempotency authority (#35): the same key replays the
     # original experiment even without this ledger; a different body under the
     # same key surfaces as a 409 from main()'s ApiError handler
+    plan["allow_paid_run"] = args.allow_paid_run  # server enforces the gate (#38)
     _, experiment = client.post("/v1/experiments", plan,
                                 idempotency_key=args.idempotency_key)
     if args.idempotency_key:
@@ -237,6 +257,8 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--suite", help="已登记题组 name@version")
     p.add_argument("--target", action="append", required=True, help="目标配置 name@version，可重复")
     p.add_argument("--repetitions", type=int, default=1)
+    p.add_argument("--allow-paid-run", action="store_true",
+                   help="确认目标可能产生付费模型调用（真实 provider 目标必须显式传入）")
     p.add_argument("--idempotency-key", help="同一键重复执行返回既有批次，不重复创建")
     p.add_argument("--wait", action="store_true", help="轮询进度直到全部样本结束；Ctrl-C 只停止等待")
     p.set_defaults(func=cmd_run)

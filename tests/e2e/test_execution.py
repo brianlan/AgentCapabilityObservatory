@@ -109,7 +109,7 @@ def stack(tmp_path_factory):
     manager.wait(timeout=10)
 
 
-def create_trial(base: str, prompt: str, profile: dict) -> str:
+def create_trial(base: str, prompt: str, profile: dict, allow_paid_run: bool = False) -> str:
     suffix = uuid.uuid4().hex[:8]
     # the supervisor refuses to start an agent whose task declares no
     # artifact contract (#14): the fake agent always writes answer.txt
@@ -128,6 +128,7 @@ def create_trial(base: str, prompt: str, profile: dict) -> str:
     status, body = http("POST", base + "/v1/experiments", {
         "task": {"name": f"task-{suffix}", "version": "v1"},
         "targets": [{"name": f"cfg-{suffix}", "version": "v1"}],
+        "allow_paid_run": allow_paid_run,
     })
     assert status == 202, body
     return body["trials"][0]["id"]
