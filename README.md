@@ -113,6 +113,8 @@ aco resume <experiment-id>
 
 正式答案是 ACO 自己经 pause/copy 冻结的 workspace 快照（Harbor 的事后收集仅作诊断）；评分由独立 verifier 容器执行（`--network none --read-only`，封存答案与 verifier bundle 均只读挂载，唯一可写是全新输出目录），每次执行追加一条 `verifications` 记录，错误分类记录、绝不写成 `pass=false`。verifier bundle 以 digest 固定（登记时声明，执行前校验）。
 
+**任务声明的 ArtifactContract（#14 reopen）**：TaskVersion 的不可变内容必须携带 `contract`（`required_outputs`，可选 `allowed_paths`/`max_total_bytes`，未知字段拒绝）及其 `contract_digest`。监督进程在 agent 启动前解析一次并校验 digest——缺失、digest 不符或 schema 无效直接 `contract_invalid` 失败，绝不静默使用默认值；同一 contract 实例贯穿 baseline、正式采集、校验、manifest 与重启恢复（恢复时校验不过按执行条件异常处理，不发布）。必产出物缺失时封存失败并留下异常状态。
+
 ## 任务准入（#20）
 
 题目 bundle 在登记为稳定候选前必须通过准入工具全部门槛（复用正式封存与评分入口，非模拟）：

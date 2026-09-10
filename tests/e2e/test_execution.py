@@ -111,8 +111,15 @@ def stack(tmp_path_factory):
 
 def create_trial(base: str, prompt: str, profile: dict) -> str:
     suffix = uuid.uuid4().hex[:8]
+    # the supervisor refuses to start an agent whose task declares no
+    # artifact contract (#14): the fake agent always writes answer.txt
+    from aco import artifacts as aco_artifacts
+    contract = aco_artifacts.ArtifactContract(required_outputs=("/workspace/answer.txt",))
+    task_content = {"prompt": prompt, "expected_answer": "hidden",
+                    "contract": {"required_outputs": ["/workspace/answer.txt"]},
+                    "contract_digest": aco_artifacts.contract_digest(contract)}
     for kind, name, content in (
-        ("task", f"task-{suffix}", {"prompt": prompt, "expected_answer": "hidden"}),
+        ("task", f"task-{suffix}", task_content),
         ("config", f"cfg-{suffix}", profile),
     ):
         status, _ = http("POST", base + "/v1/versions",

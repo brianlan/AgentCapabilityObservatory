@@ -59,7 +59,7 @@ def patch_containers(monkeypatch, root, verdicts):
     """Fake the container boundary: prepare_answer returns a fake published
     answer; score_answer replays `verdicts`, a callable of (gate, index)."""
 
-    def fake_prepare(image, workspace_src, data_root, label):
+    def fake_prepare(image, workspace_src, data_root, label, contract):
         gate = label.split("-")[2]
         return fake_answers(root, label.replace("-", "_"), b"answer-" + gate.encode())
 
@@ -120,7 +120,7 @@ def test_oracle_failure_fails_admission(bundle, root, monkeypatch):
 def test_unstable_reference_content_fails_oracle(bundle, root, monkeypatch):
     # different sealed content per run: the determinism evidence fails
     monkeypatch.setattr(admission, "prepare_answer",
-                        lambda image, src, r, label: fake_answers(root, label, label.encode()))
+                        lambda image, src, r, label, contract: fake_answers(root, label, label.encode()))
     monkeypatch.setattr(admission, "score_answer", lambda *a: PASS)
     report = run_report(bundle, root)
     assert report["gates"]["oracle"]["ok"] is False

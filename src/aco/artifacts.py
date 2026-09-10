@@ -58,6 +58,70 @@ class ArtifactContract:
                 raise SealError(f"required output {output!r} outside allowed paths")
 
 
+def contract_payload(contract: ArtifactContract) -> dict:
+    """The canonical contract fields; the sha256 of this JSON (sort_keys) is
+    the contract digest — the same definition admission reports."""
+    return {"allowed_paths": list(contract.allowed_paths),
+            "required_outputs": list(contract.required_outputs),
+            "max_total_bytes": contract.max_total_bytes}
+
+
+def contract_digest(contract: ArtifactContract) -> str:
+    return hashlib.sha256(
+        json.dumps(contract_payload(contract), sort_keys=True).encode()).hexdigest()
+
+
+def contract_from_payload(payload) -> ArtifactContract:
+    """Schema-validate a task-declared contract at the trust boundary; any
+    violation is a SealError, never a silent default (#14 reopen)."""
+    if not isinstance(payload, dict):
+        raise SealError("artifact contract must be a table")
+    unknown = set(payload) - {"allowed_paths", "required_outputs", "max_total_bytes"}
+    if unknown:
+        # a typo'd field must never be silently dropped: the contract is the
+        # trust boundary for what gets collected (#14)
+        raise SealError(f"unknown artifact contract fields: {sorted(unknown)}")
+    allowed = payload.get("allowed_paths", list(CONTRACT_ALLOWED_PATHS))
+    required = payload.get("required_outputs")
+    max_bytes = payload.get("max_total_bytes", CONTRACT_MAX_TOTAL_BYTES)
+    if not isinstance(required, list) or not all(isinstance(p, str) for p in required):
+        raise SealError("contract required_outputs must be a list of paths")
+    if not isinstance(allowed, list) or not all(isinstance(p, str) for p in allowed):
+        raise SealError("contract allowed_paths must be a list of paths")
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+        raise SealError("contract max_total_bytes must be a positive integer")
+    contract = ArtifactContract(allowed_paths=tuple(allowed), required_outputs=tuple(required),
+                                max_total_bytes=max_bytes)
+    contract.validate()
+    return contract
+
+
+def resolve_task_contract(content) -> ArtifactContract:
+    """The contract a TaskVersion declares, plus its digest as integrity
+    evidence: missing contract, missing/mismatched digest, or invalid schema
+    all fail loudly — the supervisor calls this before the agent starts."""
+    if not isinstance(content, dict) or not isinstance(content.get("contract"), dict):
+        raise SealError("task content declares no artifact contract")
+    contract = contract_from_payload(content["contract"])
+    declared = content.get("contract_digest")
+    if not isinstance(declared, str):
+        raise SealError("task content declares no artifact contract digest")
+    if declared != contract_digest(contract):
+        raise SealError("task artifact contract digest mismatch")
+    return contract
+
+
+def contract_for_trial(conn: sqlite3.Connection, trial_id: str) -> ArtifactContract:
+    """Resolve the owning TaskVersion's contract (seal and recovery path)."""
+    row = conn.execute(
+        "SELECT content FROM versions WHERE id ="
+        " (SELECT task_version_id FROM trials WHERE id = ?)", (trial_id,)
+    ).fetchone()
+    if row is None:
+        raise SealError(f"trial {trial_id} has no task version")
+    return resolve_task_contract(json.loads(row["content"]))
+
+
 def pause_container(container_id: str) -> None:
     subprocess.run(["docker", "pause", container_id], check=True,
                    capture_output=True, timeout=20)
@@ -83,11 +147,12 @@ def collect_workspace(container_id: str, dest: Path, contract: ArtifactContract)
         copy_from_container(container_id, allowed, target)
 
 
-def snapshot_baseline(container_id: str, baseline_dir: Path) -> bool:
-    """Best-effort pre-agent copy of the allowed paths; False when the
+def snapshot_baseline(container_id: str, baseline_dir: Path,
+                      contract: ArtifactContract) -> bool:
+    """Best-effort pre-agent copy of the task's allowed paths; False when the
     workspace does not exist yet (nothing to diff against)."""
     try:
-        collect_workspace(container_id, baseline_dir, ArtifactContract())
+        collect_workspace(container_id, baseline_dir, contract)
         return True
     except Exception:  # noqa: BLE001 — baseline is diagnostic metadata only
         return False
@@ -295,10 +360,11 @@ def register(conn: sqlite3.Connection, trial_id: str, run_id: str, receipt_id: s
 
 
 def seal(conn: sqlite3.Connection, run: sqlite3.Row, container_id: str, trigger: str,
-         root: Path, baseline_dir: Path | None = None) -> dict:
+         root: Path, baseline_dir: Path | None, contract: ArtifactContract) -> dict:
     """The single seal entry point for submit, exit, and timeout triggers.
 
-    Freezes the workspace (pause -> copy -> unpause), publishes it
+    Validates and collects exactly the task-declared contract (never a
+    default), freezes the workspace (pause -> copy -> unpause), publishes it
     content-addressed, and registers it. Idempotent: a second call for the
     same trial returns the registered digest without re-collecting. Any
     failure marks the submission 'error' and leaves an explainable state.
@@ -318,7 +384,6 @@ def seal(conn: sqlite3.Connection, run: sqlite3.Row, container_id: str, trigger:
         receipt_id = submission["receipt_id"] if submission else uuid.uuid4().hex
 
         times = {"trigger_at": utcnow()}
-        contract = ArtifactContract()
         contract.validate()
         set_submission_status(conn, trial_id, "sealing")
         staging = root / "sealing" / run_id / "staging"
@@ -396,6 +461,15 @@ def recover(conn: sqlite3.Connection, root: Path) -> None:
                 if mismatch:
                     shutil.rmtree(run_dir, ignore_errors=True)
                     mark_anomaly(conn, trial_id, run_id, mismatch)
+                    continue
+                try:
+                    # same task contract as baseline and the original seal:
+                    # disk may have drifted during the crash window
+                    validate_snapshot(staging, contract_for_trial(conn, trial_id))
+                except SealError as exc:
+                    shutil.rmtree(run_dir, ignore_errors=True)
+                    mark_anomaly(conn, trial_id, run_id,
+                                 f"recovered staging fails the task contract: {exc}")
                     continue
                 digest = manifest_digest(manifest)
                 submission = conn.execute(

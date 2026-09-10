@@ -115,6 +115,7 @@ class Bundle:
         bundle = cls(path=path, manifest=manifest, verifier=verifier, wrong_cases=cases)
         for rel in (PUBLIC_ENV, VERIFIER_DIR, REFERENCE_DIR):
             bundle.required_dir(rel)  # fail fast on a malformed layout
+        bundle.contract  # fail fast on a missing/invalid artifact contract
         return bundle
 
     def required_dir(self, rel: str) -> Path:
@@ -137,8 +138,11 @@ class Bundle:
 
     @property
     def contract(self) -> artifacts.ArtifactContract:
-        required = tuple(self.manifest.get("contract", {}).get("required_outputs", ()))
-        return artifacts.ArtifactContract(required_outputs=tuple(required))
+        """The full task-declared artifact contract, validated at load."""
+        try:
+            return artifacts.contract_from_payload(self.manifest.get("contract"))
+        except artifacts.SealError as exc:
+            raise AdmissionError(f"artifact contract invalid: {exc}") from exc
 
     def provenance(self) -> dict:
         return dict(self.manifest.get("provenance", {}))
@@ -250,13 +254,15 @@ def _workspace_label(scope: str, gate: str, index: int) -> str:
     return f"admission-{scope}-{gate}-{index}"
 
 
-def prepare_answer(image: str, workspace_src: Path, root: Path, label: str) -> Path:
+def prepare_answer(image: str, workspace_src: Path, root: Path, label: str,
+                   contract: artifacts.ArtifactContract) -> Path:
     """Seal a candidate workspace state through the official sealing entries.
 
     Starts a throwaway container, overlays the workspace tree onto /workspace,
     then runs the same pause -> copy -> validate -> manifest -> publish
-    pipeline a real trial uses. Returns the published answer directory."""
-    contract = artifacts.ArtifactContract()
+    pipeline a real trial uses, against the task-declared contract. Returns
+    the published answer directory; raises SealError when the workspace
+    cannot satisfy the contract."""
     cid = subprocess.run(
         ["docker", "run", "-d", "--entrypoint", "sleep", image, str(CONTAINER_LIFETIME_SEC)],
         capture_output=True, text=True, timeout=CONTAINER_OP_TIMEOUT, check=True,
@@ -323,8 +329,13 @@ def _workspace(parent: Path) -> Path:
 def oracle_gate(bundle: Bundle, root: Path, scope: str) -> dict:
     digests = []
     for index in (1, 2, 3):
-        answer_dir = prepare_answer(bundle.manifest["image"], _workspace(bundle.reference), root,
-                                    _workspace_label(scope, "oracle", index))
+        try:
+            answer_dir = prepare_answer(bundle.manifest["image"], _workspace(bundle.reference),
+                                        root, _workspace_label(scope, "oracle", index),
+                                        bundle.contract)
+        except artifacts.SealError as exc:
+            return {"ok": False, "runs": index,
+                    "detail": f"reference run {index} failed to seal: {exc}"}
         verdict = score_answer(answer_dir, bundle.verifier_bundle, bundle.verifier,
                                root, _workspace_label(scope, "oracle", index))
         digests.append(_answer_content_digests(answer_dir))
@@ -337,8 +348,15 @@ def oracle_gate(bundle: Bundle, root: Path, scope: str) -> dict:
 
 def nop_gate(bundle: Bundle, root: Path, scope: str) -> dict:
     for index in (1, 2, 3):
-        answer_dir = prepare_answer(bundle.manifest["image"], _workspace(bundle.public_env), root,
-                                    _workspace_label(scope, "nop", index))
+        try:
+            answer_dir = prepare_answer(bundle.manifest["image"], _workspace(bundle.public_env),
+                                        root, _workspace_label(scope, "nop", index),
+                                        bundle.contract)
+        except artifacts.SealError as exc:
+            # the unmodified workspace cannot even produce a complete answer:
+            # it certainly fails 0/3
+            return {"ok": True, "runs": index,
+                    "detail": f"initial workspace fails the artifact contract (cannot seal): {exc}"}
         verdict = score_answer(answer_dir, bundle.verifier_bundle, bundle.verifier,
                                root, _workspace_label(scope, "nop", index))
         if verdict == {"status": "succeeded", "pass": True}:
@@ -352,8 +370,12 @@ def cheats_gate(bundle: Bundle, root: Path, scope: str) -> dict:
     wrong_dir = bundle.path / WRONG_DIR
     passing, errors = [], []
     for index, case in enumerate(bundle.wrong_cases, start=1):
-        answer_dir = prepare_answer(bundle.manifest["image"], _workspace(wrong_dir / case), root,
-                                    _workspace_label(scope, "cheat", index))
+        try:
+            answer_dir = prepare_answer(bundle.manifest["image"], _workspace(wrong_dir / case),
+                                        root, _workspace_label(scope, "cheat", index),
+                                        bundle.contract)
+        except artifacts.SealError:
+            continue  # the cheat cannot even seal a complete answer: it fails
         verdict = score_answer(answer_dir, bundle.verifier_bundle, bundle.verifier,
                                root, _workspace_label(scope, "cheat", index))
         if verdict == {"status": "succeeded", "pass": True}:
@@ -368,8 +390,11 @@ def cheats_gate(bundle: Bundle, root: Path, scope: str) -> dict:
 
 
 def rescore_gate(bundle: Bundle, root: Path, scope: str) -> dict:
-    answer_dir = prepare_answer(bundle.manifest["image"], _workspace(bundle.reference), root,
-                                _workspace_label(scope, "rescore", 1))
+    try:
+        answer_dir = prepare_answer(bundle.manifest["image"], _workspace(bundle.reference),
+                                    root, _workspace_label(scope, "rescore", 1), bundle.contract)
+    except artifacts.SealError as exc:
+        return {"ok": False, "detail": f"reference answer failed to seal: {exc}"}
     verdicts = [score_answer(answer_dir, bundle.verifier_bundle, bundle.verifier,
                              root, _workspace_label(scope, "rescore", index))
                 for index in (1, 2)]
@@ -417,11 +442,8 @@ def run_admission(bundle_path: Path, data_root: Path) -> dict:
     db.migrate(runner_conn)
     verifier_bundle_digest = runner.bundle_digest(bundle.verifier_bundle)
     environment_digest = runner.bundle_digest(bundle.public_env)
-    contract_digest = _digest(json.dumps(
-        {"required_outputs": bundle.contract.required_outputs,
-         "allowed_paths": bundle.contract.allowed_paths,
-         "max_total_bytes": bundle.contract.max_total_bytes},
-        sort_keys=True).encode())
+    # same digest definition the supervisor re-verifies before agent start
+    contract_digest = artifacts.contract_digest(bundle.contract)
 
     registered = None
     if static_ok:
@@ -505,7 +527,10 @@ def _register_candidate(conn, bundle: Bundle, data_root: Path,
     task_name = bundle.manifest["name"]
     task_version = bundle.manifest["version"]
     task_content = {key: value for key, value in bundle.manifest.items() if key != "verifier"} \
-        | {"admission": "stable-candidate", "admission_report_dir": "admission/"}
+        | {"admission": "stable-candidate", "admission_report_dir": "admission/",
+           # the contract travels with its digest so the supervisor can verify
+           # it byte-for-byte before any agent starts (#14 reopen)
+           "contract_digest": artifacts.contract_digest(bundle.contract)}
     task_assets = [AssetRef(name="verifier_bundle", digest=verifier_bundle_digest),
                    AssetRef(name="environment", digest=environment_digest)]
     # the version id is deterministic (content-addressed): identical bundles
