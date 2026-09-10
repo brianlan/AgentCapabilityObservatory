@@ -144,7 +144,8 @@ def run_one(conn, root: Path, api_url: str, api_token: str, session_api_url: str
         proc.kill()
         proc.wait()
     if runs.get_run(conn, run_id)["status"] in ("launching", "running"):
-        runs.add_phase(conn, run_id, "supervisor_lost", pid=proc.pid)
+        runs.add_phase(conn, run_id, "supervisor_lost", pid=proc.pid,
+                       exit_code=proc.returncode)
         runs.finish_run(conn, run_id, "error", runs.EXIT_SUPERVISOR_LOST,
                         f"supervisor pid {proc.pid} exited without recording an outcome")
         cleanup_container(run_id)

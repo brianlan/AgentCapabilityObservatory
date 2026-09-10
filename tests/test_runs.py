@@ -155,3 +155,56 @@ class TestManagerHelpers:
         run_id = runs.create_run(conn, "t1", {}, supervisor_pid=os.getpid())
         reap_lost_supervisors(conn)
         assert runs.get_run(conn, run_id)["status"] == "launching"
+
+
+# --------------------------------------------------- task network policy (#38)
+
+def test_fake_task_dir_stays_offline(tmp_path):
+    from aco.supervisor import build_task_dir
+
+    build_task_dir(tmp_path, "prompt", 20, "run-1")
+    toml = (tmp_path / "task" / "task.toml").read_text()
+    compose = (tmp_path / "task" / "offline.yaml").read_text()
+    assert 'network_mode = "public"' in toml
+    assert "allowlist" not in toml
+    assert "network_mode: none" in compose
+
+
+def test_pi_task_dir_declares_allowlist_and_no_explicit_networking(tmp_path, monkeypatch):
+    """#38: the pi target's restriction comes from harbor's egress sidecar —
+    task.toml allowlists exactly the gateway service, the compose override
+    adds NO explicit networking on main (the sidecar owns the network
+    namespace), and the gateway service carries the fixed upstreams."""
+    from aco import supervisor
+    from aco.supervisor import build_task_dir, gateway_config
+
+    monkeypatch.setenv("ARK_AGENT_PLAN_BASE_URL", "https://ark.example.com/api/v3")
+    monkeypatch.setenv("ACO_BASE_URL", "http://127.0.0.1:8100")
+    gateway = gateway_config(tmp_path, "run-2")
+    build_task_dir(tmp_path, "prompt", 120, "run-2", harness="pi", gateway=gateway)
+    toml = (tmp_path / "task" / "task.toml").read_text()
+    compose = (tmp_path / "task" / "offline.yaml").read_text()
+    ip, subnet = supervisor.gateway_ip("run-2"), supervisor.gateway_subnet("run-2")
+    assert 'network_mode = "allowlist"' in toml
+    assert f'allowed_hosts = ["{ip}"]' in toml
+    main_block = compose.split("  main:")[1]
+    assert "network_mode" not in main_block  # no bridge/none override on main
+    assert "aco-gateway" in main_block  # main depends on the gateway
+    assert subnet in compose  # per-run gateway subnet (crash-leak safe, #38)
+    # the gateway: pinned python, stdlib gateway module, fixed upstreams
+    assert f"ipv4_address: {ip}" in compose  # gateway on the trial net, not the sidecar netns
+    assert "ACO_GATEWAY_PROVIDER_UPSTREAM: \"https://ark.example.com/api/v3\"" in compose
+    assert "ACO_GATEWAY_SESSION_UPSTREAM: \"http://host.docker.internal:8100\"" in compose
+    assert "/aco/gateway.py:ro" in compose
+
+
+def test_pi_task_dir_defaults_allowlist_to_gateway(tmp_path, monkeypatch):
+    from aco import supervisor
+    from aco.supervisor import build_task_dir, gateway_config
+
+    monkeypatch.setenv("ARK_AGENT_PLAN_BASE_URL", "https://ark.example.com/api/v3")
+    monkeypatch.setenv("ACO_BASE_URL", "http://127.0.0.1:8100")
+    build_task_dir(tmp_path, "prompt", 120, "run-3", harness="pi",
+                   gateway=gateway_config(tmp_path, "run-3"))
+    toml = (tmp_path / "task" / "task.toml").read_text()
+    assert f'"{supervisor.gateway_ip("run-3")}"' in toml

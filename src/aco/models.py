@@ -94,6 +94,12 @@ def parse_config_content(content: dict) -> TargetProfile:
     )
 
 
+# harnesses whose trials call a real paid provider (#38): creating an
+# experiment with such a target requires the explicit allow_paid_run intent.
+# Fail-closed by construction: new real harnesses must be added here to run.
+REAL_PROVIDER_HARNESSES = frozenset({"pi"})
+
+
 class SuiteContent(BaseModel):
     tasks: list[VersionRef] = Field(min_length=1)
 
@@ -121,6 +127,7 @@ class ExperimentCreate(BaseModel):
     suite: VersionRef | None = None
     targets: list[VersionRef] = Field(min_length=1)
     repetitions: int = Field(default=1, ge=1)
+    allow_paid_run: bool = False  # explicit gate for real-provider targets (#38)
 
 
 class TrialOut(BaseModel):

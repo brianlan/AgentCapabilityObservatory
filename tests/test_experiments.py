@@ -131,3 +131,55 @@ def test_openapi_generated_from_runtime_models(client, register):
             "/v1/trials/{trial_id}"} <= paths
     schemas = set(spec["components"]["schemas"])
     assert {"VersionRegistration", "ExperimentCreate", "TrialOut"} <= schemas
+
+
+# ------------------------------------------------------------------ #38
+
+PI_PROFILE_CONTENT = {
+    "schema_version": 1,
+    "harness": "pi",
+    "harness_version": "0.84.1",
+    "model": "glm-5.3-flash",
+    "thinking": "max",
+    "provider": "ark-agent-plan",
+    "provider_api_style": "openai-responses",
+    "adapter_version": "0.1.0",
+    "credentials": ["ark-agent-plan-main"],
+}
+
+
+def test_real_provider_target_requires_allow_paid_run(client, register):
+    setup_registry(register, ["arith"], ["cfg-a"])
+    register("config", "pi-cfg", "v1", dict(PI_PROFILE_CONTENT))
+    resp = client.post("/v1/experiments", json={
+        "task": {"name": "arith", "version": "v1"},
+        "targets": [{"name": "pi-cfg", "version": "v1"}],
+    })
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "paid_run_not_allowed"
+    # legacy/unsupported harnesses are not paid targets: creation stays open
+    resp = client.post("/v1/experiments", json={
+        "task": {"name": "arith", "version": "v1"},
+        "targets": [{"name": "cfg-a", "version": "v1"}],
+    })
+    assert resp.status_code == 202, resp.text
+
+
+def test_real_provider_target_with_allow_paid_run_is_created(client, register):
+    setup_registry(register, ["arith"], [])
+    register("config", "pi-cfg", "v1", dict(PI_PROFILE_CONTENT))
+    resp = client.post("/v1/experiments", json={
+        "task": {"name": "arith", "version": "v1"},
+        "targets": [{"name": "pi-cfg", "version": "v1"}],
+        "allow_paid_run": True,
+    })
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["requested"]["allow_paid_run"] is True
+
+
+def test_version_get_returns_registered_content(client, register):
+    register("config", "pi-cfg", "v1", dict(PI_PROFILE_CONTENT))
+    resp = client.get("/v1/versions/config/pi-cfg/v1")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["content"]["harness"] == "pi"
+    assert client.get("/v1/versions/config/missing/v1").status_code == 404
