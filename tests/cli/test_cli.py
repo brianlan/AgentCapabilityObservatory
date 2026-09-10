@@ -6,21 +6,26 @@ request is ever sent), and credential-free stable JSON output.
 """
 
 import json
+import os
 import threading
 import time
 
 import pytest
 import uvicorn
 
-from aco.app import create_app
+from aco.app import create_management_app
 from aco.cli import main
+
+MGMT_TOKEN = "test-management-token"
+MGMT_AUTH = {"Authorization": f"Bearer {MGMT_TOKEN}"}
+os.environ.setdefault("ACO_MANAGEMENT_TOKEN", MGMT_TOKEN)  # the CLI resolves its token from the env
 
 
 @pytest.fixture(scope="module")
 def api(tmp_path_factory):
     """One live management API for the whole module (real SQLite, real HTTP)."""
     root = tmp_path_factory.mktemp("aco-cli-api")
-    app = create_app(data_root=str(root))
+    app = create_management_app(data_root=str(root), token=MGMT_TOKEN)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -58,9 +63,9 @@ def test_register_and_run_map_args_to_payload(api, state, tmp_path, capsys):
     experiment_id = out.split("Experiment ")[1].split("（")[0]
 
     # the created plan is server-readable and matches the CLI arguments
-    doc = json.loads(
-        __import__("urllib.request", fromlist=["urlopen"]).urlopen(
-            f"{api}/v1/experiments/{experiment_id}").read())
+    from urllib.request import Request, urlopen
+    doc = json.loads(urlopen(
+        Request(f"{api}/v1/experiments/{experiment_id}", headers=MGMT_AUTH)).read())
     assert doc["requested"]["task"] == {"name": "demo-task", "version": "v1"}
     assert doc["requested"]["targets"] == [{"name": "demo-cfg", "version": "v1"}]
     assert doc["requested"]["repetitions"] == 3
@@ -98,7 +103,7 @@ def test_status_human_and_json(api, state, capsys):
     body = json.dumps({"task": {"name": "s-task", "version": "v1"},
                        "targets": [{"name": "s-cfg", "version": "v1"}], "repetitions": 1}).encode()
     req = Request(f"{api}/v1/experiments", data=body, method="POST",
-                  headers={"Content-Type": "application/json"})
+                  headers={"Content-Type": "application/json", **MGMT_AUTH})
     exp_id = json.loads(urlopen(req).read())["id"]
 
     assert main(["status", exp_id, "--api-url", api]) == 0
@@ -165,8 +170,9 @@ def test_ctrl_c_stops_watcher_without_cancelling(api, state, tmp_path, capsys, m
     assert f"aco cancel {exp_id}" in out  # the message points at explicit cancel
 
     # regression: the watcher never cancelled anything — plan is untouched
-    from urllib.request import urlopen
-    doc = json.loads(urlopen(f"{api}/v1/experiments/{exp_id}").read())
+    from urllib.request import Request, urlopen
+    doc = json.loads(urlopen(
+        Request(f"{api}/v1/experiments/{exp_id}", headers=MGMT_AUTH)).read())
     assert doc["progress"]["planned"] == 1
     assert doc["progress"]["cancelled"] == 0
     real_sleep(0)

@@ -27,24 +27,28 @@ V1 架构规划已完成，尚未进入生产实现。GitHub 的 [ACO V1 架构�
 /ssd4/envs/aco_py312/bin/python -m pytest
 
 # 启动 API（首次启动自动从零执行 SQLite migration）
-/ssd4/envs/aco_py312/bin/python -m uvicorn aco.app:app
+# 两个 ASGI 监听（ADR 0001）：管理面需要服务端校验的 bearer 凭证，绝不暴露给被测容器
+ACO_MANAGEMENT_TOKEN=<管理凭证> /ssd4/envs/aco_py312/bin/python -m uvicorn aco.app:management_app --port 8000
+/ssd4/envs/aco_py312/bin/python -m uvicorn aco.app:session_app --port 8001
 # 打开 http://127.0.0.1:8000/openapi.json 查看运行时生成的 OpenAPI
 ```
 
 - 数据根目录：默认 `./data`，可用环境变量 `ACO_DATA_ROOT` 覆盖；SQLite 数据库位于 `<data-root>/aco.db`，是唯一元数据权威。
 - Migration：`src/aco/migrations/` 内有序 SQL 文件 + `schema_version` 表，重复执行是 no-op。
-- 端点：`POST /v1/versions`（登记不可变版本，内容寻址 digest，重复登记幂等，同标识不同内容返回 `409`）、`POST /v1/experiments`（返回 `202` 与原子展开的 Trial 计划）、`GET /v1/experiments/{id}`、`GET /v1/trials/{id}`。
+- 端点：`POST /v1/versions`（登记不可变版本，内容寻址 digest，重复登记幂等，同标识不同内容返回 `409`）、`POST /v1/experiments`（返回 `202` 与原子展开的 Trial 计划）、`GET /v1/experiments/{id}`、`GET /v1/trials/{id}`。管理面所有路由（含 dashboard）都要求 `Authorization: Bearer $ACO_MANAGEMENT_TOKEN`，缺失或错误返回 `401`；未设置该环境变量时管理面拒绝启动。
 - 凭证只允许逻辑引用（config 的 `credentials` 名称列表），任何凭证值都不会入库；Trial 的 `runtime_observation` 在未观测前保持 `null`。
 
 ## 受限 Session API（#12）
 
-被测会话不使用管理 API。启动端为每个 Trial 调 `POST /v1/trials/{trial_id}/session-token` 换取短期（默认 24h）bearer token，明文只返回一次，服务端只存 sha256 摘要。
+被测会话只能到达 Session 监听（网络部署上管理监听绝不暴露给被测容器）。启动端为每个可运行 Trial 调 `POST /v1/trials/{trial_id}/session-token`（管理面）换取短期（默认 24h）bearer token，明文只返回一次，服务端只存 sha256 摘要；已取消或已有封存/异常答案的 Trial 拒绝铸造（`409 trial_not_runnable`）。
 
 会话端点（均需 `Authorization: Bearer <token>`，令牌绑定单个 Trial）：
 
 - `GET /v1/session/task`：领取绑定 Trial 的公开任务（只含 task 引用、`prompt` 指令与状态；不含隐藏测试/答案）。首次成功领取原子记录 `opened_at` 计时起点，重复领取不重置。
-- `POST /v1/session/submit`：提交唯一结束意图，返回 `202` 与稳定 `receipt_id`（仅代表意图已接受，未封存未评分）。幂等规则持久化在 SQLite：相同 key + 相同内容重试返回相同 receipt（`200`）；相同 key 不同内容 `409 idempotency_conflict`；换 key 不能产生第二次交卷（`409 already_submitted`，数据库约束一 Trial 一意图）。
-- `GET /v1/session/submission`：查询结束意图状态（`accepted` / `sealing` / `sealed` / `error`，V1 只有 `accepted`）。
+- `POST /v1/session/submit`：提交唯一结束意图，请求体只含 `idempotency_key`（携带 `answer` 等额外字段被 schema 拒绝 `422`——正式答案是监督进程封存的 workspace 快照，永远不由会话提交）。返回 `202` 与稳定 `receipt_id`（仅代表意图已接受，未封存未评分）。幂等规则持久化在 SQLite：相同 key 重试返回相同 receipt（`200`）；换 key 不能产生第二次交卷（`409 already_submitted`，数据库约束一 Trial 一意图）。
+- `GET /v1/session/submission`：查询结束意图状态（`accepted` / `sealing` / `error`）。
+
+Trial 结束（取消或答案封存/异常）即会话能力失效：旧令牌的一切会话请求返回 `401 session_expired`，不能产生迟到交卷；封存结果只能经管理面观测。
 
 日志与错误响应不包含令牌明文、答案内容或隐藏测试信息。
 
@@ -52,7 +56,7 @@ V1 架构规划已完成，尚未进入生产实现。GitHub 的 [ACO V1 架构�
 
 FastAPI 进程只保存计划与状态；长运行由独立进程承担：
 
-- **执行管理器**（本机单例，默认单槽）：`/ssd4/envs/aco_py312/bin/python -m aco.execution --data-root data --api-url http://127.0.0.1:8000`。从 SQLite 原子领取 `planned` Trial，先持久化启动意图（`trial_runs` 表），再 spawn 监督子进程； supervisor 死亡会留下启动意图与 `supervisor_lost` 诊断，并按运行标签清理容器。要求 API 服务已启动（通过 HTTP 领取 session token）。
+- **执行管理器**（本机单例，默认单槽）：`/ssd4/envs/aco_py312/bin/python -m aco.execution --data-root data --api-url http://127.0.0.1:8000 --session-api-url http://127.0.0.1:8001`（管理凭证取环境变量 `ACO_MANAGEMENT_TOKEN`，或用 `--api-token` 传入）。从 SQLite 原子领取 `planned` Trial，经管理面铸造 session token，先持久化启动意图（`trial_runs` 表），再 spawn 监督子进程并只下发 Session 监听地址； supervisor 死亡会留下启动意图与 `supervisor_lost` 诊断，并按运行标签清理容器。要求两个监听均已启动。
 - **监督进程**：`/ssd4/envs/aco_py312/bin/python -m aco.supervisor --run-id <id> --data-root data`（通常由管理器拉起，不建议手动运行）。用固定版本 Harbor 0.22.0（源 commit `71c39eafbd134d43ae3f489b5e6488b2a157de65`）运行 Trial：只使用公开接入点（`Trial.create`、`add_hook`、`import_path` agent、关闭 verifier、额外 compose 文件）；Harbor 自动评分永久禁用，其原始退出/日志只作诊断，ACO 不读取 Harbor reward 作为正式分数。
 - **运行观测**：`GET /v1/trials/{trial_id}/runs` 返回启动意图（`requested_profile` 冻结不覆盖）、阶段事件、容器关联（含运行时安全摘要：非 privileged、无 docker socket、`network_mode: none`）、原始退出（`exit_kind`/`exit_detail`）与日志目录引用；未观测字段保持 `null`。
 - **假 target**：V1 只执行 `harness: "fake"`（config 版本内容 `{"harness": "fake", "model": "none"}`）。`aco.fake_agent:FakeAgent` 仅供测试（领题 → 写普通文件 → 按指令场景提交/前台退出/后台写入），不代表真实 harness 接入；其他 harness 或模型/provider/skills/credentials 组合显式失败，不静默回退。
@@ -86,7 +90,7 @@ aco cancel <experiment-id>
 aco resume <experiment-id>
 ```
 
-- 连接配置：`--api-url` / 环境变量 `ACO_API_URL`（默认 `http://127.0.0.1:8000`）；可选 `--token` / `ACO_API_TOKEN` 以 bearer 头发送，任何输出与错误信息都不包含凭证。
+- 连接配置：`--api-url` / 环境变量 `ACO_API_URL`（默认 `http://127.0.0.1:8000`）；`--token` / 环境变量 `ACO_MANAGEMENT_TOKEN` 以 bearer 头发送（服务端校验，缺失返回 `401`），任何输出与错误信息都不包含凭证。
 - 脚本使用：任意命令加 `--json` 得到稳定 JSON（stdout 仅含 JSON，创建前估算输出走 stderr）；API/HTTP 错误返回非零退出码（Ctrl-C 中断 `--wait` 返回 `130`）。
 - 幂等键：`--idempotency-key` 在本地记录键 → Experiment ID（`ACO_CLI_STATE`，默认 `~/.config/aco/cli.json`），同键重复 `run` 返回既有批次，不重复创建。
 

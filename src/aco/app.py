@@ -1,4 +1,10 @@
-"""ACO API: versioned registry, evaluation plans, trial sessions."""
+"""ACO API: versioned registry, evaluation plans, trial sessions.
+
+Two ASGI surfaces share the same domain modules and SQLite database
+(ADR 0001): the authenticated Management surface (registry, planning,
+lifecycle, session-token minting, dashboard) and the untrusted-agent-facing
+Session surface (three trial-scoped operations, `aco.api.session`).
+"""
 
 import hashlib
 import json
@@ -7,10 +13,9 @@ import os
 import secrets
 import sqlite3
 import uuid
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -22,7 +27,6 @@ from .models import (
     ExperimentCreate,
     ExperimentOut,
     ScorerContent,
-    SubmitRequest,
     SuiteContent,
     TrialOut,
     VersionRecord,
@@ -35,9 +39,6 @@ logger = logging.getLogger("aco")
 # ponytail: V1 default is one answer slot per trial; add config knob when a
 # multi-slot need actually exists.
 SINGLE_ANSWER_SLOT = 1
-
-# ponytail: 24h short-lived session token; tune when a real execution window exists.
-SESSION_TOKEN_TTL = timedelta(hours=24)
 
 
 class AppError(Exception):
@@ -228,129 +229,7 @@ def error_response(status: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(status_code=status, content={"error": {"code": code, "message": message}})
 
 
-# --- Session API (#12): trial-scoped, least-privilege, idempotent end-intent ---
-
-
-def token_digest(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
-
-
-def mint_session_token(conn: sqlite3.Connection, trial_id: str) -> dict:
-    if conn.execute("SELECT 1 FROM trials WHERE id = ?", (trial_id,)).fetchone() is None:
-        raise AppError(404, "not_found", f"trial {trial_id} does not exist")
-    token = secrets.token_urlsafe(32)
-    expires_at = (datetime.now(timezone.utc) + SESSION_TOKEN_TTL).isoformat()
-    with conn:
-        conn.execute(
-            "UPDATE trials SET session_token_digest = ?, session_token_expires_at = ? WHERE id = ?",
-            (token_digest(token), expires_at, trial_id),
-        )
-    logger.info("session_token_minted trial_id=%s", trial_id)
-    return {"trial_id": trial_id, "token": token, "expires_at": expires_at}
-
-
-def trial_from_token(conn: sqlite3.Connection, request: Request) -> sqlite3.Row:
-    auth = request.headers.get("authorization", "")
-    token = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
-    row = None
-    if token:
-        row = conn.execute(
-            "SELECT * FROM trials WHERE session_token_digest = ?", (token_digest(token),)
-        ).fetchone()
-        if row is not None and (row["session_token_expires_at"] or "") <= db.utcnow():
-            row = None
-    if row is None:
-        # audit event without any token material
-        logger.info("session_auth_failed")
-        raise AppError(401, "unauthorized", "valid session token required")
-    return row
-
-
-def claim_session_task(conn: sqlite3.Connection, trial: sqlite3.Row) -> dict:
-    now = db.utcnow()
-    # atomic: only the first claim sets opened_at; repeats never reset it
-    with conn:
-        conn.execute(
-            "UPDATE trials SET opened_at = ? WHERE id = ? AND opened_at IS NULL", (now, trial["id"])
-        )
-    row = conn.execute(f"{TRIAL_SELECT} WHERE t.id = ?", (trial["id"],)).fetchone()
-    task = conn.execute(
-        "SELECT name, version, content FROM versions WHERE id = ?", (row["task_version_id"],)
-    ).fetchone()
-    first_claim = row["opened_at"] == now
-    logger.info("session_task_claimed trial_id=%s first_claim=%s", row["id"], first_claim)
-    # minimal public surface: instruction only; hidden tests/answers never leave the registry
-    return {
-        "trial_id": row["id"],
-        "status": row["status"],
-        "task": {"name": task["name"], "version": task["version"]},
-        "instruction": json.loads(task["content"]).get("prompt"),
-        "opened_at": row["opened_at"],
-    }
-
-
-def submit_session(conn: sqlite3.Connection, trial: sqlite3.Row, req: SubmitRequest) -> tuple[int, dict]:
-    # a late submit can never extend a deadline or revive a cancelled trial (#16)
-    if trial["status"] == "cancelled":
-        logger.info("session_submit_rejected_cancelled trial_id=%s", trial["id"])
-        raise AppError(409, "trial_cancelled", "this trial was explicitly cancelled")
-    request_digest = hashlib.sha256(
-        canonical({"answer": req.answer, "idempotency_key": req.idempotency_key}).encode()
-    ).hexdigest()
-    existing = conn.execute(
-        "SELECT * FROM submissions WHERE trial_id = ?", (trial["id"],)
-    ).fetchone()
-    if existing is not None:
-        if existing["idempotency_key"] == req.idempotency_key:
-            if existing["request_digest"] == request_digest:
-                logger.info("session_submit_replayed trial_id=%s", trial["id"])
-                return 200, {"receipt_id": existing["receipt_id"], "status": existing["status"]}
-            raise AppError(409, "idempotency_conflict", "same idempotency key with different payload")
-        raise AppError(409, "already_submitted", "trial already has a submission")
-    receipt_id = uuid.uuid4().hex
-    try:
-        with conn:
-            conn.execute(
-                "INSERT INTO submissions (trial_id, idempotency_key, request_digest, receipt_id,"
-                " status, answer, created_at) VALUES (?, ?, ?, ?, 'accepted', ?, ?)",
-                (trial["id"], req.idempotency_key, request_digest, receipt_id,
-                 canonical(req.answer), db.utcnow()),
-            )
-    except sqlite3.IntegrityError:
-        # multi-worker race on the one-intent-per-trial constraint; retry sees
-        # the stored receipt on the next identical request
-        logger.info("session_submit_race trial_id=%s", trial["id"])
-        raise AppError(409, "already_submitted", "trial already has a submission") from None
-    logger.info("session_submit_accepted trial_id=%s receipt_id=%s", trial["id"], receipt_id)
-    # 202: intent accepted only — not sealed, not scored
-    return 202, {"receipt_id": receipt_id, "status": "accepted"}
-
-
-def session_submission(conn: sqlite3.Connection, trial: sqlite3.Row) -> dict:
-    row = conn.execute(
-        "SELECT receipt_id, status, created_at FROM submissions WHERE trial_id = ?", (trial["id"],)
-    ).fetchone()
-    if row is None:
-        raise AppError(404, "not_found", "no submission for this trial")
-    sealed = conn.execute(
-        "SELECT digest FROM sealed_answers WHERE trial_id = ?", (trial["id"],)
-    ).fetchone()
-    return {"receipt_id": row["receipt_id"], "status": row["status"], "submitted_at": row["created_at"],
-            "answer_digest": sealed["digest"] if sealed else None}
-
-
-def create_app(data_root: str | None = None) -> FastAPI:
-    root = Path(data_root or os.environ.get("ACO_DATA_ROOT", "data")).expanduser()
-    root.mkdir(parents=True, exist_ok=True)
-    conn = db.connect(root / "aco.db")
-    db.migrate(conn)
-
-    # imported here, not at module top: the routes module imports AppError
-    # and canonical from this module
-    from .api.verifications import register_routes
-
-    app = FastAPI(title="Agent Capability Observatory", version="0.1.0")
-
+def _add_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def app_error_handler(_request, exc: AppError):
         return error_response(exc.status, exc.code, exc.message)
@@ -365,6 +244,36 @@ def create_app(data_root: str | None = None) -> FastAPI:
     @app.exception_handler(StarletteHTTPException)
     async def http_error_handler(_request, exc: StarletteHTTPException):
         return error_response(exc.status_code, "http_error", str(exc.detail))
+
+
+def create_management_app(data_root: str | None = None, token: str | None = None) -> FastAPI:
+    """Authenticated management surface (ADR 0001): never exposed to evaluated
+    containers. Every route except /healthz requires the management bearer."""
+    root = Path(data_root or os.environ.get("ACO_DATA_ROOT", "data")).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    conn = db.connect(root / "aco.db")
+    db.migrate(conn)
+
+    token = token or os.environ.get("ACO_MANAGEMENT_TOKEN", "")
+    if not token:
+        # fail closed: a management surface without a credential must not start
+        raise RuntimeError(
+            "the management surface requires a bearer credential: set ACO_MANAGEMENT_TOKEN"
+        )
+
+    app = FastAPI(title="Agent Capability Observatory — Management API", version="0.2.0")
+    _add_error_handlers(app)
+
+    @app.middleware("http")
+    async def management_auth(request, call_next):
+        if request.url.path == "/healthz":
+            return await call_next(request)
+        auth = request.headers.get("authorization", "")
+        supplied = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+        # constant-time compare: this is the trust boundary for the whole surface
+        if not secrets.compare_digest(supplied, token):
+            return error_response(401, "unauthorized", "valid management token required")
+        return await call_next(request)
 
     @app.get("/healthz")
     async def healthz():
@@ -412,26 +321,16 @@ def create_app(data_root: str | None = None) -> FastAPI:
             raise AppError(404, "not_found", f"trial {trial_id} does not exist")
         return [runs.run_out(row) for row in runs.list_runs(conn, trial_id)]
 
-    # management path: mints a trial-scoped token (plaintext returned once)
+    # management path: mints a trial-scoped token (plaintext returned once);
+    # only trials that can still run receive a capability (#12)
     @app.post("/v1/trials/{trial_id}/session-token", status_code=201)
     async def post_session_token(trial_id: str):
+        from .api.session import mint_session_token
         return mint_session_token(conn, trial_id)
 
-    # session path: bearer token binds every request to exactly one trial
-    @app.get("/v1/session/task")
-    async def get_session_task(request: Request):
-        return claim_session_task(conn, trial_from_token(conn, request))
+    # independent scoring of the sealed answer (#15)
+    from .api.verifications import register_routes
 
-    @app.post("/v1/session/submit", status_code=202)
-    async def post_session_submit(request: Request, req: SubmitRequest):
-        status_code, body = submit_session(conn, trial_from_token(conn, request), req)
-        return JSONResponse(status_code=status_code, content=body)
-
-    @app.get("/v1/session/submission")
-    async def get_session_submission(request: Request):
-        return session_submission(conn, trial_from_token(conn, request))
-
-    # management path: independent scoring of the sealed answer (#15)
     register_routes(app, conn)
 
     # results query and aggregation (#19)
@@ -447,4 +346,26 @@ def create_app(data_root: str | None = None) -> FastAPI:
     return app
 
 
-app = create_app()
+def create_session_app(data_root: str | None = None) -> FastAPI:
+    """Untrusted-agent-facing Session surface (ADR 0001): exactly the three
+    trial-scoped operations, each bound to one trial by a bearer token."""
+    root = Path(data_root or os.environ.get("ACO_DATA_ROOT", "data")).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    conn = db.connect(root / "aco.db")
+    db.migrate(conn)
+
+    app = FastAPI(title="Agent Capability Observatory — Session API", version="0.2.0")
+    _add_error_handlers(app)
+
+    @app.get("/healthz")
+    async def healthz():
+        return {"status": "ok"}
+
+    from .api.session import register_session_routes
+
+    register_session_routes(app, conn)
+    return app
+
+
+management_app = create_management_app()
+session_app = create_session_app()

@@ -76,13 +76,9 @@ class FakeAgent(NopAgent):
             raise NonZeroAgentExitCodeError("fake agent asked to exit")
 
         if scenario == "submit":
-            answer = await environment.exec("cat /workspace/answer.txt")
-            if answer.return_code:
-                raise NonZeroAgentExitCodeError(f"read answer.txt failed: {answer.stderr}")
+            # end-intent only: the official answer is the workspace snapshot
+            # the supervisor seals; the session never carries an answer body
             _session_request(
                 "POST", "/v1/session/submit", token,
-                {
-                    "answer": {"prompt": prompt, "output": answer.stdout},
-                    "idempotency_key": f"fake-{task['trial_id']}",
-                },
+                {"idempotency_key": f"fake-{task['trial_id']}"},
             )

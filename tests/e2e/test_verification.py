@@ -45,6 +45,10 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+MGMT_TOKEN = "e2e-verification-management-token"
+MGMT_AUTH = {"Authorization": f"Bearer {MGMT_TOKEN}"}
+
+
 def http(method: str, url: str, payload: dict | None = None) -> tuple[int, dict]:
     import urllib.error
     import urllib.request
@@ -53,7 +57,7 @@ def http(method: str, url: str, payload: dict | None = None) -> tuple[int, dict]
         url,
         data=json.dumps(payload).encode() if payload is not None else None,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **MGMT_AUTH},
     )
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -65,34 +69,47 @@ def http(method: str, url: str, payload: dict | None = None) -> tuple[int, dict]
 @pytest.fixture(scope="module")
 def stack(tmp_path_factory):
     root = tmp_path_factory.mktemp("aco-e2e-verification")
-    port = free_port()
-    base = f"http://127.0.0.1:{port}"
-    env = {**dict(__import__("os").environ), "PYTHONPATH": f"{_repo_root()}/src"}
+    mgmt_port, session_port = free_port(), free_port()
+    base = f"http://127.0.0.1:{mgmt_port}"
+    session_base = f"http://127.0.0.1:{session_port}"
+    env = {**dict(__import__("os").environ), "PYTHONPATH": f"{_repo_root()}/src",
+           "ACO_MANAGEMENT_TOKEN": MGMT_TOKEN}
+    server_env = {**env, "ACO_DATA_ROOT": str(root)}
     server = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "aco.app:app", "--port", str(port), "--log-level", "warning"],
-        env={**env, "ACO_DATA_ROOT": str(root)},
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        [sys.executable, "-m", "uvicorn", "aco.app:management_app", "--port", str(mgmt_port),
+         "--log-level", "warning"],
+        env=server_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    session_server = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "aco.app:session_app", "--port", str(session_port),
+         "--log-level", "warning"],
+        env=server_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     manager = subprocess.Popen(
-        [sys.executable, "-m", "aco.execution", "--data-root", str(root), "--api-url", base],
+        [sys.executable, "-m", "aco.execution", "--data-root", str(root),
+         "--api-url", base, "--api-token", MGMT_TOKEN, "--session-api-url", session_base],
         env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         try:
-            if http("GET", base + "/healthz")[0] == 200:
+            if (http("GET", base + "/healthz")[0] == 200
+                    and http("GET", session_base + "/healthz")[0] == 200):
                 break
         except Exception:
             time.sleep(0.2)
     else:
         server.kill()
+        session_server.kill()
         manager.kill()
         raise RuntimeError("API did not become healthy")
     yield {"root": root, "base": base}
     server.terminate()
+    session_server.terminate()
     manager.terminate()
     server.wait(timeout=10)
+    session_server.wait(timeout=10)
     manager.wait(timeout=10)
 
 

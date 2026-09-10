@@ -31,8 +31,9 @@ def conn(tmp_path):
 def client(tmp_path):
     from fastapi.testclient import TestClient
 
-    from aco.app import create_app
-    return TestClient(create_app(data_root=str(tmp_path)))
+    from aco.app import create_management_app
+    app = create_management_app(data_root=str(tmp_path), token="test-management-token")
+    return TestClient(app, headers={"Authorization": "Bearer test-management-token"})
 
 
 def make_experiment(conn, n_trials=2, status="planned") -> str:
@@ -96,15 +97,19 @@ class TestCancel:
         assert conn.execute("SELECT status FROM experiments WHERE id = 'e1'").fetchone()[0] == "cancelled"
         assert dict(conn.execute("SELECT id, status FROM trials").fetchall()) == {"t1": "cancelled", "t2": "cancelled"}
 
-    def test_late_submit_on_cancelled_trial_409(self, client, conn):
+    def test_late_submit_on_cancelled_trial_401(self, client, conn):
+        """A cancelled trial's capability expired: the old token can neither
+        submit late nor replay (#12 reopen)."""
         make_experiment(conn, n_trials=1)
         token = client.post("/v1/trials/t1/session-token").json()["token"]
         client.post("/v1/experiments/e1/cancel")
-        resp = client.post("/v1/session/submit",
-                           headers={"Authorization": f"Bearer {token}"},
-                           json={"answer": "late", "idempotency_key": "k1"})
-        assert resp.status_code == 409
-        assert resp.json()["error"]["code"] == "trial_cancelled"
+        session_client = _session_client_for(conn)
+        resp = session_client.post("/v1/session/submit",
+                                   headers={"Authorization": f"Bearer {token}"},
+                                   json={"idempotency_key": "k1"})
+        assert resp.status_code == 401
+        assert resp.json()["error"]["code"] == "session_expired"
+        assert conn.execute("SELECT COUNT(*) FROM submissions").fetchone()[0] == 0
 
     def test_cancel_untouched_sealed_trial(self, client, conn):
         make_experiment(conn, n_trials=1)
@@ -315,8 +320,10 @@ class TestTerminationRaces:
         conn.commit()
         client = _client_for(conn)
         token = client.post("/v1/trials/t1/session-token").json()["token"]
-        resp = client.post("/v1/session/submit", headers={"Authorization": f"Bearer {token}"},
-                           json={"answer": "in flight", "idempotency_key": "k1"})
+        session_client = _session_client_for(conn)
+        resp = session_client.post("/v1/session/submit",
+                                   headers={"Authorization": f"Bearer {token}"},
+                                   json={"idempotency_key": "k1"})
         assert resp.status_code == 202  # submit wins the acceptance race
 
         client.post("/v1/experiments/e1/cancel")  # cancel wins the termination race
@@ -386,9 +393,21 @@ def _client_for(conn):
 
     from fastapi.testclient import TestClient
 
-    from aco.app import create_app
+    from aco.app import create_management_app
     db_file = Path(conn.execute("PRAGMA database_list").fetchone()[2])
-    return TestClient(create_app(data_root=str(db_file.parent)))
+    app = create_management_app(data_root=str(db_file.parent), token="test-management-token")
+    return TestClient(app, headers={"Authorization": "Bearer test-management-token"})
+
+
+def _session_client_for(conn):
+    """A Session-surface client bound to the same database file."""
+    from pathlib import Path
+
+    from fastapi.testclient import TestClient
+
+    from aco.app import create_session_app
+    db_file = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    return TestClient(create_session_app(data_root=str(db_file.parent)))
 
 
 class TestTimeoutVerdict:

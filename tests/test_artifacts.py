@@ -41,7 +41,7 @@ def trial(conn, tmp_path):
     run_id = runs.create_run(conn, "t1", {"harness": "fake", "model": "none"}, supervisor_pid=1)
     conn.execute(
         "INSERT INTO submissions (trial_id, idempotency_key, request_digest, receipt_id,"
-        " status, answer, created_at) VALUES ('t1', 'k1', 'd1', 'r-123', 'accepted', '{}', 'now')"
+        " status, created_at) VALUES ('t1', 'k1', 'd1', 'r-123', 'accepted', 'now')"
     )
     conn.commit()
     return runs.get_run(conn, run_id)
