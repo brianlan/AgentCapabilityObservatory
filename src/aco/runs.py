@@ -13,6 +13,7 @@ from .db import utcnow
 
 # terminal exit kinds are diagnostics, not scores; harbor's own outcome is raw
 EXIT_NORMAL = "normal"
+EXIT_SUBMIT = "submit"
 EXIT_AGENT_ERROR = "agent_error"
 EXIT_TIMEOUT = "timeout"
 EXIT_SUPERVISOR_LOST = "supervisor_lost"

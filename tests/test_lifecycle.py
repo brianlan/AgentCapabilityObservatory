@@ -127,7 +127,9 @@ class TestCancel:
         resp = client.post("/v1/experiments/e1/cancel")
         assert resp.status_code == 200
         assert resp.json() == {"status": "cancelled", "cancelled": 0, "stopped": 0, "untouched": 1}
-        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "claimed"
+        # the sealed answer keeps its official eligibility: the trial is
+        # terminal 'sealed', never retroactively cancelled
+        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "sealed"
         assert conn.execute("SELECT status FROM sealed_answers WHERE trial_id = 't1'").fetchone()[0] == "sealed"
 
     def test_cancel_stops_running_run_and_marks_anomaly(self, client, conn, monkeypatch):
@@ -183,8 +185,10 @@ class TestRestart:
         assert claim_next_planned(conn) is None  # paused plans never start implicitly
         resp = client.post("/v1/experiments/e1/resume")
         assert resp.status_code == 200
-        assert resp.json() == {"status": "planned", "resumed": 2}
+        assert resp.json() == {"status": "running", "resumed": 2}
         assert claim_next_planned(conn) == "t1"
+        # the first claim flips the experiment to running (state machine)
+        assert conn.execute("SELECT status FROM experiments WHERE id = 'e1'").fetchone()[0] == "running"
 
     def test_resume_without_pause_is_idempotent_noop(self, client, conn):
         make_experiment(conn)
@@ -210,18 +214,22 @@ class TestRestart:
         assert event["reason"] == "supervisor_survived_restart"
 
     def test_unknowable_start_is_never_rerun(self, conn):
-        """Run in 'launching' with an unreadable pid: the trial stays claimed
-        (diagnostics only) and never silently returns to the plan."""
+        """Run in 'launching' with an unreadable pid: the trial ends as an
+        execution-condition anomaly — explainable, terminal, never silently
+        returned to the plan, never re-answered."""
         make_experiment(conn, n_trials=1)
         runs.create_run(conn, "t1", {}, supervisor_pid=-1)
         conn.execute("UPDATE trials SET status = 'claimed' WHERE id = 't1'")
         conn.commit()
         recover_stale_claims(conn)
         reap_lost_supervisors(conn)
-        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "claimed"
+        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "anomaly"
         assert claim_next_planned(conn) is None
         run = runs.get_run(conn, runs.list_runs(conn, "t1")[0]["run_id"])
         assert run["exit_kind"] == "supervisor_lost"  # explainable, not rerun
+        row = conn.execute(
+            "SELECT status, seal_trigger FROM sealed_answers WHERE trial_id = 't1'").fetchone()
+        assert row["status"] == "anomaly" and row["seal_trigger"] == "supervisor_lost"
 
     def test_stuck_running_verification_is_requeued(self, conn):
         make_experiment(conn, n_trials=1)
@@ -271,7 +279,7 @@ class TestTerminationRaces:
         # the official answer stands untouched: exactly one answer row, sealed
         assert conn.execute("SELECT COUNT(*) FROM sealed_answers").fetchone()[0] == 1
         assert conn.execute("SELECT status FROM sealed_answers WHERE trial_id = 't1'").fetchone()[0] == "sealed"
-        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "claimed"
+        assert conn.execute("SELECT status FROM trials WHERE id = 't1'").fetchone()[0] == "sealed"
         # the in-flight run was still stopped (diagnostic only)
         assert runs.get_run(conn, run_id)["exit_kind"] == "cancelled"
 

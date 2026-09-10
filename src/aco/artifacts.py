@@ -127,6 +127,13 @@ def pause_container(container_id: str) -> None:
                    capture_output=True, timeout=20)
 
 
+def container_is_running(container_id: str) -> bool:
+    result = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", container_id],
+        capture_output=True, text=True, timeout=20, check=False)
+    return result.stdout.strip() == "true"
+
+
 def unpause_container(container_id: str) -> None:
     subprocess.run(["docker", "unpause", container_id], check=True,
                    capture_output=True, timeout=20)
@@ -388,7 +395,14 @@ def seal(conn: sqlite3.Connection, run: sqlite3.Row, container_id: str, trigger:
         set_submission_status(conn, trial_id, "sealing")
         staging = root / "sealing" / run_id / "staging"
         try:
-            pause_container(container_id)
+            try:
+                pause_container(container_id)
+            except Exception:
+                # a container stopped by the winning trigger (submit watchdog,
+                # cancel) is already write-frozen — no write can follow (#16).
+                # A pause failure on a running container is still a real error.
+                if container_is_running(container_id):
+                    raise
             times["frozen_at"] = utcnow()
             collect_workspace(container_id, staging, contract)
             times["copied_at"] = utcnow()
@@ -551,7 +565,7 @@ def recover(conn: sqlite3.Connection, root: Path) -> None:
 
 
 def mark_anomaly(conn: sqlite3.Connection, trial_id: str, run_id: str,
-                 detail: str, trigger: str = "exit") -> None:
+                 detail: str, trigger: str = "recovery") -> None:
     """Record an execution-condition anomaly for a trial that never sealed.
 
     The receipt stays stable: reuse the submission's receipt when one exists,
