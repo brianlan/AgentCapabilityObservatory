@@ -7,6 +7,7 @@ daemon is reachable.
 """
 
 import json
+import os
 import shutil
 import socket
 import sqlite3
@@ -208,7 +209,11 @@ def create_verification(base: str, root: Path, trial_id: str, scorer_id: str, ke
     return body
 
 
-def wait_for_verifications(base: str, trial_id: str, count: int, timeout: float = 90) -> list[dict]:
+# ponytail: fixed 90s flaked on a 2.4x-slow CI runner (issue #48); 240s default, override for local runs
+VERIFY_TIMEOUT = float(os.environ.get("ACO_E2E_VERIFY_TIMEOUT", "240"))
+
+
+def wait_for_verifications(base: str, trial_id: str, count: int, timeout: float = VERIFY_TIMEOUT) -> list[dict]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status, records = http("GET", base + f"/v1/trials/{trial_id}/verifications")
