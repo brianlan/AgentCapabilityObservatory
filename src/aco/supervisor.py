@@ -95,14 +95,20 @@ def command(*args, check=True):
 def resolve_skill_mounts(conn: sqlite3.Connection, parsed: TargetProfile,
                          root: Path) -> list[dict]:
     """Resolve each declared SkillVersionRef to its imported, verified bytes
-    (#39). Returns one entry per skill with requested vs observed digests;
-    verified=False means the trial must not run (execution anomaly, no paid
-    call). The fake harness never reaches this: it rejects any skill."""
+    (#39). Returns one entry per skill with requested vs observed digests and
+    the host_dir to mount; verified=False means the trial must not run
+    (execution anomaly, no paid call). The fake harness never reaches this:
+    it rejects any skill."""
     state = []
     for ref in parsed.skills:
-        row = fetch_version(conn, "skill", ref.name, ref.version)
         entry = {"name": ref.name, "version": ref.version,
                  "requested": None, "observed": None, "verified": False}
+        if not skills.NAME_RE.fullmatch(ref.name):
+            # only trusted-side misregistration can reach this; refuse to
+            # build any container path from a non-renderable name (#39)
+            state.append({**entry, "observed": "unsafe_name"})
+            continue
+        row = fetch_version(conn, "skill", ref.name, ref.version)
         if row is None:
             state.append({**entry, "observed": "version_not_found"})
             continue
@@ -116,7 +122,7 @@ def resolve_skill_mounts(conn: sqlite3.Connection, parsed: TargetProfile,
         except skills.SkillImportError as exc:
             state.append({**entry, "observed": f"unreadable: {exc}"})
             continue
-        state.append({**entry, "observed": observed,
+        state.append({**entry, "observed": observed, "host_dir": str(host_dir),
                       "verified": observed == entry["requested"]})
     return state
 
@@ -347,6 +353,10 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
                                      f"{bad['name']}@{bad['version']}:"
                                      f" {bad['observed']}")
             return
+        # verified bytes are the mount source; :ro makes them exactly what
+        # the container sees (#39)
+        skill_mounts = [{"name": s["name"], "host_dir": s["host_dir"]}
+                        for s in skill_state]
         image_ref = await asyncio.to_thread(pi_agent.ensure_image)
         agent_import_path = "aco.pi_agent:PiAgent"
         # the adapter reads these (same process): profile, db root, run id

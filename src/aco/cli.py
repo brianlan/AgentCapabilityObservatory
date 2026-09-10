@@ -84,14 +84,16 @@ def cmd_import_skill(args) -> int:
     copy the bytes into the local data root. Local database, no API."""
     from pathlib import Path as _Path
     from . import db, skills
+    from .app import AppError
 
     root = _Path(args.data_root).expanduser()
     root.mkdir(parents=True, exist_ok=True)
     conn = db.connect(root / "aco.db")
+    db.migrate(conn)
     try:
         record = skills.import_skill(
             _Path(args.bundle), root, args.name, args.version, conn)
-    except skills.SkillImportError as exc:
+    except (skills.SkillImportError, AppError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"imported skill {args.name}@{args.version} id={record['id']} "

@@ -189,8 +189,32 @@ class TestSkillMaterialization:
         state = resolve_skill_mounts(conn, parsed, tmp_path)
         assert len(state) == 1
         assert state[0]["verified"] is True
+        # the mount wiring needs the host_dir of the verified bytes
+        assert state[0]["host_dir"] == str(tmp_path / "skills" / record["id"])
+        assert (tmp_path / "skills" / record["id"] / "SKILL.md").is_file()
         assert state[0]["requested"] == state[0]["observed"]
         assert state[0]["requested"] == record["content"]["bundle"]["digest"]
+
+    def test_unsafe_skill_name_fails_closed(self, tmp_path, conn):
+        """A hostile skill name (only possible via trusted-side
+        misregistration) never becomes a container path (#39)."""
+        import json as _json
+        from aco.models import parse_config_content
+        from aco.supervisor import resolve_skill_mounts
+        conn.execute(
+            "INSERT INTO versions (id, kind, name, version, content, assets,"
+            " created_at) VALUES (?, 'skill', 'evil/path', 'v1', ?, '[]',"
+            " '2026-01-01T00:00:00Z')",
+            ("deadbeef", _json.dumps({"schema_version": 1, "entry": "SKILL.md",
+                                      "bundle": {"digest": "0" * 64,
+                                                 "bytes": 1, "files": 1}})))
+        conn.commit()
+        parsed = parse_config_content(
+            self._profile([{"name": "evil/path", "version": "v1"}]))
+        state = resolve_skill_mounts(conn, parsed, tmp_path)
+        assert state[0]["verified"] is False
+        assert state[0]["observed"] == "unsafe_name"
+        assert "host_dir" not in state[0]
 
     def test_tampered_bytes_fail_verification(self, tmp_path, conn):
         from aco.models import parse_config_content

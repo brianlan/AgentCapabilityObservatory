@@ -198,6 +198,14 @@ class TestPiExecution:
         assert entry["verified"] is True
         assert entry["requested"] == record["content"]["bundle"]["digest"]
         assert entry["requested"] == entry["observed"]
+        # the declared bytes must actually be mounted read-only into the
+        # container — this assertion fails if skill_mounts is never wired
+        # through execute_run (the vacuous-mount regression)
+        compose = (pi_stack["root"] / "runs" / run["run_id"] / "task"
+                   / "offline.yaml").read_text()
+        from aco import pi_agent as aco_pi_agent
+        assert (f'{pi_stack["root"]}/skills/{record["id"]}'
+                f':{aco_pi_agent._PI_CONTAINER_SKILL_ROOT}/e2e-skill:ro') in compose
         status, trial = http("GET", base + f"/v1/trials/{trial_id}")
         assert status == 200
         assert trial["runtime_observation"]["source"] == "pi_json_transcript"
