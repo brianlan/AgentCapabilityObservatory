@@ -97,6 +97,36 @@ def test_run_with_suite_and_idempotency_key_replays(api, state, tmp_path, capsys
     assert other != exp_id
 
 
+def test_run_replays_from_server_after_state_file_loss(api, state, tmp_path, capsys):
+    """#35: the server owns idempotency — losing the local ledger must not
+    duplicate the batch, and the same key with a different body must conflict."""
+    write(tmp_path, "task.json", {"prompt": "T", "tests": []})
+    write(tmp_path, "config.json", {"harness": "fake", "model": "fake-model"})
+    assert main(["register", "task", "sl-task", "v1", str(tmp_path / "task.json"), "--api-url", api]) == 0
+    assert main(["register", "config", "sl-cfg", "v1", str(tmp_path / "config.json"), "--api-url", api]) == 0
+
+    common = ["run", "--task", "sl-task@v1", "--target", "sl-cfg@v1", "--api-url", api,
+              "--idempotency-key", "lost"]
+    assert main(common) == 0
+    first = capsys.readouterr().out
+    exp_id = first.split("Experiment ")[1].split("（")[0]
+
+    state.unlink()  # ledger gone: the server is now the only idempotency authority
+    assert main(common) == 0
+    second = capsys.readouterr().out
+    assert f"Experiment {exp_id}" in second
+    assert second.split("Experiment ")[1].split("（")[0] == exp_id
+
+    # same key, different request: the server answers 409, the CLI exits 1.
+    # (the replay above re-saved the ledger; drop it again so the cache does
+    # not short-circuit before the server ever sees the key)
+    state.unlink()
+    conflict = ["run", "--task", "sl-task@v1", "--target", "sl-cfg@v1",
+                "--repetitions", "2", "--api-url", api, "--idempotency-key", "lost"]
+    assert main(conflict) == 1
+    assert "idempotency_conflict" in capsys.readouterr().err
+
+
 def test_status_human_and_json(api, state, capsys):
     from urllib.request import Request, urlopen
 

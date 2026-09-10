@@ -15,7 +15,7 @@ import sqlite3
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -131,7 +131,34 @@ def register_version(conn: sqlite3.Connection, reg: VersionRegistration) -> tupl
     return version_record(fetch_version(conn, reg.kind, reg.name, reg.version)), 201
 
 
-def create_experiment(conn: sqlite3.Connection, req: ExperimentCreate) -> dict:
+def _idempotency_row(conn: sqlite3.Connection, principal: str, key: str):
+    return conn.execute(
+        "SELECT * FROM management_idempotency WHERE principal = ? AND idempotency_key = ?",
+        (principal, key),
+    ).fetchone()
+
+
+def create_experiment(
+    conn: sqlite3.Connection, req: ExperimentCreate,
+    principal: str | None = None, idempotency_key: str | None = None,
+) -> tuple[dict, int]:
+    """Create the evaluation plan; returns (experiment, status).
+
+    With (principal, idempotency_key) the server owns idempotency (#35): the
+    same key + canonical request digest replays the original experiment (200),
+    the same key with a different body is a 409. Without a key every call
+    creates a new experiment — no implicit idempotency.
+    """
+    request_digest = None
+    if idempotency_key is not None:
+        request_digest = hashlib.sha256(canonical(req.model_dump()).encode()).hexdigest()
+        row = _idempotency_row(conn, principal, idempotency_key)
+        if row is not None:
+            if row["request_digest"] != request_digest:
+                raise AppError(409, "idempotency_conflict",
+                               "this Idempotency-Key was already used with a different request")
+            return get_experiment(conn, row["experiment_id"]), 200
+
     if (req.task is None) == (req.suite is None):
         raise AppError(422, "invalid_selection", "exactly one of 'task' or 'suite' is required")
 
@@ -166,23 +193,45 @@ def create_experiment(conn: sqlite3.Connection, req: ExperimentCreate) -> dict:
 
     requested = req.model_dump()
     # Single transaction: validation failed earlier, so any failure here rolls
-    # back the whole plan — no half-created experiments or trials.
-    with conn:
-        conn.execute(
-            "INSERT INTO experiments (id, status, requested, created_at) VALUES (?, 'planned', ?, ?)",
-            (experiment_id, canonical(requested), db.utcnow()),
-        )
-        conn.executemany(
-            "INSERT INTO trials (id, experiment_id, task_version_id, config_version_id,"
-            " repetition, plan_order, status, requested) VALUES (?, ?, ?, ?, ?, ?, 'planned', ?)",
-            [
-                (tid, eid, task_id, config_id, rep, order,
-                 canonical({"task": {"name": task_row["name"], "version": task_row["version"]},
-                            "config": config_content, "answer_slot": SINGLE_ANSWER_SLOT}))
-                for tid, eid, task_id, config_id, rep, order, config_content in trial_rows
-            ],
-        )
-    return get_experiment(conn, experiment_id)
+    # back the whole plan — no half-created experiments or trials, and (#35) no
+    # orphaned idempotency key. Parent rows are inserted before the FK-bearing
+    # idempotency row (SQLite foreign keys are immediate, even in-transaction).
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO experiments (id, status, requested, created_at) VALUES (?, 'planned', ?, ?)",
+                (experiment_id, canonical(requested), db.utcnow()),
+            )
+            if idempotency_key is not None:
+                conn.execute(
+                    "INSERT INTO management_idempotency"
+                    " (principal, idempotency_key, request_digest, experiment_id, created_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (principal, idempotency_key, request_digest, experiment_id, db.utcnow()),
+                )
+            conn.executemany(
+                "INSERT INTO trials (id, experiment_id, task_version_id, config_version_id,"
+                " repetition, plan_order, status, requested) VALUES (?, ?, ?, ?, ?, ?, 'planned', ?)",
+                [
+                    (tid, eid, task_id, config_id, rep, order,
+                     canonical({"task": {"name": task_row["name"], "version": task_row["version"]},
+                                "config": config_content, "answer_slot": SINGLE_ANSWER_SLOT}))
+                    for tid, eid, task_id, config_id, rep, order, config_content in trial_rows
+                ],
+            )
+    except sqlite3.IntegrityError:
+        # Multi-worker race (#35): UNIQUE(principal, idempotency_key) is the
+        # authoritative guard; the loser's whole transaction (key + plan) was
+        # rolled back, so map it onto the winner's experiment — or 409 if the
+        # winner carried a different body.
+        if idempotency_key is None:
+            raise
+        row = _idempotency_row(conn, principal, idempotency_key)
+        if row is not None and row["request_digest"] == request_digest:
+            return get_experiment(conn, row["experiment_id"]), 200
+        raise AppError(409, "idempotency_conflict",
+                       "this Idempotency-Key was already used with a different request") from None
+    return get_experiment(conn, experiment_id), 202
 
 
 def trial_out(row) -> dict:
@@ -273,6 +322,9 @@ def create_management_app(data_root: str | None = None, token: str | None = None
         # constant-time compare: this is the trust boundary for the whole surface
         if not secrets.compare_digest(supplied, token):
             return error_response(401, "unauthorized", "valid management token required")
+        # principal identity for server-side idempotency (#35): sha256 of the
+        # supplied bearer — the plaintext never lands in the database
+        request.state.principal = hashlib.sha256(supplied.encode()).hexdigest()
         return await call_next(request)
 
     @app.get("/healthz")
@@ -288,9 +340,30 @@ def create_management_app(data_root: str | None = None, token: str | None = None
         record, status = register_version(conn, reg)
         return JSONResponse(status_code=status, content=record)
 
-    @app.post("/v1/experiments", status_code=202, response_model=ExperimentOut)
-    async def post_experiment(req: ExperimentCreate):
-        return create_experiment(conn, req)
+    @app.post(
+        "/v1/experiments",
+        status_code=202,
+        responses={
+            200: {"description": "Idempotent replay: same principal, key, and request digest", "model": ExperimentOut},
+            409: {"description": "Same Idempotency-Key with a different request body"},
+        },
+    )
+    async def post_experiment(
+        req: ExperimentCreate, request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    ):
+        """Create an evaluation plan.
+
+        With an ``Idempotency-Key`` header, the server owns idempotency (#35):
+        the same authenticated principal retrying the same request returns the
+        original experiment (200); the same key with a different body is a 409
+        conflict. WITHOUT the header every call creates a new experiment —
+        the API never pretends an unkeyed request is idempotent.
+        """
+        record, status = create_experiment(
+            conn, req, principal=request.state.principal, idempotency_key=idempotency_key,
+        )
+        return JSONResponse(status_code=status, content=record)
 
     @app.get("/v1/experiments/{experiment_id}", response_model=ExperimentOut)
     async def get_experiment_route(experiment_id: str):
