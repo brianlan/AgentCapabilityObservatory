@@ -10,19 +10,20 @@ scoring).
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
-from . import artifacts, db, lifecycle, runs
+from . import artifacts, db, lifecycle, pi_agent, runs
 from .models import TargetProfile, parse_config_content
 
 # pinned at adoption; prototype verified the installed package against this
 # source commit byte-for-byte (prototypes/harbor-freeze evidence).
 HARBOR_VERSION = "0.22.0"
 HARBOR_SOURCE_COMMIT = "71c39eafbd134d43ae3f489b5e6488b2a157de65"
-ADAPTER_VERSION = "0.1.0"
+ADAPTER_VERSION = pi_agent.ADAPTER_VERSION
 
 # fixed digest used by the prototype; the fake agent needs nothing newer
 IMAGE = "python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254"
@@ -32,6 +33,7 @@ TRIAL_GRACE_SEC = 90
 SUBMIT_POLL_SEC = 0.5
 
 FAKE_HARNESS = "fake"
+PI_HARNESS = "pi"
 # the fake target calls no model; anything model-shaped is unsupported, never
 # silently downgraded (issue acceptance: explicit failure)
 FAKE_MODEL_VALUES = {"", "none"}
@@ -44,22 +46,7 @@ class UnsupportedTarget(Exception):
     pass
 
 
-def translate_profile(profile: dict) -> int:
-    """Return the agent timeout for the fake target or raise UnsupportedTarget."""
-    for key in sorted(profile):
-        if key not in KNOWN_PROFILE_KEYS:
-            raise UnsupportedTarget(
-                f"unsupported target profile field {key!r} for {FAKE_HARNESS!r} in V1;"
-                " only a bare fake profile executes"
-            )
-    try:
-        parsed = parse_config_content(profile)
-    except ValueError as exc:
-        raise UnsupportedTarget(f"invalid target profile: {exc}") from exc
-    if parsed.harness != FAKE_HARNESS:
-        raise UnsupportedTarget(
-            f"unsupported harness {parsed.harness!r}: only {FAKE_HARNESS!r} executes in V1"
-        )
+def _validate_fake_profile(parsed: TargetProfile) -> None:
     if parsed.model not in FAKE_MODEL_VALUES:
         raise UnsupportedTarget(
             f"fake target does not support model={parsed.model!r};"
@@ -71,23 +58,66 @@ def translate_profile(profile: dict) -> int:
                 f"fake target does not support {field}={getattr(parsed, field)!r};"
                 " only a bare fake profile executes in V1"
             )
-    return DEFAULT_AGENT_TIMEOUT_SEC
+
+
+def translate_profile(profile: dict) -> tuple[str, int]:
+    """Return (harness, agent timeout) for an executable profile or raise
+    UnsupportedTarget. Unknown fields fail explicitly on every path (#36)."""
+    for key in sorted(profile):
+        if key not in KNOWN_PROFILE_KEYS:
+            raise UnsupportedTarget(
+                f"unsupported target profile field {key!r};"
+                f" supported harnesses: {FAKE_HARNESS!r}, {PI_HARNESS!r}"
+            )
+    try:
+        parsed = parse_config_content(profile)
+    except ValueError as exc:
+        raise UnsupportedTarget(f"invalid target profile: {exc}") from exc
+    if parsed.harness == FAKE_HARNESS:
+        _validate_fake_profile(parsed)
+        return FAKE_HARNESS, DEFAULT_AGENT_TIMEOUT_SEC
+    if parsed.harness == PI_HARNESS:
+        try:
+            return PI_HARNESS, pi_agent.validate_profile(parsed)
+        except ValueError as exc:
+            raise UnsupportedTarget(str(exc)) from exc
+    raise UnsupportedTarget(
+        f"unsupported harness {parsed.harness!r}: only {FAKE_HARNESS!r} and"
+        f" {PI_HARNESS!r} execute in V1"
+    )
 
 
 def command(*args, check=True):
     return subprocess.run(args, text=True, capture_output=True, timeout=20, check=check)
 
 
-def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run_id: str) -> Path:
+def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run_id: str,
+                   harness: str = FAKE_HARNESS) -> Path:
     """Minimal Harbor task dir: registry prompt as instruction, pinned image,
-    offline compose override with our identification label."""
+    offline compose override with our identification label. The fake target
+    stays fully offline; the pi target gets bridge networking plus a
+    host-gateway route so the configured provider endpoint is reachable."""
     task_dir = work_dir / "task"
     (task_dir / "environment").mkdir(parents=True)
     (task_dir / "instruction.md").write_text(instruction)
+    image = pi_agent.PI_IMAGE_TAG if harness == PI_HARNESS else IMAGE
     (task_dir / "task.toml").write_text(
-        f'schema_version = "1.4"\n[environment]\ndocker_image = "{IMAGE}"\n'
+        f'schema_version = "1.4"\n[environment]\ndocker_image = "{image}"\n'
         f'network_mode = "public"\n[agent]\ntimeout_sec = {agent_timeout_sec}\n'
     )
+    if harness == PI_HARNESS:
+        (task_dir / "environment" / "Dockerfile").write_text(pi_agent.render_dockerfile())
+        compose = task_dir / "offline.yaml"
+        compose.write_text(
+            "services:\n"
+            "  main:\n"
+            "    network_mode: bridge\n"
+            "    extra_hosts:\n"
+            "      - \"host.docker.internal:host-gateway\"\n"
+            "    labels:\n"
+            f"      {RUN_LABEL}: {run_id}\n"
+        )
+        return task_dir
     (task_dir / "environment" / "Dockerfile").write_text(f"FROM {IMAGE}\n")
     compose = task_dir / "offline.yaml"
     compose.write_text(
@@ -135,6 +165,13 @@ def _has_submission(conn: sqlite3.Connection, trial_id: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM submissions WHERE trial_id = ?", (trial_id,)
     ).fetchone() is not None
+
+
+def _target_failure(conn: sqlite3.Connection, run_id: str) -> dict | None:
+    """The adapter's recorded execution-condition failure, if any (#37)."""
+    row = conn.execute("SELECT phases FROM trial_runs WHERE run_id = ?", (run_id,)).fetchone()
+    phases = json.loads(row["phases"]) if row and row["phases"] else []
+    return next((p for p in phases if p.get("event") == "target_failure"), None)
 
 
 def _finish_trial_from_answer(conn: sqlite3.Connection, trial_id: str,
@@ -250,11 +287,21 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
 
     # fail before any side effect on unsupported profiles
     try:
-        agent_timeout_sec = translate_profile(profile)
+        harness, agent_timeout_sec = translate_profile(profile)
     except UnsupportedTarget as exc:
         runs.finish_run(conn, run_id, "error", runs.EXIT_UNSUPPORTED_TARGET, str(exc))
         _fail_before_agent_start(conn, run, "unsupported_target", str(exc))
         return
+
+    image_ref = IMAGE
+    agent_import_path = "aco.fake_agent:FakeAgent"
+    if harness == PI_HARNESS:
+        image_ref = await asyncio.to_thread(pi_agent.ensure_image)
+        agent_import_path = "aco.pi_agent:PiAgent"
+        # the adapter reads these (same process): profile, db root, run id
+        os.environ["ACO_TARGET_PROFILE"] = json.dumps(profile, sort_keys=True)
+        os.environ["ACO_DATA_ROOT"] = str(root)
+        os.environ["ACO_RUN_ID"] = run_id
 
     from harbor.models.trial.config import (
         AgentConfig,
@@ -268,7 +315,8 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
 
     work_dir = root / "runs" / run_id
     baseline_dir = root / "sealing" / run_id / "baseline"
-    task_dir = build_task_dir(work_dir, task_content.get("prompt", ""), agent_timeout_sec, run_id)
+    task_dir = build_task_dir(work_dir, task_content.get("prompt", ""), agent_timeout_sec,
+                              run_id, harness=harness)
     trials_dir = work_dir / "trials"
     container_id = None
     agent_started_at: dict | None = None
@@ -276,7 +324,7 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     async def on_agent_start(_event):
         nonlocal container_id, agent_started_at
         container_id = await asyncio.to_thread(discover_container, run_id)
-        runs.mark_running(conn, run_id, container_id=container_id, image=IMAGE)
+        runs.mark_running(conn, run_id, container_id=container_id, image=image_ref)
         lifecycle.mark_trial_running(conn, run["trial_id"])  # claimed -> running (#16)
         security = await asyncio.to_thread(container_security_summary, container_id)
         agent_started_at = runs.add_phase(conn, run_id, "agent_start", container_id=container_id,
@@ -303,7 +351,7 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         task=TaskConfig(path=task_dir),
         trial_name=f"aco-{run_id[:12]}",
         trials_dir=trials_dir,
-        agent=AgentConfig(import_path="aco.fake_agent:FakeAgent"),
+        agent=AgentConfig(import_path=agent_import_path),
         environment=EnvironmentConfig(extra_docker_compose=[task_dir / "offline.yaml"]),
         # harbor scoring is disabled permanently; ACO owns all official results
         verifier=VerifierConfig(disable=True),
@@ -377,6 +425,14 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
             exit_kind, detail = runs.EXIT_SUBMIT, "agent ended by submit-won container stop"
         else:
             exit_kind, detail = (runs.EXIT_AGENT_ERROR, exception) if exception else (runs.EXIT_NORMAL, None)
+        # an execution-condition failure the adapter recorded (#37) outranks
+        # the mechanical exit: never a capability fail, always an anomaly
+        failure = _target_failure(conn, run_id)
+        if failure is not None:
+            failure_class = failure.get("failure_class", "")
+            exit_kind = (runs.EXIT_PROVIDER_FAILURE if failure_class.startswith("provider")
+                         else runs.EXIT_HARNESS_FAILURE)
+            detail = f"{failure_class}: {failure.get('detail')}"
         runs.add_phase(conn, run_id, "trial_finished", exception=exception,
                        verifier_scored=result.verifier_result is not None)
         runs.finish_run(conn, run_id, "finished", exit_kind, detail)

@@ -61,6 +61,10 @@ FastAPI 进程只保存计划与状态；长运行由独立进程承担：
 - **监督进程**：`/ssd4/envs/aco_py312/bin/python -m aco.supervisor --run-id <id> --data-root data`（通常由管理器拉起，不建议手动运行）。用固定版本 Harbor 0.22.0（源 commit `71c39eafbd134d43ae3f489b5e6488b2a157de65`）运行 Trial：只使用公开接入点（`Trial.create`、`add_hook`、`import_path` agent、关闭 verifier、额外 compose 文件）；Harbor 自动评分永久禁用，其原始退出/日志只作诊断，ACO 不读取 Harbor reward 作为正式分数。
 - **运行观测**：`GET /v1/trials/{trial_id}/runs` 返回启动意图（`requested_profile` 冻结不覆盖）、阶段事件、容器关联（含运行时安全摘要：非 privileged、无 docker socket、`network_mode: none`）、原始退出（`exit_kind`/`exit_detail`）与日志目录引用；未观测字段保持 `null`。
 - **假 target**：V1 只执行 `harness: "fake"`（config 版本内容 `{"harness": "fake", "model": "none"}`）。`aco.fake_agent:FakeAgent` 仅供测试（领题 → 写普通文件 → 按指令场景提交/前台退出/后台写入），不代表真实 harness 接入；其他 harness 或模型/provider/skills/credentials 组合显式失败，不静默回退。
+- **真实 target：Pi + Ark Agent Plan（#37）**：`harness: "pi"` 的 v1 config（`schema_version: 1`）由 `aco.pi_agent:PiAgent` 在 Harbor agent seam 执行，当前只接受精确的固定组合：`pi@0.84.1`（镜像 `aco-pi-agent:0.84.1`，由 supervisor 按固定 node digest + 包版本本地构建并缓存）、provider `ark-agent-plan`、model `glm-5.3-flash`、thinking `max`、`provider_api_style: "openai-responses"`、`adapter_version: "0.1.0"`、`assistance_mode: "none"`、`credentials: ["ark-agent-plan-main"]`、skills 为空（#39 才引入显式 skill）。运行要求：
+  - 管理器/监督进程环境设置 `ARK_AGENT_PLAN_API_KEY=<真实凭证>`（凭证只经环境注入本 Trial 的 pi 进程，不进入配置文件、数据库、日志或 artifacts）；provider endpoint 默认 `https://ark.cn-beijing.volces.com/api/v3`，可用 `ARK_AGENT_PLAN_BASE_URL` 覆盖。
+  - Pi 在容器内以 trial-local 空 `PI_CODING_AGENT_DIR` 运行（不挂载宿主 `~/.pi`），并禁用未声明 skills/extensions/prompt templates/themes/context files，不落 session 文件；agent 收到的唯一文本是任务 prompt。
+  - 证据：`runtime_observation`（`GET /v1/trials/{id}`）带 `source: "pi_json_transcript"`，含 provider/model/usage/tool calls/stop reason，缺失保持 unknown；provider 认证/不可用/瞬时错误与凭证/配置失败分类为 `target_failure`，trial 以 anomaly 收尾，永不计为能力样本。
 
 e2e 测试（需要本机 Docker）：`/ssd4/envs/aco_py312/bin/python -m pytest tests/e2e`。
 
