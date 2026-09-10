@@ -53,11 +53,12 @@ import json
 import sqlite3
 from collections import defaultdict
 
-from ..app import AppError
+from ..app import AppError, ensure_fingerprint
 
 TRIAL_FACTS_SELECT = (
     "SELECT t.id AS trial_id, t.experiment_id, t.status AS trial_status,"
-    " t.opened_at, tv.name AS task_name, tv.version AS task_version,"
+    " t.opened_at, t.fingerprint, cv.content AS config_content,"
+    " tv.name AS task_name, tv.version AS task_version,"
     " cv.name AS config_name, cv.version AS config_version,"
     " e.created_at AS batch_created_at, e.requested AS exp_requested"
     " FROM trials t"
@@ -250,6 +251,9 @@ def collect(conn: sqlite3.Connection, *, task_set: str | None = None, config: st
     groups: dict[tuple[str, str], dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
     for row in conn.execute(f"{TRIAL_FACTS_SELECT} ORDER BY e.created_at, t.plan_order"):
         trial = dict(row)
+        trial["fingerprint"] = ensure_fingerprint(
+            conn, trial["trial_id"], trial["fingerprint"],
+            config_content=trial["config_content"])
         trial["anomaly"] = trial["trial_id"] in anomalies
         trial["published_at"] = published.get(trial["trial_id"])
         if batch and trial["experiment_id"] != batch:
@@ -297,13 +301,18 @@ def collect(conn: sqlite3.Connection, *, task_set: str | None = None, config: st
     for key, batches in sorted(series_map.items(),
                                key=lambda item: (item[0][0], item[0][1], item[0][2] or "")):
         ts, cfg, scr = key
+        # every trial in the group shares the label's immutable version row,
+        # hence one fingerprint; it is the comparability judgment for the
+        # series — two labels with equal fingerprints are comparable (#36)
+        fingerprint = next(iter(batches.values()))[0]["fingerprint"]
         points = []
         for eid, items in sorted(
                 batches.items(), key=lambda pair: pair[1][0]["batch_created_at"]):
             points.append({"batch_id": eid,
                            "batch_created_at": items[0]["batch_created_at"],
                            **_batch_point(items)})
-        series.append({"key": {"task_set": ts, "config": cfg, "scorer": scr},
+        series.append({"key": {"task_set": ts, "config": cfg, "fingerprint": fingerprint,
+                               "scorer": scr},
                        "points": points})
 
     matrix = None

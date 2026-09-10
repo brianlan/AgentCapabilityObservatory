@@ -23,15 +23,16 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from . import db, lifecycle, runs
 from .models import (
     AssetRef,
-    ConfigContent,
     ExperimentCreate,
     ExperimentOut,
     ScorerContent,
     SuiteContent,
+    TargetProfile,
     TrialOut,
     VersionRecord,
     VersionRef,
     VersionRegistration,
+    parse_config_content,
 )
 
 logger = logging.getLogger("aco")
@@ -59,6 +60,34 @@ def version_digest(kind: str, name: str, version: str, content: dict, assets: li
         "assets": sorted((a.model_dump() for a in assets), key=lambda a: (a["name"], a["digest"])),
     }
     return hashlib.sha256(canonical(payload).encode()).hexdigest()
+
+
+def trial_fingerprint(profile: TargetProfile) -> str:
+    """Content fingerprint over the normalized TargetProfile (#36): any
+    change to a controlled condition — model, thinking, harness/adapter
+    versions, prompt, skills, environment, execution policy, assistance
+    mode — yields a different fingerprint and a different comparable
+    result series."""
+    return hashlib.sha256(canonical(profile.model_dump()).encode()).hexdigest()
+
+
+def ensure_fingerprint(conn: sqlite3.Connection, trial_id: str, stored: str | None,
+                       config_content: str | None = None,
+                       config_version_id: str | None = None) -> str:
+    """Compute-and-cache a pre-0011 trial row's fingerprint (#36). The config
+    version content is immutable, so the backfill is deterministic and runs
+    at most once per trial. Pass config_content when already joined,
+    otherwise config_version_id to fetch it."""
+    if stored is not None:
+        return stored
+    if config_content is None:
+        config_content = conn.execute(
+            "SELECT content FROM versions WHERE id = ?", (config_version_id,)
+        ).fetchone()["content"]
+    fp = trial_fingerprint(parse_config_content(json.loads(config_content)))
+    conn.execute("UPDATE trials SET fingerprint = ? WHERE id = ?", (fp, trial_id))
+    conn.commit()
+    return fp
 
 
 def fetch_version(conn: sqlite3.Connection, kind: str, name: str, version: str):
@@ -98,7 +127,9 @@ def register_version(conn: sqlite3.Connection, reg: VersionRegistration) -> tupl
             resolve_version(conn, "task", task_ref)
     elif reg.kind == "config":
         try:
-            ConfigContent.model_validate(reg.content)
+            # both paths validate here: v1 TargetProfile and the legacy fake
+            # shape — unknown fields fail explicitly on either (#36)
+            parse_config_content(reg.content)
         except ValueError as exc:
             raise AppError(422, "invalid_content", f"config content invalid: {exc}") from exc
     elif reg.kind == "scorer":
@@ -180,6 +211,10 @@ def create_experiment(
     trial_rows = []
     for task_row in task_rows:
         for config_row in target_rows:
+            # materialize the full request snapshot: the normalized profile
+            # (defaults included) plus its fingerprint (#36)
+            profile = parse_config_content(json.loads(config_row["content"]))
+            fingerprint = trial_fingerprint(profile)
             for repetition in range(1, req.repetitions + 1):
                 trial_rows.append((
                     uuid.uuid4().hex,
@@ -188,7 +223,9 @@ def create_experiment(
                     config_row["id"],
                     repetition,
                     len(trial_rows) + 1,
-                    json.loads(config_row["content"]),
+                    fingerprint,
+                    canonical({"task": {"name": task_row["name"], "version": task_row["version"]},
+                               "config": profile.model_dump(), "answer_slot": SINGLE_ANSWER_SLOT}),
                 ))
 
     requested = req.model_dump()
@@ -211,12 +248,11 @@ def create_experiment(
                 )
             conn.executemany(
                 "INSERT INTO trials (id, experiment_id, task_version_id, config_version_id,"
-                " repetition, plan_order, status, requested) VALUES (?, ?, ?, ?, ?, ?, 'planned', ?)",
+                " repetition, plan_order, status, requested, fingerprint)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'planned', ?, ?)",
                 [
-                    (tid, eid, task_id, config_id, rep, order,
-                     canonical({"task": {"name": task_row["name"], "version": task_row["version"]},
-                                "config": config_content, "answer_slot": SINGLE_ANSWER_SLOT}))
-                    for tid, eid, task_id, config_id, rep, order, config_content in trial_rows
+                    (tid, eid, task_id, config_id, rep, order, requested, fingerprint)
+                    for tid, eid, task_id, config_id, rep, order, fingerprint, requested in trial_rows
                 ],
             )
     except sqlite3.IntegrityError:
@@ -244,6 +280,7 @@ def trial_out(row) -> dict:
         task=VersionRef(name=row["task_name"], version=row["task_version"]),
         config=VersionRef(name=row["config_name"], version=row["config_version"]),
         requested=json.loads(row["requested"]),
+        fingerprint=row["fingerprint"],
         runtime_observation=json.loads(row["runtime_observation"]) if row["runtime_observation"] else None,
     ).model_dump()
 
@@ -264,6 +301,11 @@ def get_experiment(conn: sqlite3.Connection, experiment_id: str) -> dict:
     trials = conn.execute(
         f"{TRIAL_SELECT} WHERE t.experiment_id = ? ORDER BY t.plan_order", (experiment_id,)
     ).fetchall()
+    # pre-0011 rows carry NULL until first read; the backfill is deterministic
+    # from the immutable version content (#36)
+    trials = [dict(t) | {"fingerprint": ensure_fingerprint(
+        conn, t["id"], t["fingerprint"], config_version_id=t["config_version_id"])}
+        for t in trials]
     return ExperimentOut(
         id=row["id"],
         status=row["status"],
@@ -385,7 +427,10 @@ def create_management_app(data_root: str | None = None, token: str | None = None
         row = conn.execute(f"{TRIAL_SELECT} WHERE t.id = ?", (trial_id,)).fetchone()
         if row is None:
             raise AppError(404, "not_found", f"trial {trial_id} does not exist")
-        return trial_out(row)
+        # deterministic backfill for pre-0011 rows (#36)
+        fingerprint = ensure_fingerprint(conn, row["id"], row["fingerprint"],
+                                         config_version_id=row["config_version_id"])
+        return trial_out(dict(row) | {"fingerprint": fingerprint})
 
     # management path: launch intent, run phases, and raw exit diagnostics
     @app.get("/v1/trials/{trial_id}/runs")

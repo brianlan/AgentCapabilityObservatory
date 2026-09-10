@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 from . import artifacts, db, lifecycle, runs
+from .models import TargetProfile, parse_config_content
 
 # pinned at adoption; prototype verified the installed package against this
 # source commit byte-for-byte (prototypes/harbor-freeze evidence).
@@ -34,8 +35,9 @@ FAKE_HARNESS = "fake"
 # the fake target calls no model; anything model-shaped is unsupported, never
 # silently downgraded (issue acceptance: explicit failure)
 FAKE_MODEL_VALUES = {"", "none"}
-# complete accepted fake-profile shape; anything else fails explicitly
-FAKE_KNOWN_KEYS = ("harness", "model", "provider", "skills", "credentials", "inference")
+# every field a TargetProfile (v1 or normalized legacy) may carry; anything
+# else fails the key walk below (#36)
+KNOWN_PROFILE_KEYS = frozenset(TargetProfile.model_fields)
 
 
 class UnsupportedTarget(Exception):
@@ -45,24 +47,28 @@ class UnsupportedTarget(Exception):
 def translate_profile(profile: dict) -> int:
     """Return the agent timeout for the fake target or raise UnsupportedTarget."""
     for key in sorted(profile):
-        if key not in FAKE_KNOWN_KEYS:
+        if key not in KNOWN_PROFILE_KEYS:
             raise UnsupportedTarget(
                 f"unsupported target profile field {key!r} for {FAKE_HARNESS!r} in V1;"
                 " only a bare fake profile executes"
             )
-    if profile.get("harness") != FAKE_HARNESS:
+    try:
+        parsed = parse_config_content(profile)
+    except ValueError as exc:
+        raise UnsupportedTarget(f"invalid target profile: {exc}") from exc
+    if parsed.harness != FAKE_HARNESS:
         raise UnsupportedTarget(
-            f"unsupported harness {profile.get('harness')!r}: only {FAKE_HARNESS!r} executes in V1"
+            f"unsupported harness {parsed.harness!r}: only {FAKE_HARNESS!r} executes in V1"
         )
-    if profile.get("model") not in FAKE_MODEL_VALUES:
+    if parsed.model not in FAKE_MODEL_VALUES:
         raise UnsupportedTarget(
-            f"fake target does not support model={profile.get('model')!r};"
+            f"fake target does not support model={parsed.model!r};"
             " the fake agent calls no model in V1"
         )
-    for key in ("provider", "skills", "credentials", "inference"):
-        if profile.get(key):
+    for field in ("provider", "thinking", "skills", "credentials"):
+        if getattr(parsed, field):
             raise UnsupportedTarget(
-                f"fake target does not support {key}={profile.get(key)!r};"
+                f"fake target does not support {field}={getattr(parsed, field)!r};"
                 " only a bare fake profile executes in V1"
             )
     return DEFAULT_AGENT_TIMEOUT_SEC

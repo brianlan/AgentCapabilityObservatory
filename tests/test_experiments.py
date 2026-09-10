@@ -111,8 +111,11 @@ def test_trial_separates_requested_config_from_runtime_observation(client, regis
     trial = client.get(f"/v1/trials/{experiment['trials'][0]['id']}").json()
     assert trial["runtime_observation"] is None  # unknown stays null
     assert trial["requested"]["task"] == {"name": "arith", "version": "v1"}
-    assert trial["requested"]["config"] == make_config("cfg-a")
+    # the request snapshot is the normalized profile (defaults included, #36)
+    from aco.models import parse_config_content
+    assert trial["requested"]["config"] == parse_config_content(make_config("cfg-a")).model_dump()
     assert trial["requested"]["answer_slot"] == 1
+    assert len(trial["fingerprint"]) == 64
 
 
 def test_get_unknown_experiment_and_trial_404(client, register):

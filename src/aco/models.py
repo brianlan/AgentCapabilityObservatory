@@ -28,6 +28,72 @@ class ConfigContent(BaseModel):
     credentials: list[str] = Field(default_factory=list)
 
 
+class SkillVersionRef(BaseModel):
+    """Ordered skill reference in a TargetProfile; skills default to empty
+    (nothing is inferred from the host environment, #36)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: str
+
+
+class ExecutionPolicy(BaseModel):
+    """Resource / timeout / network conditions of a target (#36)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cpus: float | None = None
+    memory_mb: int | None = None
+    timeout_sec: int | None = None
+    network: Literal["offline", "online"] | None = None
+
+
+class TargetProfile(BaseModel):
+    """Versioned, normalized, secret-free controlled conditions (#36).
+
+    schema_version 1. Any change to a declared field changes the Trial
+    fingerprint and therefore the comparable result series. Credential
+    fields are logical references only — there is no field a secret value
+    could even be placed in (extra=forbid)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    harness: str
+    harness_version: str | None = None  # e.g. "0.84.1" for pi
+    model: str
+    thinking: str | None = None  # e.g. "max"
+    provider: str | None = None  # e.g. "ark-agent-plan"
+    provider_api_style: str | None = None
+    adapter_version: str | None = None
+    assistance_mode: Literal["none", "human"] = "none"
+    prompt_digest: str | None = None  # content-addressed prompt reference
+    environment: str | None = None  # agent environment image digest
+    resources: ExecutionPolicy | None = None
+    skills: list[SkillVersionRef] = Field(default_factory=list)  # ordered
+    credentials: list[str] = Field(default_factory=list)  # refs only
+
+
+def parse_config_content(content: dict) -> TargetProfile:
+    """Registered config-version content -> normalized TargetProfile (#36).
+
+    Content carrying schema_version uses the v1 profile path; anything else
+    is the legacy fake-config shape, normalized into the same fields (skill
+    names become unversioned refs, assistance_mode defaults to none). Unknown
+    fields fail explicitly on both paths (extra=forbid) — never ignored."""
+    if isinstance(content, dict) and "schema_version" in content:
+        return TargetProfile.model_validate(content)
+    legacy = ConfigContent.model_validate(content)
+    return TargetProfile(
+        harness=legacy.harness,
+        model=legacy.model,
+        provider=legacy.provider,
+        skills=[SkillVersionRef(name=s, version="") for s in legacy.skills],
+        credentials=legacy.credentials,
+    )
+
+
 class SuiteContent(BaseModel):
     tasks: list[VersionRef] = Field(min_length=1)
 
@@ -66,6 +132,7 @@ class TrialOut(BaseModel):
     task: VersionRef
     config: VersionRef
     requested: dict[str, Any]
+    fingerprint: str | None = None  # pre-0011 rows backfill on read (#36)
     runtime_observation: dict[str, Any] | None = None
 
 
