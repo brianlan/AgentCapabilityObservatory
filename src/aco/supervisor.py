@@ -572,8 +572,6 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     try:
         try:
             result = await asyncio.wait_for(run_task, timeout=agent_timeout_sec + TRIAL_GRACE_SEC)
-            print(f"[aco-supervisor] run task returned: {type(result).__name__}",
-                  file=sys.stderr, flush=True)
         except asyncio.TimeoutError:
             await handle_timeout("outer_deadline",
                                  f"trial exceeded {agent_timeout_sec + TRIAL_GRACE_SEC}s")

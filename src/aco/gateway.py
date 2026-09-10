@@ -19,6 +19,8 @@ from urllib.parse import urlsplit
 
 SESSION_PREFIX = "/v1/session/"
 EVIDENCE_FILE = os.environ.get("ACO_GATEWAY_EVIDENCE", "")
+# per-upstream connect/read timeout; module constant so tests can shrink it
+UPSTREAM_TIMEOUT_SEC = 120
 
 PROVIDER_UPSTREAM = urlsplit(os.environ.get("ACO_GATEWAY_PROVIDER_UPSTREAM", ""))
 SESSION_UPSTREAM = urlsplit(os.environ.get("ACO_GATEWAY_SESSION_UPSTREAM", ""))
@@ -77,7 +79,7 @@ class _Gateway(BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in ("host", "connection", "transfer-encoding")}
         try:
-            connection = http.client.HTTPConnection(upstream.netloc, timeout=120)
+            connection = http.client.HTTPConnection(upstream.netloc, timeout=UPSTREAM_TIMEOUT_SEC)
             connection.request(self.command, self.path,
                                body=self.rfile.read(length) if length else None,
                                headers=headers)

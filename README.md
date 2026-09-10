@@ -65,7 +65,14 @@ FastAPI 进程只保存计划与状态；长运行由独立进程承担：
   - 管理器/监督进程环境设置 `ARK_AGENT_PLAN_API_KEY=<真实凭证>`（凭证只经环境注入本 Trial 的 pi 进程，不进入配置文件、数据库、日志或 artifacts）；provider endpoint 默认 `https://ark.cn-beijing.volces.com/api/v3`，可用 `ARK_AGENT_PLAN_BASE_URL` 覆盖。
   - Pi 在容器内以 trial-local 空 `PI_CODING_AGENT_DIR` 运行（不挂载宿主 `~/.pi`），并禁用未声明 skills/extensions/prompt templates/themes/context files，不落 session 文件；agent 收到的唯一文本是任务 prompt。
   - 证据：`runtime_observation`（`GET /v1/trials/{id}`）带 `source: "pi_json_transcript"`，含 provider/model/usage/tool calls/stop reason，缺失保持 unknown；provider 认证/不可用/瞬时错误与凭证/配置失败分类为 `target_failure`，trial 以 anomaly 收尾，永不计为能力样本。
-  - **网络限制与付费门（#38）**：真实 provider target 默认拒绝执行。创建 Experiment 时，若任一 target 的 harness 为 `pi` 而请求未带 `allow_paid_run: true`（CLI 为 `aco run --allow-paid-run`，创建前经 `GET /v1/versions/{kind}/{name}/{version}` 预检），API 返回 403 `paid_run_not_allowed`；恢复路径只回放既有计划，绝不重新付费调用。获准的 Trial 在受限网络中运行：容器网络命名空间由 Harbor 0.22.0 的 egress-control sidecar 以 nftables 内核级执行 allowlist，唯一放行目标是每 Trial 一次性的 `aco-gateway` 服务（stdlib 转发器，静态 IP `198.19.<派生字节>.10`，子网 `198.19.<派生字节>.0/24`——受限命名空间内 DNS 不可靠，放行路径不依赖域名）。gateway 只转发两类流量：`/v1/session/*` → Session 监听；provider 前缀 → 固定 Ark endpoint（可用 `ARK_AGENT_PLAN_BASE_URL` 覆盖，e2e 用本地 mock）。其余目标一律 403 `egress_denied` 并记入证据。审计证据（不含任何内容或密钥）：`network_policy` 阶段记录 policy 版本、allowed_targets 与 enforcement；`network_deny_probe` 阶段记录 agent 启动钩子内对 `1.1.1.1` 的内核级拒绝探测；`<data-root>/gateway-logs/<run_id>.jsonl` 逐连接记录 route/method/path/status/耗时。运营注意：管理与 session 监听必须只绑定本机回环/内网接口（gateway 经 `host.docker.internal` 访问 session；管理面永远不加入 trial 网络）；e2e 已从容器内验证：session 可达、管理面/公网/直连 IP/运行时安装全部被拒、提交意图经受限路径成功。
+  - **网络限制与付费门（#38）**：真实 provider target 默认拒绝执行。创建 Experiment 时，若任一 target 的 harness 为 `pi` 而请求未带 `allow_paid_run: true`（CLI 为 `aco run --allow-paid-run`，创建前经 `GET /v1/versions/{kind}/{name}/{version}` 预检），API 返回 403 `paid_run_not_allowed`；恢复路径只回放既有计划，绝不重新付费调用。获准的 Trial 在受限网络中运行：容器网络命名空间由 Harbor 0.22.0 的 egress-control sidecar 以 nftables 内核级执行 allowlist，唯一放行目标是每 Trial 一次性的 `aco-gateway` 服务（stdlib 转发器，静态 IP `198.19.<派生字节>.10`，子网 `198.19.<派生字节>.0/24`——受限命名空间内 DNS 不可靠，放行路径不依赖域名）。gateway 只转发两类流量：`/v1/session/*` → Session 监听；provider 前缀 → 固定 Ark endpoint（可用 `ARK_AGENT_PLAN_BASE_URL` 覆盖，e2e 用本地 mock）。其余目标一律 403 `egress_denied` 并记入证据。审计证据（不含任何内容或密钥）：`network_policy` 阶段记录 policy 版本、allowed_targets 与 enforcement；`network_deny_probe` 阶段记录 agent 启动钩子内对 `1.1.1.1` 的内核级拒绝探测；`<data-root>/gateway-logs/<run_id>.jsonl` 逐连接记录 route/method/path/status/耗时。运营注意：管理与 session 监听必须只绑定本机回环/内网接口（gateway 经 `host.docker.internal` 访问 session；管理面永远不加入 trial 网络）；Docker socket 绝不挂载进 trial 容器，宿主控制面按构造不可达。e2e 已从容器内验证：session 可达、管理面/公网/直连 IP/运行时安装全部被拒、提交意图经受限路径成功。
+
+真实 provider smoke（仅供运营手动审阅执行，系统绝不自动运行；固定超时由 config 的 `resources.timeout_sec` 钉死）：
+
+```bash
+aco run --task <task>@v1 --target <pi-config>@v1 --repetitions 1 \
+  --allow-paid-run --wait
+```
 
 e2e 测试（需要本机 Docker）：`/ssd4/envs/aco_py312/bin/python -m pytest tests/e2e`。
 
