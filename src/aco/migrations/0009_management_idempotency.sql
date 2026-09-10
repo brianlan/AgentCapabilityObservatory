@@ -1,4 +1,4 @@
--- 0008 (#35): server-authoritative idempotent Experiment creation.
+-- 0009 (#35): server-authoritative idempotent Experiment creation.
 -- One row per (management principal, Idempotency-Key). The canonical request
 -- digest — body only, never credential material — decides replay vs 409; the
 -- experiment_id ties the key to the first-created plan. Registered in the

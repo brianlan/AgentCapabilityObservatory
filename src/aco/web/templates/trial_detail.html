@@ -108,6 +108,7 @@
     <tr>
       <th scope="col">评分器</th><th scope="col">状态</th><th scope="col">结果</th>
       <th scope="col">子指标</th><th scope="col">错误</th><th scope="col">结果一致</th>
+      <th scope="col">执行尝试</th>
       <th scope="col">开始</th><th scope="col">结束</th>
     </tr>
   </thead>
@@ -120,6 +121,7 @@
       <td>{% if v.submetrics %}{{ v.submetrics | tojson }}{% else %}<span class="unknown">未知</span>{% endif %}</td>
       <td>{% if v.error_kind %}{{ v.error_kind }}: {{ v.error_detail }}{% else %}—{% endif %}</td>
       <td>{% if v.stable %}是{% else %}否（同版本评分结果冲突，需人工核查）{% endif %}</td>
+      <td>{% for a in v.attempts %}#{{ a.attempt_no }} {{ a.status }}{% if a.status == 'succeeded' %}（{{ '通过' if a.pass else '未通过' }}）{% elif a.error_kind %}（{{ a.error_kind }}: {{ a.error_detail }}）{% endif %}<br>{% else %}<span class="unknown">无尝试记录</span>{% endfor %}</td>
       <td>{{ v.started_at or '未知' }}</td>
       <td>{{ v.finished_at or '未知' }}</td>
     </tr>

@@ -99,11 +99,11 @@ aco resume <experiment-id>
 
 `GET /v1/results`（可选过滤：`task_set`、`config`、`scorer`、`batch`，均 `name@version`；`view=raw|unified`）在服务端完成过滤与聚合，dashboard `/dashboard/results` 只渲染其返回值，统计公式不进前端：
 
-- **分母来自实验计划**（trials 表的计划重复数），成功评分行从不充当分母；异常封存、取消、待完成样本保留在分母中并分别计数（`counts.anomaly` / `cancelled` / `pending` / `score_error`）。
+- **分母来自实验计划**（trials 表的计划重复数），成功评分行从不充当分母；异常封存、取消、待完成样本保留在分母中并分别计数（`counts.anomaly` / `cancelled` / `pending` / `score_error` / `unstable`）。
 - **主分按题等权**：每题先算预定重复的通过率，再对题目等权平均——不是按 Trial 总数的简单合并平均。
 - **缺失界限**：任一计划样本无有效判定时不标主分，输出固定权重下界（确认通过/计划）与"未知全通过"上界；界限是缺失界限，不是置信区间。
 - **分线**：题组版本、target 配置、评分口径（scorer 版本）任一不同即不同序列，允许叠加、不自动混合；同题跨序列比较需显式过滤。
-- **raw 与 unified**：raw 视图按实际产生判定的 scorer 版本分线（重评过的试验在两个 grader 下各出现一次）；unified 视图必须显式指定 `scorer`，只统计该重评口径。判定解析取每 (trial, scorer 版本) 的最新追加记录（`created_at` + 插入顺序）：重评/重试取代旧记录，旧记录绝不影响结果——不自动挑选"最高分"，而是按时间取当前判定。
+- **raw 与 unified**：raw 视图按实际产生判定的 scorer 版本分线（重评过的试验在两个 grader 下各出现一次）；unified 视图必须显式指定 `scorer`，只统计该重评口径。判定解析按每 (trial, scorer 版本) 进行：该组合下所有成功判定一致时取最新追加记录为当前判定（`created_at` + 插入顺序）；成功判定相互矛盾时标记 `unstable`，保留全部证据、单独计数（`counts.unstable`）并从正式能力分中排除——不会按"最新赢"静默取舍，重复执行到通过也无法消除该标记。不自动挑选"最高分"。
 - **时间轴**：每批次点以作答批次创建时间为横轴并给出实际起止范围；部分批次明确标"否（部分结果）"。
 - **矩阵与下钻**：单 grader 口径下给出题目 × 配置矩阵（跨批次合并计数 + 缺失界限），趋势点/矩阵格/计数表链接到批次与试验详情页。
 - **延迟/令牌/费用**：仅当 verifier submetrics 上报时按名称展示均值与样本数（来源：verifier submetrics），未上报显示缺失——不填零、不混入能力分。
@@ -112,7 +112,9 @@ aco resume <experiment-id>
 
 ## 独立评分与封存（#14、#15）
 
-正式答案是 ACO 自己经 pause/copy 冻结的 workspace 快照（Harbor 的事后收集仅作诊断）；评分由独立 verifier 容器执行（`--network none --read-only`，封存答案与 verifier bundle 均只读挂载，唯一可写是全新输出目录），每次执行追加一条 `verifications` 记录，错误分类记录、绝不写成 `pass=false`。verifier bundle 以 digest 固定（登记时声明，执行前校验）。
+正式答案是 ACO 自己经 pause/copy 冻结的 workspace 快照（Harbor 的事后收集仅作诊断）；评分由独立 verifier 容器执行（`--network none --read-only`，封存答案与 verifier bundle 均只读挂载，唯一可写是全新输出目录），错误分类记录、绝不写成 `pass=false`。verifier bundle 以 digest 固定（登记时声明，执行前校验）。
+
+每次实际容器启动追加一条独立 `verification_attempts` 记录（序号、起止时间、原始输出目录、运行时证据），`verifications` 行只保存幂等请求与当前状态；manager 重启恢复会把被中断的 attempt 定型为 `infra_error`（保留其原始时间与诊断）并追加新 attempt，绝不覆盖历史。`GET /v1/trials/{id}/verifications` 与 dashboard 返回每条评分的完整 attempt 历史。
 
 **任务声明的 ArtifactContract（#14 reopen）**：TaskVersion 的不可变内容必须携带 `contract`（`required_outputs`，可选 `allowed_paths`/`max_total_bytes`，未知字段拒绝）及其 `contract_digest`。监督进程在 agent 启动前解析一次并校验 digest——缺失、digest 不符或 schema 无效直接 `contract_invalid` 失败，绝不静默使用默认值；同一 contract 实例贯穿 baseline、正式采集、校验、manifest 与重启恢复（恢复时校验不过按执行条件异常处理，不发布）。必产出物缺失时封存失败并留下异常状态。
 
