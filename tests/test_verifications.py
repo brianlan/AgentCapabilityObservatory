@@ -292,7 +292,7 @@ class TestAuthoritativeParsing:
         scorer_id = make_scorer(conn, tmp_path)
         seal_directly(tmp_path, trial)
         vid = queue_verification(conn, trial, scorer_id)
-        planted = tmp_path / "verifications" / vid / "output"
+        planted = tmp_path / "verifications" / vid / "attempt-1" / "output"
         planted.mkdir(parents=True)
         (planted / "result.json").write_text(json.dumps({"schema": SCHEMA, "pass": True}))
         monkeypatch.setattr(runner.subprocess, "run", FakeDocker(verdict="missing"))
@@ -344,8 +344,8 @@ class TestContainerCommand:
         scorer_id = make_scorer(conn, tmp_path)
         seal_directly(tmp_path, trial)
         record = run_one(conn, tmp_path, scorer_id)
-        assert (tmp_path / "verifications" / record["id"] / "output" / "result.json").is_file()
-        assert (tmp_path / "verifications" / record["id"] / "docker-run.log").is_file()
+        assert (tmp_path / "verifications" / record["id"] / "attempt-1" / "output" / "result.json").is_file()
+        assert (tmp_path / "verifications" / record["id"] / "attempt-1" / "docker-run.log").is_file()
 
 
 class TestBundleDigest:
@@ -501,6 +501,78 @@ class TestVerificationAPI:
         )
         conn.commit()
         conn.close()
+
+
+class TestRestartRecovery:
+    """Reopened #15: every actual container start appends its own attempt
+    record; manager-restart recovery preserves earlier attempts and the
+    re-queued execution appends a new one."""
+
+    @staticmethod
+    def attempts(conn, vid):
+        return conn.execute(
+            "SELECT * FROM verification_attempts WHERE verification_id = ?"
+            " ORDER BY attempt_no", (vid,)).fetchall()
+
+    def test_recovery_preserves_first_attempt_and_appends_second(self, conn, trial, tmp_path, monkeypatch):
+        scorer_id = make_scorer(conn, tmp_path)
+        seal_directly(tmp_path, trial)
+        vid = queue_verification(conn, trial, scorer_id)
+
+        first = runner.claim_next_queued(conn)  # container started, then the manager crashed
+        first_started = first["started_at"]
+        runner.requeue_stuck_running(conn)  # startup recovery after the crash
+
+        (recorded,) = self.attempts(conn, vid)
+        assert recorded["attempt_no"] == 1
+        assert recorded["started_at"] == first_started  # first attempt's time preserved
+        assert recorded["status"] == "error" and recorded["error_kind"] == "infra_error"
+        assert "interrupted" in recorded["error_detail"]
+
+        monkeypatch.setattr(runner.subprocess, "run", FakeDocker(pass_value=True))
+        assert runner.run_pending(conn, tmp_path) is True  # the re-queued execution
+
+        first_attempt, second_attempt = self.attempts(conn, vid)
+        assert second_attempt["attempt_no"] == 2
+        assert second_attempt["status"] == "succeeded" and second_attempt["pass"] == 1
+        assert second_attempt["started_at"] != first_started
+        assert first_attempt["started_at"] == first_started  # still untouched
+        assert "interrupted" in first_attempt["error_detail"]
+        # the verifications row mirrors the current (second) attempt state
+        row = dict(conn.execute("SELECT * FROM verifications WHERE id = ?", (vid,)).fetchone())
+        assert row["status"] == "succeeded" and row["pass"] == 1
+        assert row["started_at"] == second_attempt["started_at"]
+
+    def test_each_attempt_keeps_its_own_diagnostics(self, conn, trial, tmp_path, fake_docker):
+        scorer_id = make_scorer(conn, tmp_path)
+        seal_directly(tmp_path, trial)
+        vid = queue_verification(conn, trial, scorer_id)
+        row = runner.claim_next_queued(conn)
+        runner.execute_verification(conn, row, tmp_path)
+        # simulate the post-crash requeue, then a second execution
+        conn.execute("UPDATE verifications SET status = 'queued', started_at = NULL WHERE id = ?", (vid,))
+        conn.commit()
+        assert runner.run_pending(conn, tmp_path) is True
+
+        base = tmp_path / "verifications" / vid
+        assert (base / "attempt-1" / "output" / "result.json").is_file()
+        assert (base / "attempt-1" / "docker-run.log").is_file()
+        assert (base / "attempt-2" / "output" / "result.json").is_file()
+        first = json.loads((base / "attempt-1" / "output" / "result.json").read_text())
+        assert first["pass"] is True  # attempt 2's fresh dir never touched attempt 1
+
+    def test_api_lists_attempt_history(self, conn, trial, tmp_path, fake_docker):
+        from aco.api.verifications import list_verifications
+
+        scorer_id = make_scorer(conn, tmp_path)
+        seal_directly(tmp_path, trial)
+        vid = queue_verification(conn, trial, scorer_id)
+        row = runner.claim_next_queued(conn)
+        runner.execute_verification(conn, row, tmp_path)
+        records = {r["id"]: r for r in list_verifications(conn, trial)}
+        (attempt,) = records[vid]["attempts"]
+        assert attempt["attempt_no"] == 1
+        assert attempt["status"] == "succeeded" and attempt["pass"] is True
 
 
 class TestQuerySemantics:

@@ -108,6 +108,17 @@ def seed(conn):
             " VALUES (?, 't-normal', ?, 'rd', 'v-scorer', ?, ?, ?, ?, ?, 'now')",
             (vid, idem, status, passed, sub, ek, ed),
         )
+    # per-execution attempt records (0008): a succeeded attempt and one
+    # interrupted by a manager restart
+    conn.execute(
+        "INSERT INTO verification_attempts (id, verification_id, attempt_no, status, pass,"
+        " submetrics, started_at, finished_at)"
+        " VALUES ('a1', 'v1', 1, 'succeeded', 1, '{\"accuracy\": 0.9}', 't0', 't1')")
+    conn.execute(
+        "INSERT INTO verification_attempts (id, verification_id, attempt_no, status,"
+        " error_kind, error_detail, started_at, finished_at)"
+        " VALUES ('a3', 'v3', 1, 'error', 'infra_error', 'interrupted by manager restart',"
+        " 't0', 't1')")
     conn.commit()
     return {"normal_run": run_id, "anomaly_run": anomalous_run}
 
@@ -151,6 +162,9 @@ def test_all_verification_attempts_and_errors_visible(client, conn):
     assert "infra_error: docker daemon unreachable" in page.text
     # same-version disagreement is surfaced, never silently resolved
     assert "同版本评分结果冲突" in page.text
+    # per-execution attempt history is visible, including a restart-interrupted one
+    assert "#1 succeeded" in page.text
+    assert "interrupted by manager restart" in page.text
 
 
 def test_eligibility_and_anomaly_visible(client, conn):

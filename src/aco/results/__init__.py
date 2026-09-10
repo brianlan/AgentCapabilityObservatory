@@ -30,10 +30,14 @@ version, ignoring rows from any other scorer version.
 
 Verdict resolution per (trial, scorer version), append-only aware:
 
-- re-evaluation appends rows; the latest row (created_at, then insertion
-  order) is the current verdict and fully supersedes older ones — stale
-  rows never influence verdicts, counts, pass rates, bounds, or
-  submetrics;
+- re-evaluation appends rows; every *successful* verdict of the pair counts
+  toward stability, and contradictory successful verdicts mark the pair
+  unstable — the state is excluded from capability scores and surfaced in
+  its own bucket instead of silently picking the latest result. Re-running
+  until pass cannot erase the mark: only agreeing verdicts are stable;
+- without a contradiction the latest row (created_at, then insertion order)
+  is the current verdict and supersedes older ones — stale rows never
+  influence verdicts, counts, pass rates, bounds, or submetrics;
 - latest row succeeded -> a valid verdict (pass 0/1, including a failing
   one);
 - latest row errored -> scoring error (unknown, counted);
@@ -62,7 +66,7 @@ TRIAL_FACTS_SELECT = (
     " JOIN versions cv ON cv.id = t.config_version_id"
 )
 
-BUCKETS = ("valid", "score_error", "anomaly", "cancelled", "pending")
+BUCKETS = ("valid", "unstable", "score_error", "anomaly", "cancelled", "pending")
 
 
 def parse_ref(value: str) -> tuple[str, str]:
@@ -79,35 +83,45 @@ def _task_set_of(requested: dict) -> str:
 
 
 def _verdicts(conn: sqlite3.Connection) -> dict[str, list[dict]]:
-    """Resolve one verdict per (trial, scorer version) from append-only rows,
-    grouped by trial id. The latest row per (trial, scorer version) — by
-    created_at, then insertion order — is the verdict and supersedes any
-    older row, so regrades and retries replace rather than conflict."""
+    """Resolve one verdict state per (trial, scorer version) from append-only
+    rows, grouped by trial id. All successful verdicts of a pair decide its
+    stability: contradictory successful verdicts mark the pair unstable —
+    excluded from capability scores instead of "latest wins". Without a
+    contradiction the latest row (created_at, then insertion order) is the
+    current verdict and supersedes older ones."""
     rows = conn.execute(
         "SELECT v.trial_id, v.scorer_version_id, v.status, v.pass, v.submetrics,"
         " v.finished_at, sv.name AS scorer_name, sv.version AS scorer_version"
         " FROM verifications v JOIN versions sv ON sv.id = v.scorer_version_id"
         " ORDER BY v.created_at, v.rowid"
     ).fetchall()
-    resolved: dict[tuple[str, str], dict] = {}
-    for row in rows:  # append-only order: each row replaces any earlier one
-        resolved[(row["trial_id"], row["scorer_version_id"])] = {
-            "trial_id": row["trial_id"],
-            "scorer": f'{row["scorer_name"]}@{row["scorer_version"]}',
-            "pass": bool(row["pass"]) if row["status"] == "succeeded" else None,
-            "score_error": row["status"] == "error",
-            "submetrics": [json.loads(row["submetrics"])] if row["submetrics"] else [],
-            "finished_at": row["finished_at"],
-        }
+    history: dict[tuple[str, str], list[sqlite3.Row]] = {}
+    for row in rows:
+        history.setdefault((row["trial_id"], row["scorer_version_id"]), []).append(row)
     by_trial: dict[str, list[dict]] = defaultdict(list)
-    for state in resolved.values():
-        by_trial[state["trial_id"]].append(state)
+    for (trial_id, _scorer_version_id), rows_of_pair in history.items():
+        last = rows_of_pair[-1]
+        verdicts = {
+            json.dumps({"pass": row["pass"], "submetrics": row["submetrics"]}, sort_keys=True)
+            for row in rows_of_pair if row["status"] == "succeeded"
+        }
+        by_trial[trial_id].append({
+            "trial_id": trial_id,
+            "scorer": f'{last["scorer_name"]}@{last["scorer_version"]}',
+            "unstable": len(verdicts) > 1,
+            "pass": bool(last["pass"]) if last["status"] == "succeeded" else None,
+            "score_error": last["status"] == "error",
+            "submetrics": [json.loads(last["submetrics"])] if last["submetrics"] else [],
+            "finished_at": last["finished_at"],
+        })
     return by_trial
 
 
 def _classify(trial: dict, state: dict | None) -> str:
     """One bucket per trial within a series; buckets sum to the plan."""
     if state is not None:
+        if state["unstable"]:
+            return "unstable"
         if state["pass"] is not None:
             return "valid"
         if state["score_error"]:
@@ -128,13 +142,16 @@ def _mean(values: list[float]) -> float | None:
 
 
 def _task_point(states: list[dict]) -> dict:
-    """Per-task metrics over that task's planned repetitions."""
+    """Per-task metrics over that task's planned repetitions. Unstable
+    trials stay in the denominator, never count as passes or valid
+    coverage, and suppress the batch's official main score."""
     planned = len(states)
     passes = sum(1 for s in states if s["bucket"] == "valid" and s["pass"])
     valid = sum(1 for s in states if s["bucket"] == "valid")
     unknown = planned - valid
     return {
         "planned": planned, "pass": passes, "valid": valid,
+        "unstable": sum(1 for s in states if s["bucket"] == "unstable"),
         "lower": _rate(passes, planned),
         "upper": _rate(passes + unknown, planned),
         "coverage": _rate(valid, planned),
@@ -199,7 +216,7 @@ def _batch_point(items: list[dict]) -> dict:
 def _empty_state(scorer: str, trial_id: str) -> dict:
     """State shape for a trial with no scoring row under this scorer version:
     it stays in the plan denominator as an unknown."""
-    return {"trial_id": trial_id, "scorer": scorer, "pass": None,
+    return {"trial_id": trial_id, "scorer": scorer, "pass": None, "unstable": False,
             "score_error": False, "submetrics": [], "finished_at": None}
 
 
