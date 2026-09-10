@@ -13,15 +13,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 ANSWER_TEXT = "PI-E2E-OK"
 
 
-def _sse(send, event):
-    send(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode())
-    send(b"", flush=False)
-
-
-def _flush(self):
-    self.wfile.flush()
-
-
 class MockArk:
     """Threaded mock; scenario switches between 'tool_call' and 'auth_fail'."""
 
