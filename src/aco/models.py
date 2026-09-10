@@ -105,7 +105,7 @@ class SuiteContent(BaseModel):
 
 
 class VersionRegistration(BaseModel):
-    kind: Literal["task", "suite", "config", "scorer"]
+    kind: Literal["task", "suite", "config", "scorer", "skill"]
     name: str = Field(min_length=1)
     version: str = Field(min_length=1)
     content: dict[str, Any]

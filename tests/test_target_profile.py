@@ -37,6 +37,14 @@ def register_task(register, name="arith"):
     register("task", name, "v1", dict(TASK_CONTENT))
 
 
+def register_pi_skills(register):
+    """PI_PROFILE declares pdf@v2 + search@v1; v1 configs resolve them (#39)."""
+    for name, version in (("pdf", "v2"), ("search", "v1")):
+        register("skill", name, version, {
+            "schema_version": 1, "entry": "SKILL.md",
+            "bundle": {"digest": "0" * 64, "bytes": 1, "files": 1}})
+
+
 def create_trial(client, config_name="t1", version="v1", allow_paid_run=False):
     experiment = client.post("/v1/experiments", json={
         "task": {"name": "arith", "version": "v1"},
@@ -64,6 +72,7 @@ class TestTargetProfileSchema:
 
     def test_v1_profile_registers_with_pinned_pi_fields(self, client, register):
         register_task(register)
+        register_pi_skills(register)
         register("config", "pi-main", "v1", dict(PI_PROFILE))
         # the pinned-field flow is exercised through the paid gate (#38)
         trial = create_trial(client, "pi-main", allow_paid_run=True)
@@ -100,6 +109,7 @@ class TestTargetProfileSchema:
         assert set(trial["requested"]["config"]) <= set(TargetProfile.model_fields)
 
     def test_assistance_mode_values(self, register):
+        register_pi_skills(register)
         ok = register("config", "ok", "v1",
                       dict(PI_PROFILE, assistance_mode="human"))
         assert ok.status_code in (200, 201)

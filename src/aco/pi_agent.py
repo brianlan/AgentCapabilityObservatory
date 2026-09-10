@@ -75,12 +75,26 @@ _UNSET_PROXIES = (
     "env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy"
     " -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy"
 )
-# isolation flags: no undeclared skills/extensions/prompt templates/themes,
-# no workspace context files, no saved session, no startup network ops
+# isolation flags: no undeclared extensions/prompt templates/themes, no
+# workspace context files, no saved session, no startup network ops.
+# Skills are handled separately: the default set is empty -> --no-skills;
+# declared skills are mounted read-only and loaded explicitly (#39).
+_PI_CONTAINER_SKILL_ROOT = "/opt/aco-skills"
 _PI_ISOLATION_FLAGS = (
-    "--no-skills --no-extensions --no-prompt-templates"
+    "--no-extensions --no-prompt-templates"
     " --no-themes --no-context-files --no-session --offline"
 )
+
+
+def render_agent_flags(profile: TargetProfile) -> str:
+    """Isolation flags for one run: default disables all skill loading
+    (reproducible empty baseline); a declared set loads exactly those,
+    in config order, via explicit --skill paths (#39)."""
+    if not profile.skills:
+        return f"--no-skills {_PI_ISOLATION_FLAGS}"
+    explicit = " ".join(
+        f"--skill {_PI_CONTAINER_SKILL_ROOT}/{ref.name}" for ref in profile.skills)
+    return f"{_PI_ISOLATION_FLAGS} {explicit}"
 
 
 def ark_base_url() -> str:
@@ -151,8 +165,6 @@ def validate_profile(profile: TargetProfile) -> int:
         raise ValueError(f"unsupported adapter_version {profile.adapter_version!r}; pin {ADAPTER_VERSION!r}")
     if profile.assistance_mode != "none":
         raise ValueError(f"unsupported assistance_mode {profile.assistance_mode!r}; only 'none' executes")
-    if profile.skills:
-        raise ValueError("pi target does not support skills yet (#39); skills must be empty")
     if profile.credentials != [ARK_CREDENTIAL_REF]:
         raise ValueError(
             f"unsupported credentials {profile.credentials!r};"
@@ -352,7 +364,7 @@ class PiAgent(BaseInstalledAgent):
                     f"{_UNSET_PROXIES} PI_CODING_AGENT_DIR={PI_CONFIG_DIR} pi"
                     f" --provider {profile.provider} --model {profile.model}"
                     f" --thinking {profile.thinking} --print --mode json"
-                    f" {_PI_ISOLATION_FLAGS}"
+                    f" {render_agent_flags(profile)}"
                     f" \"$(cat /tmp/aco-prompt.txt)\" </dev/null"
                     f" > /tmp/aco-pi.jsonl 2> /tmp/aco-pi.stderr"
                 ),

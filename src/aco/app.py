@@ -130,9 +130,16 @@ def register_version(conn: sqlite3.Connection, reg: VersionRegistration) -> tupl
         try:
             # both paths validate here: v1 TargetProfile and the legacy fake
             # shape — unknown fields fail explicitly on either (#36)
-            parse_config_content(reg.content)
+            parsed_config = parse_config_content(reg.content)
         except ValueError as exc:
             raise AppError(422, "invalid_content", f"config content invalid: {exc}") from exc
+        if reg.content.get("schema_version") == 1:
+            # v1 configs reference registered, immutable skill versions (#39)
+            for skill_ref in parsed_config.skills:
+                if not skill_ref.version:
+                    raise AppError(422, "invalid_content",
+                                   "v1 config skill reference requires a version")
+                resolve_version(conn, "skill", skill_ref)
     elif reg.kind == "scorer":
         try:
             ScorerContent.model_validate(reg.content)

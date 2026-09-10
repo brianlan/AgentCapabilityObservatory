@@ -80,6 +80,28 @@ def cmd_register(args) -> int:
     return 0
 
 
+def cmd_import_skill(args) -> int:
+    """Trusted-side skill import (#39): validate, register the digest, and
+    copy the bytes into the local data root. Local database, no API."""
+    from pathlib import Path as _Path
+    from . import db, skills
+    from .app import AppError
+
+    root = _Path(args.data_root).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    conn = db.connect(root / "aco.db")
+    db.migrate(conn)
+    try:
+        record = skills.import_skill(
+            _Path(args.bundle), root, args.name, args.version, conn)
+    except (skills.SkillImportError, AppError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"imported skill {args.name}@{args.version} id={record['id']} "
+          f"digest={record['assets'][0]['digest'][:12]}")
+    return 0
+
+
 def require_paid_run_consent(client: Client, targets: list[dict], allow_paid_run: bool) -> None:
     """Pre-flight paid-run gate (#38): real-provider targets run only with an
     explicit --allow-paid-run. The API enforces the same rule at creation;
@@ -252,6 +274,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("resume", parents=[common], help="恢复重启后暂停的批次计划")
     p.add_argument("experiment_id")
     p.set_defaults(func=cmd_resume)
+
+    # local, trusted-side import (#39): skill bytes land in the local data
+    # root and the digest-verified version in the local registry — same
+    # pattern as the admission tool's verifier-bundle import
+    p = sub.add_parser("import-skill", parents=[common],
+                       help="导入内容寻址 skill bundle 到本地数据根")
+    p.add_argument("bundle", help="skill bundle 目录（含 SKILL.md）")
+    p.add_argument("--name", required=True)
+    p.add_argument("--version", required=True)
+    p.add_argument("--data-root", default="data")
+    p.set_defaults(func=cmd_import_skill)
     return parser
 
 
