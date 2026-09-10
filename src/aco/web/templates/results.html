@@ -40,7 +40,7 @@
   <ul>
     {% for sv in series_views %}
     <li><span class="badge" style="color: {{ sv.color }};">■</span>
-      {{ sv.key.task_set }} × {{ sv.key.config }} × {{ sv.key.scorer or "未评分" }}
+      {{ sv.key.task_set }} × {{ sv.key.config }} × {{ sv.key.scorer or "未评分" }} <span class="fp">fp:{{ sv.key.fingerprint[:12] }}</span>
       — {{ sv.points | length }} 个批次点</li>
     {% endfor %}
   </ul>
@@ -74,7 +74,7 @@
 
 {% for sv in series_views %}
 <section>
-  <h2>原始计数 — {{ sv.key.task_set }} × {{ sv.key.config }} × {{ sv.key.scorer or "未评分" }}</h2>
+  <h2>原始计数 — {{ sv.key.task_set }} × {{ sv.key.config }} × {{ sv.key.scorer or "未评分" }} <span class="fp">fp:{{ sv.key.fingerprint[:12] }}</span></h2>
   <table>
     <tr><th>批次</th><th>完整</th><th>主分</th><th>覆盖</th><th>界限(下–上)</th>
         <th>有效</th><th>通过</th><th>计划</th><th>不稳定</th><th>异常</th><th>取消</th><th>待完成</th>

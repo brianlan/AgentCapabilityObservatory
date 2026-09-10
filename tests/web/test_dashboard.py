@@ -44,7 +44,7 @@ def seed(conn):
     conn.execute(
         "INSERT INTO versions (id, kind, name, version, content, created_at) VALUES"
         " ('v-task', 'task', 'task', 'v1', '{}', 'now'),"
-        " ('v-cfg', 'config', 'cfg', 'v1', '{}', 'now'),"
+        " ('v-cfg', 'config', 'cfg', 'v1', '{\"harness\": \"fake\", \"model\": \"none\"}', 'now'),"
         " ('v-scorer', 'scorer', 'scorer', 'v1', '{}', 'now')"
     )
     conn.execute(

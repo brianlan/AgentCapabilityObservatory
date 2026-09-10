@@ -63,7 +63,9 @@ class TestTranslateProfile:
                 translate_profile(profile)
 
     def test_inference_field_fails_explicitly(self):
-        with pytest.raises(UnsupportedTarget, match="does not support inference"):
+        # "inference" is not a TargetProfile field (never registrable, #36):
+        # it fails the unknown-field walk like any other stray key
+        with pytest.raises(UnsupportedTarget, match="unsupported target profile field 'inference'"):
             translate_profile(
                 {"harness": "fake", "model": "none", "inference": {"temperature": 0.7}}
             )

@@ -45,7 +45,7 @@ def make_experiment(conn, n_trials=2, status="planned") -> str:
     conn.execute(
         "INSERT INTO versions (id, kind, name, version, content, created_at)"
         " VALUES ('v-task', 'task', 'task', 'v1', ?, 'now'),"
-        " ('v-cfg', 'config', 'cfg', 'v1', '{}', 'now')",
+        " ('v-cfg', 'config', 'cfg', 'v1', '{\"harness\": \"fake\", \"model\": \"none\"}', 'now')",
         (json.dumps(task_content),),
     )
     conn.execute(

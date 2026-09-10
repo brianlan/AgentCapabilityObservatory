@@ -164,8 +164,10 @@ def cmd_status(args) -> int:
     print(f"Experiment {experiment['id']} 状态 {experiment['status']}")
     print(progress_line(experiment))
     for t in experiment["trials"]:
+        fp = t.get("fingerprint") or ""
         print(f"  #{t['plan_order']} rep{t['repetition']} {t['task']['name']}@{t['task']['version']}"
-              f" → {t['config']['name']}@{t['config']['version']}  {t['status']}")
+              f" → {t['config']['name']}@{t['config']['version']}  {t['status']}"
+              + (f"  fp:{fp[:12]}" if fp else ""))
     return 0
 
 
