@@ -9,11 +9,13 @@ scoring).
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 from . import artifacts, db, lifecycle, pi_agent, runs
@@ -31,6 +33,79 @@ RUN_LABEL = "aco.run"
 DEFAULT_AGENT_TIMEOUT_SEC = 20
 TRIAL_GRACE_SEC = 90
 SUBMIT_POLL_SEC = 0.5
+
+# the host-side route the gateway (infrastructure, not the evaluated
+# container) may use to reach host services such as the session listener (#38)
+HOST_ROUTE_HOST = "host.docker.internal"
+# network policy evidence version (#38)
+NETWORK_POLICY_VERSION = 1
+# the single allowlisted target: the per-trial gateway service, pinned to a
+# static IP inside a private benchmark subnet (RFC 2544 — docker never
+# allocates it, the internet never routes it). The /24 is chosen per run so
+# leaked networks from crashed trials cannot collide; DNS inside the
+# restricted netns is unreliable (docker's DNAT rewrites the resolver port
+# ahead of the nftables DNS allowance), so the allow path needs no names (#38)
+GATEWAY_SERVICE = "aco-gateway"
+GATEWAY_SUBNET_PREFIX = "198.19"
+GATEWAY_HOST_OCTET = 10
+
+
+def _gateway_octet(run_id: str) -> int:
+    # deterministic per-run third octet: crashed trials leak their subnet
+    # until cleanup runs, and a fixed subnet would make every leak fatal
+    return hashlib.md5(run_id.encode()).digest()[0]
+
+
+def gateway_subnet(run_id: str) -> str:
+    return f"{GATEWAY_SUBNET_PREFIX}.{_gateway_octet(run_id)}.0/24"
+
+
+def gateway_ip(run_id: str) -> str:
+    return f"{GATEWAY_SUBNET_PREFIX}.{_gateway_octet(run_id)}.{GATEWAY_HOST_OCTET}"
+
+
+def _trial_network_name(run_id: str) -> str:
+    return f"aco-{run_id[:12]}__env_default"
+
+
+def _remove_stale_trial_networks(run_id: str | None = None) -> None:
+    """Remove compose networks of dead ACO trials (#38): the fixed per-run
+    gateway IP needs a free subnet, and interrupted runs (supervisor crash,
+    stack teardown) leak theirs. Networks are ours by construction:
+    aco-<run12>__env_default."""
+    args = ["docker", "network", "ls", "--format", "{{.Name}}"]
+    result = subprocess.run(args, text=True, capture_output=True, timeout=20, check=False)
+    for name in result.stdout.split():
+        if not (name.startswith("aco-") and name.endswith("__env_default")):
+            continue
+        if run_id is not None and name == _trial_network_name(run_id):
+            continue  # the current trial's network is removed by its owner
+        command("docker", "network", "rm", name, check=False)
+
+
+def _container_reachable_url(url: str) -> str:
+    """Rewrite a loopback host-side URL into the gateway container's
+    host-gateway route (#38). Non-loopback URLs pass through unchanged."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.hostname in ("127.0.0.1", "localhost", "::1"):
+        netloc = f"{HOST_ROUTE_HOST}:{parts.port}" if parts.port else HOST_ROUTE_HOST
+        return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
+    return url
+
+
+def gateway_config(root: Path, run_id: str) -> dict:
+    """Per-trial gateway wiring (#38): fixed upstreams from the trusted
+    supervisor environment. The provider upstream comes from the profile's
+    base URL (mock in tests), the session upstream from the session API URL
+    the manager was started with. The gateway IP/subnet are per-run."""
+    return {
+        "module": Path(pi_agent.__file__).with_name("gateway.py"),
+        "evidence_dir": root / "gateway-logs",
+        "provider_upstream": _container_reachable_url(pi_agent.ark_base_url()),
+        "session_upstream": _container_reachable_url(os.environ["ACO_BASE_URL"]),
+        "subnet": gateway_subnet(run_id),
+        "ip": gateway_ip(run_id),
+    }
 
 FAKE_HARNESS = "fake"
 PI_HARNESS = "pi"
@@ -92,32 +167,75 @@ def command(*args, check=True):
 
 
 def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run_id: str,
-                   harness: str = FAKE_HARNESS) -> Path:
+                   harness: str = FAKE_HARNESS,
+                   allowed_hosts: list[str] | None = None,
+                   gateway: dict | None = None) -> Path:
     """Minimal Harbor task dir: registry prompt as instruction, pinned image,
-    offline compose override with our identification label. The fake target
-    stays fully offline; the pi target gets bridge networking plus a
-    host-gateway route so the configured provider endpoint is reachable."""
+    compose override with our identification label.
+
+    The fake target stays fully offline (network_mode none). The pi target
+    runs under Harbor's egress-control sidecar: task.toml declares
+    network_mode allowlist whose only target is the per-trial gateway
+    service, the override adds NO explicit networking on main (so the
+    sidecar owns main's network namespace and enforces the allowlist
+    in-kernel), and the gateway — ACO infrastructure, not evaluated code —
+    exposes the session surface and the single fixed provider route (#38)."""
     task_dir = work_dir / "task"
     (task_dir / "environment").mkdir(parents=True)
     (task_dir / "instruction.md").write_text(instruction)
     image = pi_agent.PI_IMAGE_TAG if harness == PI_HARNESS else IMAGE
+    if harness == PI_HARNESS:
+        hosts = ", ".join(f'"{h}"' for h in (allowed_hosts or [gateway_ip(run_id)]))
+        (task_dir / "task.toml").write_text(
+            f'schema_version = "1.4"\n[environment]\ndocker_image = "{image}"\n'
+            f'network_mode = "allowlist"\nallowed_hosts = [{hosts}]\n'
+            f'[agent]\ntimeout_sec = {agent_timeout_sec}\n'
+        )
+        (task_dir / "environment" / "Dockerfile").write_text(pi_agent.render_dockerfile())
+        provider = urllib.parse.urlsplit(gateway["provider_upstream"])
+        # pi renders baseUrl = gateway IP + provider path; the gateway
+        # forwards the full path to the fixed upstream. Static IP: no DNS on
+        # the allow path.
+        gateway_env = (
+            f"      ACO_GATEWAY_EVIDENCE: \"/evidence/{run_id}.jsonl\"\n"
+            f"      ACO_GATEWAY_PROVIDER_UPSTREAM: \"{gateway['provider_upstream']}\"\n"
+            f"      ACO_GATEWAY_SESSION_UPSTREAM: \"{gateway['session_upstream']}\"\n"
+        )
+        subnet, ip = gateway["subnet"], gateway["ip"]
+        compose = task_dir / "offline.yaml"
+        compose.write_text(
+            "services:\n"
+            f"  {GATEWAY_SERVICE}:\n"
+            f"    image: {IMAGE}\n"
+            "    command: [\"python\", \"/aco/gateway.py\"]\n"
+            "    volumes:\n"
+            f"      - \"{gateway['module']}:/aco/gateway.py:ro\"\n"
+            f"      - \"{gateway['evidence_dir']}:/evidence\"\n"
+            "    environment:\n"
+            + gateway_env +
+            "    extra_hosts:\n"
+            f"      - \"{HOST_ROUTE_HOST}:host-gateway\"\n"
+            "    networks:\n"
+            "      default:\n"
+            f"        ipv4_address: {ip}\n"
+            "  main:\n"
+            "    depends_on:\n"
+            f"      {GATEWAY_SERVICE}:\n"
+            "        condition: service_started\n"
+            "    labels:\n"
+            f"      {RUN_LABEL}: {run_id}\n"
+            "networks:\n"
+            "  default:\n"
+            "    ipam:\n"
+            "      config:\n"
+            f"        - subnet: {subnet}\n"
+        )
+        assert provider.hostname  # the provider upstream must be absolute
+        return task_dir
     (task_dir / "task.toml").write_text(
         f'schema_version = "1.4"\n[environment]\ndocker_image = "{image}"\n'
         f'network_mode = "public"\n[agent]\ntimeout_sec = {agent_timeout_sec}\n'
     )
-    if harness == PI_HARNESS:
-        (task_dir / "environment" / "Dockerfile").write_text(pi_agent.render_dockerfile())
-        compose = task_dir / "offline.yaml"
-        compose.write_text(
-            "services:\n"
-            "  main:\n"
-            "    network_mode: bridge\n"
-            "    extra_hosts:\n"
-            "      - \"host.docker.internal:host-gateway\"\n"
-            "    labels:\n"
-            f"      {RUN_LABEL}: {run_id}\n"
-        )
-        return task_dir
     (task_dir / "environment" / "Dockerfile").write_text(f"FROM {IMAGE}\n")
     compose = task_dir / "offline.yaml"
     compose.write_text(
@@ -263,6 +381,24 @@ def _retrigger_answer(conn: sqlite3.Connection, trial_id: str, run_id: str) -> N
     conn.commit()
 
 
+def _network_deny_probe(container_id: str) -> dict:
+    """Auditable enforcement evidence (#38): from inside the agent container,
+    a connection to a non-allowlisted IP must fail. Blocked = the egress
+    sidecar's nftables policy is live in the container's network namespace;
+    an unexpected success means the restriction is not enforcing, and the
+    run must never reach a model call."""
+    probe = (
+        "node -e \"fetch('http://1.1.1.1/',{signal:AbortSignal.timeout(4000)})"
+        ".then(() => process.exit(0), () => process.exit(1))\""
+    )
+    result = command("docker", "exec", container_id, "sh", "-c", probe, check=False)
+    if result.returncode == 0:
+        raise RuntimeError(
+            "network isolation probe unexpectedly connected to 1.1.1.1;"
+            " egress allowlist is not enforcing — refusing to run the agent")
+    return {"target": "1.1.1.1", "result": "blocked"}
+
+
 async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) -> None:
     run_id = run["run_id"]
     trial = conn.execute("SELECT * FROM trials WHERE id = ?", (run["trial_id"],)).fetchone()
@@ -315,8 +451,32 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
 
     work_dir = root / "runs" / run_id
     baseline_dir = root / "sealing" / run_id / "baseline"
+    gateway = None
+    allowed_hosts = None
+    if harness == PI_HARNESS:
+        # all provider and session traffic from the evaluated container
+        # traverses the per-trial gateway; the adapter renders its provider
+        # base URL against the gateway (#38)
+        gateway = gateway_config(root, run_id)
+        gateway["evidence_dir"].mkdir(parents=True, exist_ok=True)
+        upstream_path = urllib.parse.urlsplit(gateway["provider_upstream"]).path
+        os.environ["ACO_PROVIDER_BASE_URL"] = (
+            f"http://{gateway['ip']}{upstream_path}")
+        allowed_hosts = [gateway["ip"]]
+        # auditable network policy for this trial: the allowlist is exactly
+        # the gateway; enforcement is harbor's egress sidecar, verified
+        # in-kernel by the deny probe at agent start
+        runs.add_phase(conn, run_id, "network_policy",
+                       policy_version=NETWORK_POLICY_VERSION, policy="allowlist",
+                       allowed_targets=allowed_hosts,
+                       provider_upstream_host=urllib.parse.urlsplit(
+                           gateway["provider_upstream"]).hostname,
+                       session_upstream_host=urllib.parse.urlsplit(
+                           gateway["session_upstream"]).hostname,
+                       enforcement="harbor-egress-sidecar", harbor_version=HARBOR_VERSION)
     task_dir = build_task_dir(work_dir, task_content.get("prompt", ""), agent_timeout_sec,
-                              run_id, harness=harness)
+                              run_id, harness=harness, allowed_hosts=allowed_hosts,
+                              gateway=gateway)
     trials_dir = work_dir / "trials"
     container_id = None
     agent_started_at: dict | None = None
@@ -331,6 +491,11 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
                                           container_security=security)
         # pre-agent baseline for the manifest's added/modified/deleted diff
         await asyncio.to_thread(artifacts.snapshot_baseline, container_id, baseline_dir, contract)
+        if harness == PI_HARNESS:
+            # enforcement evidence BEFORE any model call: a non-allowlisted
+            # target must be unreachable from the agent container (#38)
+            probe = await asyncio.to_thread(_network_deny_probe, container_id)
+            runs.add_phase(conn, run_id, "network_deny_probe", **probe)
 
     submit_stopped = False
     agent_ended = False
@@ -347,7 +512,7 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         await asyncio.to_thread(_seal_after_run, conn, run, container_id,
                                 trigger, root, baseline_dir, contract)
 
-    trial_obj = await Trial.create(TrialConfig(
+    trial_config = TrialConfig(
         task=TaskConfig(path=task_dir),
         trial_name=f"aco-{run_id[:12]}",
         trials_dir=trials_dir,
@@ -356,7 +521,14 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         # harbor scoring is disabled permanently; ACO owns all official results
         verifier=VerifierConfig(disable=True),
         artifacts=["/workspace"],
-    ))
+    )
+    try:
+        trial_obj = await Trial.create(trial_config)
+    except RuntimeError as exc:
+        if "overlaps with other one" not in str(exc):
+            raise  # a leaked network from a crashed earlier trial (#38)
+        await asyncio.to_thread(_remove_stale_trial_networks, run_id)
+        trial_obj = await Trial.create(trial_config)
     trial_obj.add_hook(TrialEvent.AGENT_START, on_agent_start)
     trial_obj.add_hook(TrialEvent.AGENT_END, on_agent_end)
 
@@ -400,6 +572,8 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     try:
         try:
             result = await asyncio.wait_for(run_task, timeout=agent_timeout_sec + TRIAL_GRACE_SEC)
+            print(f"[aco-supervisor] run task returned: {type(result).__name__}",
+                  file=sys.stderr, flush=True)
         except asyncio.TimeoutError:
             await handle_timeout("outer_deadline",
                                  f"trial exceeded {agent_timeout_sec + TRIAL_GRACE_SEC}s")
@@ -442,9 +616,20 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         if container_id is None:
             # never discovered: no seal can reference it; remove labeled leftovers
             cleanup_container(run_id)
+        # belt for interrupted harbor runs: compose down normally removes the
+        # per-trial network; crashes (killed supervisor, failed up) leak it
+        # and the leaked subnet blocks future trials (#38)
+        await asyncio.to_thread(
+            command, "docker", "network", "rm", _trial_network_name(run_id),
+            check=False)
 
 
 def main() -> int:
+    import faulthandler
+    import signal
+    # SIGUSR1 dumps every thread's stack to stderr (supervisor.log) — the
+    # supervisor is a black-box subprocess, this is the live-debug hatch
+    faulthandler.register(signal.SIGUSR1, file=sys.stderr)
     parser = argparse.ArgumentParser(prog="aco-supervisor", description=__doc__)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--data-root", required=True)
@@ -458,9 +643,12 @@ def main() -> int:
         return 2
     try:
         asyncio.run(execute_run(conn, run, root))
-    except Exception as exc:  # noqa: BLE001 — supervisor records its own crash
+    except BaseException as exc:  # noqa: BLE001 — the supervisor log IS stderr
+        import traceback
+        traceback.print_exc()
         # leave diagnostics; the manager reaps leftovers (container/pid)
-        if runs.get_run(conn, args.run_id)["status"] in ("launching", "running"):
+        if isinstance(exc, Exception) and runs.get_run(
+                conn, args.run_id)["status"] in ("launching", "running"):
             runs.finish_run(conn, args.run_id, "error", runs.EXIT_AGENT_ERROR,
                             f"{type(exc).__name__}: {exc}")
         # the trial must land in a terminal state even when the supervisor
