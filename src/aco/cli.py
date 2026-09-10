@@ -20,7 +20,11 @@ POLL_INTERVAL = 2.0
 
 
 def state_file() -> Path:
-    """Local run ledger for --idempotency-key replays (key -> experiment id)."""
+    """Convenience cache for --idempotency-key replays (key -> experiment id).
+
+    The SERVER owns idempotency (#35); this ledger only short-circuits the
+    POST when it still holds the id. If the file is lost, the retry still
+    replays correctly because the same key is sent to the API again."""
     return Path(os.environ.get("ACO_CLI_STATE", "~/.config/aco/cli.json")).expanduser()
 
 
@@ -102,7 +106,11 @@ def cmd_run(args) -> int:
     # JSON mode keeps stdout machine-parseable; the pre-create estimate goes to stderr
     print(estimate, file=sys.stderr if args.json else sys.stdout)
 
-    _, experiment = client.post("/v1/experiments", plan)
+    # the server is the idempotency authority (#35): the same key replays the
+    # original experiment even without this ledger; a different body under the
+    # same key surfaces as a 409 from main()'s ApiError handler
+    _, experiment = client.post("/v1/experiments", plan,
+                                idempotency_key=args.idempotency_key)
     if args.idempotency_key:
         state = load_state()
         state[args.idempotency_key] = experiment["id"]

@@ -29,13 +29,16 @@ class Client:
         self.token = token
         self.timeout = timeout
 
-    def request(self, method: str, path: str, payload=None) -> tuple[int, dict]:
+    def request(self, method: str, path: str, payload=None,
+                idempotency_key: str | None = None) -> tuple[int, dict]:
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(self.base_url + path, data=data, method=method)
         req.add_header("Content-Type", "application/json")
         req.add_header("Accept", "application/json")
         if self.token:
             req.add_header("Authorization", f"Bearer {self.token}")
+        if idempotency_key:
+            req.add_header("Idempotency-Key", idempotency_key)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 body = resp.read()
@@ -57,5 +60,6 @@ class Client:
     def get(self, path: str) -> tuple[int, dict]:
         return self.request("GET", path)
 
-    def post(self, path: str, payload=None) -> tuple[int, dict]:
-        return self.request("POST", path, payload)
+    def post(self, path: str, payload=None,
+             idempotency_key: str | None = None) -> tuple[int, dict]:
+        return self.request("POST", path, payload, idempotency_key=idempotency_key)

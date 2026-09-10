@@ -77,7 +77,7 @@
   <h2>原始计数 — {{ sv.key.task_set }} × {{ sv.key.config }} × {{ sv.key.scorer or "未评分" }}</h2>
   <table>
     <tr><th>批次</th><th>完整</th><th>主分</th><th>覆盖</th><th>界限(下–上)</th>
-        <th>有效</th><th>通过</th><th>计划</th><th>异常</th><th>取消</th><th>待完成</th>
+        <th>有效</th><th>通过</th><th>计划</th><th>不稳定</th><th>异常</th><th>取消</th><th>待完成</th>
         <th>评分错误</th><th>实际起止</th></tr>
     {% for point in sv.points %}
     <tr>
@@ -87,6 +87,7 @@
       <td>{{ '%.0f' | format(point.coverage * 100) }}%</td>
       <td>{{ '%.2f' | format(point.bounds.lower) }}–{{ '%.2f' | format(point.bounds.upper) }}</td>
       <td>{{ point.counts.valid }}</td><td>{{ point.pass }}</td><td>{{ point.planned }}</td>
+      <td>{{ point.counts.unstable }}</td>
       <td>{{ point.counts.anomaly }}</td><td>{{ point.counts.cancelled }}</td>
       <td>{{ point.counts.pending }}</td>
       <td>{{ point.counts.score_error }}</td>

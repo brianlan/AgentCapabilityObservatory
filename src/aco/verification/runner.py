@@ -1,11 +1,12 @@
 """Verifier container execution, result parsing, and record keeping (#15).
 
-One verifier container per scoring record: ``docker run --network none
+One verifier container per scoring attempt: ``docker run --network none
 --read-only`` with the sealed answer and the trusted verifier bundle mounted
 read-only and a fresh private output directory. The container gets no
 environment, no credentials, and no access to the application, SQLite, or
-the Docker socket. Every execution, error, and result appends a verifications
-row — never an overwrite.
+the Docker socket. Every actual container start appends a
+verification_attempts row; the verifications row carries the idempotent
+request and its current state — never a history overwrite.
 
 Scoring errors are classified (verifier_error / invalid_output / infra_error)
 and never recorded as ``pass = false``: a failing verdict is a succeeded
@@ -17,6 +18,7 @@ import json
 import shutil
 import sqlite3
 import subprocess
+import uuid
 from pathlib import Path
 
 from .. import artifacts
@@ -41,21 +43,39 @@ def bundle_digest(bundle_dir: Path) -> str:
 
 def claim_next_queued(conn: sqlite3.Connection) -> sqlite3.Row | None:
     """Atomically move the oldest queued verification to running; single
-    winner across processes."""
+    winner across processes. Each actual claim appends one attempt row —
+    the per-execution history the verifications row itself cannot hold."""
+    now = utcnow()
     row = conn.execute(
         "UPDATE verifications SET status = 'running', started_at = ?"
         " WHERE id = (SELECT id FROM verifications WHERE status = 'queued' ORDER BY rowid LIMIT 1)"
         " RETURNING *",
-        (utcnow(),),
+        (now,),
     ).fetchone()
+    if row is not None:
+        conn.execute(
+            "INSERT INTO verification_attempts (id, verification_id, attempt_no,"
+            " status, started_at) VALUES (?, ?,"
+            " (SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM verification_attempts"
+            "  WHERE verification_id = ?), 'running', ?)",
+            (uuid.uuid4().hex, row["id"], row["id"], now),
+        )
     conn.commit()
     return row
 
 
 def _record(conn: sqlite3.Connection, verification_id: str, **fields) -> None:
+    """Terminal outcome: append to the running attempt row and mirror the
+    current state on the verifications row. Both tables share the outcome
+    columns; the attempt's started_at and every earlier attempt's row stay
+    untouched."""
     assignments = ", ".join(f"{name} = ?" for name in fields)
+    values = (*fields.values(),)
     conn.execute(f"UPDATE verifications SET {assignments} WHERE id = ?",
-                 (*fields.values(), verification_id))
+                 (*values, verification_id))
+    conn.execute(f"UPDATE verification_attempts SET {assignments}"
+                 " WHERE verification_id = ? AND status = 'running'",
+                 (*values, verification_id))
     conn.commit()
 
 
@@ -188,9 +208,14 @@ def _execute(conn: sqlite3.Connection, row: sqlite3.Row, root: Path) -> dict:
         return _error("infra_error",
                       f"verifier bundle digest mismatch: declared {declared[0]}, observed {observed_digest}")
 
-    work_dir = root / "verifications" / verification_id
+    attempt = conn.execute(
+        "SELECT attempt_no FROM verification_attempts"
+        " WHERE verification_id = ? AND status = 'running'", (verification_id,)
+    ).fetchone()
+    work_dir = root / "verifications" / verification_id / f"attempt-{attempt['attempt_no']}"
     output_dir = work_dir / "output"
-    # fresh output per execution: stale or planted files can never be parsed
+    # fresh output per execution: stale or planted files can never be parsed;
+    # per-attempt directories keep earlier attempts' diagnostics intact
     shutil.rmtree(work_dir, ignore_errors=True)
     output_dir.mkdir(parents=True)
 
@@ -249,9 +274,15 @@ def run_pending(conn: sqlite3.Connection, root: Path) -> bool:
 
 def requeue_stuck_running(conn: sqlite3.Connection) -> int:
     """Manager-startup recovery (#16): scoring rows left in 'running' by a
-    manager crash go back to 'queued'. A verifier container never calls a
-    model, so requeueing is not an agent rerun; the row's history stays
-    append-only."""
+    manager crash go back to 'queued', and the interrupted attempt is
+    finalized as an infra error — with its own started_at and record intact.
+    The re-queued execution appends a new attempt; a verifier container never
+    calls a model, so requeueing is not an agent rerun."""
+    conn.execute(
+        "UPDATE verification_attempts SET status = 'error', error_kind = 'infra_error',"
+        " error_detail = 'interrupted by manager restart', finished_at = ?"
+        " WHERE status = 'running'", (utcnow(),),
+    )
     cur = conn.execute(
         "UPDATE verifications SET status = 'queued', started_at = NULL WHERE status = 'running'"
     )

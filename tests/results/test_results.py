@@ -143,7 +143,7 @@ def test_equal_weight_across_tasks_not_pooled(tmp_path):
     point = single_series(results(client))["points"][0]
     assert point["main_score"] == 0.5
     assert point["complete"] is True
-    assert point["counts"] == {"valid": 3, "score_error": 0,
+    assert point["counts"] == {"valid": 3, "unstable": 0, "score_error": 0,
                                "anomaly": 0, "cancelled": 0, "pending": 0}
     assert point["per_task"]["t1@v1"]["pass"] == 2
     assert point["per_task"]["t1@v1"]["planned"] == 2
@@ -236,9 +236,12 @@ def test_raw_view_shows_regrade_under_both_graders_unified_picks_one(tmp_path):
     assert client.get("/v1/results", params={"view": "unified"}).status_code == 422
 
 
-def test_later_verdict_supersedes_older_one(tmp_path):
-    """Append-only regrade: a newer same-version verdict replaces the older
-    one (never a conflict, never a stale readout)."""
+def test_contradictory_same_version_verdicts_are_unstable(tmp_path):
+    """Same sealed answer + scorer version with contradictory successful
+    verdicts: the pair is marked unstable, kept in the denominator with its
+    own coverage bucket, and excluded from the official capability score —
+    never resolved by latest-wins, and a later agreeing re-run cannot erase
+    the mark."""
     client = make_client(tmp_path)
     ids = register_versions(client, tasks=["arith"], configs=["cfg-a"], scorers=["ver"])
     exp = make_experiment(client, task="arith")
@@ -247,12 +250,52 @@ def test_later_verdict_supersedes_older_one(tmp_path):
                      idempotency_key="first")
     add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=0,
                      idempotency_key="second")
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=0,
+                     idempotency_key="third")  # agrees with the second — still contradictory history
     point = single_series(results(client))["points"][0]
-    assert point["counts"]["valid"] == 1
-    assert point["pass"] == 0  # the later verdict wins
+    assert point["counts"] == {"valid": 0, "unstable": 1, "score_error": 0,
+                               "anomaly": 0, "cancelled": 0, "pending": 0}
+    assert point["pass"] == 0  # the latest record is displayed but not trusted
+    assert point["complete"] is False
+    assert point["main_score"] is None  # no official capability point
+    assert point["bounds"] == {"lower": 0.0, "upper": 1.0}
+
+
+def test_same_pass_with_different_submetrics_is_unstable(tmp_path):
+    """A verdict is pass plus submetrics: same pass with diverging submetrics
+    is still a contradiction (matching the API's stable flag)."""
+    client = make_client(tmp_path)
+    ids = register_versions(client, tasks=["arith"], configs=["cfg-a"], scorers=["ver"])
+    exp = make_experiment(client, task="arith")
+    trial_id = exp["trials"][0]["id"]
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=1,
+                     submetrics={"accuracy": 1.0}, idempotency_key="first")
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=1,
+                     submetrics={"accuracy": 0.5}, idempotency_key="second")
+    point = single_series(results(client))["points"][0]
+    assert point["counts"]["unstable"] == 1
+    assert point["counts"]["valid"] == 0
+    assert point["main_score"] is None
+
+
+def test_agreeing_repeat_verdicts_stay_stable(tmp_path):
+    """Repeated same-version scoring that agrees is stable and valid —
+    repetition alone never creates an instability, only disagreement does."""
+    client = make_client(tmp_path)
+    ids = register_versions(client, tasks=["arith"], configs=["cfg-a"], scorers=["ver"])
+    exp = make_experiment(client, task="arith")
+    trial_id = exp["trials"][0]["id"]
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=1,
+                     submetrics={"accuracy": 1.0}, idempotency_key="first")
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=1,
+                     submetrics={"accuracy": 1.0}, idempotency_key="second")
+    point = single_series(results(client))["points"][0]
+    assert point["counts"] == {"valid": 1, "unstable": 0, "score_error": 0,
+                               "anomaly": 0, "cancelled": 0, "pending": 0}
     assert point["complete"] is True
-    assert point["main_score"] == 0.0
-    assert point["bounds"] == {"lower": 0.0, "upper": 0.0}
+    assert point["main_score"] == 1.0
+    # submetrics come from the current (latest) record only
+    assert point["submetrics"] == {"accuracy": {"mean": 1.0, "samples": 1}}
 
 
 def test_later_verdict_wins_on_created_at_tie(tmp_path):
@@ -261,12 +304,13 @@ def test_later_verdict_wins_on_created_at_tie(tmp_path):
     ids = register_versions(client, tasks=["arith"], configs=["cfg-a"], scorers=["ver"])
     exp = make_experiment(client, task="arith")
     trial_id = exp["trials"][0]["id"]
-    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=1,
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], status="error",
                      idempotency_key="first")
-    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=0,
+    add_verification(tmp_path, trial_id, ids["scorer:ver"], pass_=1,
                      idempotency_key="second")
     point = single_series(results(client))["points"][0]
-    assert point["pass"] == 0  # second insert is the latest even on a tie
+    assert point["counts"]["valid"] == 1
+    assert point["pass"] == 1  # second insert is the latest even on a tie
 
 
 def test_later_error_supersedes_older_success(tmp_path):
@@ -281,7 +325,7 @@ def test_later_error_supersedes_older_success(tmp_path):
     add_verification(tmp_path, trial_id, ids["scorer:ver"], status="error",
                      idempotency_key="second")
     point = single_series(results(client))["points"][0]
-    assert point["counts"] == {"valid": 0, "score_error": 1,
+    assert point["counts"] == {"valid": 0, "unstable": 0, "score_error": 1,
                                "anomaly": 0, "cancelled": 0, "pending": 0}
     assert point["complete"] is False
     assert point["main_score"] is None
