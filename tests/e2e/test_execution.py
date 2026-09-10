@@ -349,6 +349,42 @@ class TestSealedAnswers:
         # takes the answers/ place
         assert answer_dir in published_dirs(stack["root"])
 
+    def test_sealed_answer_excludes_post_submit_writes(self, stack):
+        """The agent keeps writing after its submit intent (#16 reopen): the
+        watchdog stops the container, and the sealed answer contains nothing
+        written after the submit. The late writes start >= 2s after the POST
+        (vs a 0.5s poll), so exclusion is deterministic; if the watchdog ever
+        stops firing, late.txt appears in the sealed answer and this fails."""
+        base = stack["base"]
+        trial_id = create_trial(base, "FAKE:submit-late-write\nlate writes stay out",
+                                {"harness": "fake", "model": "none"})
+        run = wait_for_run(base, trial_id, timeout=60)
+        assert run["exit_kind"] == "submit"
+
+        events = [p["event"] for p in run["phases"]]
+        # non-vacuous proof the watchdog stopped a live agent: the poll fired
+        # while the agent was still mid-run (sleeping past its submit)
+        assert "submit_watch_fired" in events, run["phases"]
+        sealed_phase = next(p for p in run["phases"] if p["event"] == "sealed")
+        answer_dir = stack["root"] / "answers" / sealed_phase["answer_digest"]
+        manifest = read_manifest(answer_dir)
+        assert manifest["trigger"] == "submit"
+
+        # the sealed workspace froze at submit time: pre-submit answer.txt,
+        # no post-submit late.txt
+        assert (answer_dir / "workspace" / "answer.txt").is_file()
+        assert list(answer_dir.glob("workspace/late*")) == []
+
+        conn = sqlite3.connect(stack["root"] / "aco.db")
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT seal_trigger, status FROM sealed_answers WHERE trial_id = ?",
+                (trial_id,)).fetchone()
+        finally:
+            conn.close()
+        assert row["status"] == "sealed" and row["seal_trigger"] == "submit"
+
     def test_background_writer_cannot_change_sealed_answer(self, stack):
         """Parent (agent) exits while a background writer keeps writing:
         the sealed snapshot freezes at pause time and stays byte-stable, while

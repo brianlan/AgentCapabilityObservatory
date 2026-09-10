@@ -43,9 +43,10 @@ timeout never bypasses eligibility and never produces a plain `agent_error`.
 ## Submit intent
 
 A submit is intent-only (#12). The supervisor watches for the persisted
-submit intent and stops the agent container the moment it appears: no
-workspace write can follow the submission, and the sealed answer is the
-frozen post-stop state. The submitted answer is the single official answer.
+submit intent and stops the agent container the moment it appears (a 0.5s
+poll: writes racing that window land in the frozen post-stop state), and the
+sealed answer is the frozen post-stop state. The submitted answer is the
+single official answer.
 
 ## Cancel semantics
 

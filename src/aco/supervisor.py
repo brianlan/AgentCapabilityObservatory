@@ -278,11 +278,16 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         # pre-agent baseline for the manifest's added/modified/deleted diff
         await asyncio.to_thread(artifacts.snapshot_baseline, container_id, baseline_dir, contract)
 
+    submit_stopped = False
+    agent_ended = False
+
     async def on_agent_end(_event):
         # the seal lives here because the container only exists while harbor's
         # run() is in flight — harbor reaps it afterwards. The trigger is the
         # best knowledge at this moment; handle_timeout corrects it to
         # 'timeout' when the deadline actually won the termination race.
+        nonlocal agent_ended
+        agent_ended = True
         runs.add_phase(conn, run_id, "agent_end")
         trigger = "submit" if _has_submission(conn, run["trial_id"]) else "exit"
         await asyncio.to_thread(_seal_after_run, conn, run, container_id,
@@ -303,16 +308,25 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
 
     runs.observe_run(conn, run_id, ADAPTER_VERSION, HARBOR_VERSION, str(trials_dir))
 
+    submit_stopped = False
+
     async def watch_submit():
         """First legal trigger wins (#16 reopen): the moment a persisted
-        submit intent exists, stop the agent container — no workspace write
-        can follow the submission, and sealing freezes the stopped state."""
+        submit intent exists, stop the agent container. Writes racing the
+        SUBMIT_POLL_SEC window land in the frozen post-stop state; nothing
+        written after the stop can reach the sealed answer."""
+        nonlocal submit_stopped
         while True:
             await asyncio.sleep(SUBMIT_POLL_SEC)
-            if _has_submission(conn, run["trial_id"]):
+            # agent_ended check: once the agent ended, the AGENT_END hook owns
+            # the terminal seal — stopping a sealing container would only
+            # misattribute the run's exit
+            if _has_submission(conn, run["trial_id"]) and not agent_ended:
+                runs.add_phase(conn, run_id, "submit_watch_fired")
                 if container_id is not None:
                     await asyncio.to_thread(
                         command, "docker", "stop", "-t", "1", container_id, check=False)
+                    submit_stopped = True
                 return
 
     async def handle_timeout(source: str, detail: str) -> None:
@@ -350,9 +364,10 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
             return
 
         trigger = "submit" if _has_submission(conn, run["trial_id"]) else "exit"
-        if exception and trigger == "submit":
-            # the submit watchdog stopped the container; the agent's forced end
-            # is not an agent error — submit is the termination reason
+        if trigger == "submit" and (exception or submit_stopped):
+            # the supervisor ended the run: the submit watchdog stopped the
+            # container (a harbor-stopped container raises no exception), or
+            # the agent died after submit — submit is the termination reason
             exit_kind, detail = runs.EXIT_SUBMIT, "agent ended by submit-won container stop"
         else:
             exit_kind, detail = (runs.EXIT_AGENT_ERROR, exception) if exception else (runs.EXIT_NORMAL, None)

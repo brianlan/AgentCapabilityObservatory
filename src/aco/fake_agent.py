@@ -85,6 +85,22 @@ class FakeAgent(NopAgent):
                 {"idempotency_key": f"fake-{task['trial_id']}"},
             )
 
+        if scenario == "submit-late-write":
+            # keeps writing after the submit intent: the watchdog must stop
+            # the container before the first late write lands (>= 2s after
+            # the POST, vs a 0.5s poll) — the sealed answer excludes them
+            _session_request(
+                "POST", "/v1/session/submit", token,
+                {"idempotency_key": f"fake-{task['trial_id']}"},
+            )
+            await environment.exec("sleep 2")
+            for i in range(50):
+                await environment.exec(
+                    "mkdir -p /workspace && echo '"
+                    + str(i) + "' >> /workspace/late.txt"
+                )
+                await environment.exec("sleep 0.2")
+
         if scenario == "sleep":
             # hang past the [agent] timeout_sec: Harbor raises
             # AgentTimeoutError — the unified timeout verdict path (#16)
