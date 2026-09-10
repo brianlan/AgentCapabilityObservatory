@@ -68,19 +68,39 @@ def _trial_network_name(run_id: str) -> str:
     return f"aco-{run_id[:12]}__env_default"
 
 
-def _remove_stale_trial_networks(run_id: str | None = None) -> None:
+def _remove_stale_trial_networks(run_id: str | None = None) -> list[str]:
     """Remove compose networks of dead ACO trials (#38): the fixed per-run
     gateway IP needs a free subnet, and interrupted runs (supervisor crash,
     stack teardown) leak theirs. Networks are ours by construction:
-    aco-<run12>__env_default."""
+    aco-<run12>__env_default. A network with attached containers belongs to
+    a live sibling trial (octet collisions happen, ~1/256 per pair) — it is
+    preserved and returned so callers can name it in diagnostics (#52)."""
     args = ["docker", "network", "ls", "--format", "{{.Name}}"]
     result = subprocess.run(args, text=True, capture_output=True, timeout=20, check=False)
+    preserved = []
     for name in result.stdout.split():
         if not (name.startswith("aco-") and name.endswith("__env_default")):
             continue
         if run_id is not None and name == _trial_network_name(run_id):
             continue  # the current trial's network is removed by its owner
+        attached = command("docker", "network", "inspect", "--format",
+                           "{{len .Containers}}", name, check=False)
+        if attached.stdout.strip() != "0":
+            # live sibling: removing it would error a healthy in-flight trial (#52)
+            preserved.append(name)
+            continue
         command("docker", "network", "rm", name, check=False)
+    return preserved
+
+
+def _subnet_blocked_error(run_id: str, preserved: list[str]) -> RuntimeError:
+    """Explicit diagnostic when our octet is held by a live sibling (#52):
+    names the blocked subnet and the surviving networks instead of a bare
+    docker overlap error."""
+    return RuntimeError(
+        f"gateway subnet {gateway_subnet(run_id)} is held by live sibling"
+        f" network(s) {preserved or '[]'}; the stale sweep left them"
+        f" untouched to avoid erroring healthy trials")
 
 
 def _container_reachable_url(url: str) -> str:
@@ -527,8 +547,17 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     except RuntimeError as exc:
         if "overlaps with other one" not in str(exc):
             raise  # a leaked network from a crashed earlier trial (#38)
-        await asyncio.to_thread(_remove_stale_trial_networks, run_id)
-        trial_obj = await Trial.create(trial_config)
+        preserved = await asyncio.to_thread(_remove_stale_trial_networks, run_id)
+        if preserved:
+            # our octet collides with a live sibling trial (#52); auditable
+            runs.add_phase(conn, run_id, "network_retry", preserved=preserved,
+                           subnet=gateway_subnet(run_id))
+        try:
+            trial_obj = await Trial.create(trial_config)
+        except RuntimeError as retry_exc:
+            if "overlaps with other one" not in str(retry_exc):
+                raise
+            raise _subnet_blocked_error(run_id, preserved) from retry_exc
     trial_obj.add_hook(TrialEvent.AGENT_START, on_agent_start)
     trial_obj.add_hook(TrialEvent.AGENT_END, on_agent_end)
 
