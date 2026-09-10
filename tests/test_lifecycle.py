@@ -36,10 +36,16 @@ def client(tmp_path):
 
 
 def make_experiment(conn, n_trials=2, status="planned") -> str:
+    task_content = {
+        "contract": {"required_outputs": ["/workspace/answer.txt"]},
+        "contract_digest": artifacts.contract_digest(
+            artifacts.ArtifactContract(required_outputs=("/workspace/answer.txt",))),
+    }
     conn.execute(
         "INSERT INTO versions (id, kind, name, version, content, created_at)"
-        " VALUES ('v-task', 'task', 'task', 'v1', '{}', 'now'),"
-        " ('v-cfg', 'config', 'cfg', 'v1', '{}', 'now')"
+        " VALUES ('v-task', 'task', 'task', 'v1', ?, 'now'),"
+        " ('v-cfg', 'config', 'cfg', 'v1', '{}', 'now')",
+        (json.dumps(task_content),),
     )
     conn.execute(
         "INSERT INTO experiments (id, status, requested, created_at)"

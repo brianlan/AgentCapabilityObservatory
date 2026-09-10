@@ -131,8 +131,10 @@ def _has_submission(conn: sqlite3.Connection, trial_id: str) -> bool:
 
 
 def _seal_after_run(conn: sqlite3.Connection, run: sqlite3.Row, container_id: str | None,
-                    trigger: str, root: Path, baseline_dir: Path) -> None:
-    """Freeze the workspace through the single seal entry point. The seal
+                    trigger: str, root: Path, baseline_dir: Path,
+                    contract: artifacts.ArtifactContract) -> None:
+    """Freeze the workspace through the single seal entry point, using the
+    contract resolved from the TaskVersion before the agent started. The seal
     happens while the container still exists — Harbor's later artifact
     collection is diagnostics only and never the official answer (#14)."""
     if container_id is None:
@@ -144,8 +146,12 @@ def _seal_after_run(conn: sqlite3.Connection, run: sqlite3.Row, container_id: st
         runs.add_phase(conn, run["run_id"], "seal_failed", detail=detail)
         return
     try:
-        receipt = artifacts.seal(conn, run, container_id, trigger, root, baseline_dir)
+        receipt = artifacts.seal(conn, run, container_id, trigger, root, baseline_dir, contract)
     except Exception as exc:  # noqa: BLE001 — sealing failure is recorded, never fatal
+        # no official answer exists: leave an execution-condition anomaly
+        # behind (explainable state, never a capability sample) (#14)
+        artifacts.mark_anomaly(conn, run["trial_id"], run["run_id"],
+                               f"sealing failed: {type(exc).__name__}: {exc}", trigger=trigger)
         runs.add_phase(conn, run["run_id"], "seal_failed", detail=f"{type(exc).__name__}: {exc}")
         return
     runs.add_phase(conn, run["run_id"], "sealed", receipt_id=receipt["receipt_id"],
@@ -187,6 +193,17 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         conn.execute("SELECT content FROM versions WHERE id = ?", (trial["config_version_id"],)).fetchone()["content"]
     )
 
+    # resolve the task-declared artifact contract ONCE, before any side
+    # effect: it governs baseline, collection, validation, manifest, and
+    # recovery; missing/invalid/mismatched contract fails before the agent
+    # starts — never a silent default (#14 reopen)
+    try:
+        contract = artifacts.resolve_task_contract(task_content)
+    except artifacts.SealError as exc:
+        runs.finish_run(conn, run_id, "error", runs.EXIT_CONTRACT_INVALID,
+                        f"task artifact contract invalid: {exc}")
+        return
+
     # fail before any side effect on unsupported profiles
     try:
         agent_timeout_sec = translate_profile(profile)
@@ -219,13 +236,13 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         agent_started_at = runs.add_phase(conn, run_id, "agent_start", container_id=container_id,
                                           container_security=security)
         # pre-agent baseline for the manifest's added/modified/deleted diff
-        await asyncio.to_thread(artifacts.snapshot_baseline, container_id, baseline_dir)
+        await asyncio.to_thread(artifacts.snapshot_baseline, container_id, baseline_dir, contract)
 
     async def on_agent_end(_event):
         runs.add_phase(conn, run_id, "agent_end")
         trigger = "submit" if _has_submission(conn, run["trial_id"]) else "exit"
         await asyncio.to_thread(_seal_after_run, conn, run, container_id,
-                                trigger, root, baseline_dir)
+                                trigger, root, baseline_dir, contract)
 
     trial_obj = await Trial.create(TrialConfig(
         task=TaskConfig(path=task_dir),
@@ -246,7 +263,7 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     except asyncio.TimeoutError:
         runs.add_phase(conn, run_id, "trial_timeout")
         await asyncio.to_thread(_seal_after_run, conn, run, container_id,
-                                "timeout", root, baseline_dir)
+                                "timeout", root, baseline_dir, contract)
         _record_timeout_verdict(conn, run, agent_started_at, agent_timeout_sec)
         runs.finish_run(conn, run_id, "error", runs.EXIT_TIMEOUT,
                         f"trial exceeded {agent_timeout_sec + TRIAL_GRACE_SEC}s")

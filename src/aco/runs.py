@@ -17,6 +17,7 @@ EXIT_AGENT_ERROR = "agent_error"
 EXIT_TIMEOUT = "timeout"
 EXIT_SUPERVISOR_LOST = "supervisor_lost"
 EXIT_UNSUPPORTED_TARGET = "unsupported_target"
+EXIT_CONTRACT_INVALID = "contract_invalid"
 EXIT_CANCELLED = "cancelled"
 
 

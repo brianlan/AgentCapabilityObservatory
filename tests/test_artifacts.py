@@ -15,6 +15,14 @@ import pytest
 
 from aco import artifacts, db, runs
 
+# the task-declared contract the seeded trial's TaskVersion carries (#14):
+# every seal and every recovery resolves exactly this contract
+TASK_CONTRACT = artifacts.ArtifactContract(required_outputs=("/workspace/answer.txt",))
+TASK_CONTENT = {
+    "contract": {"required_outputs": ["/workspace/answer.txt"]},
+    "contract_digest": artifacts.contract_digest(TASK_CONTRACT),
+}
+
 
 @pytest.fixture()
 def conn(tmp_path):
@@ -29,8 +37,9 @@ def trial(conn, tmp_path):
     """A trial with a launch-intent run and an accepted submission."""
     conn.execute(
         "INSERT INTO versions (id, kind, name, version, content, created_at)"
-        " VALUES ('v-task', 'task', 'task', 'v1', '{}', 'now'),"
-        " ('v-cfg', 'config', 'cfg', 'v1', '{}', 'now')"
+        " VALUES ('v-task', 'task', 'task', 'v1', ?, 'now'),"
+        " ('v-cfg', 'config', 'cfg', 'v1', '{}', 'now')",
+        (json.dumps(TASK_CONTENT),),
     )
     conn.execute("INSERT INTO experiments (id, status, requested, created_at) VALUES ('e1', 'planned', '{}', 'now')")
     conn.execute(
@@ -73,6 +82,9 @@ def fake_container(tmp_path, monkeypatch):
 
 
 def seal_trial(conn, trial, tmp_path, trigger="submit", **kwargs):
+    """Seal through the official entry with the seeded trial's own contract."""
+    kwargs.setdefault("baseline_dir", None)
+    kwargs.setdefault("contract", TASK_CONTRACT)
     return artifacts.seal(conn, trial, "cid-1", trigger, tmp_path, **kwargs)
 
 
@@ -91,6 +103,160 @@ class TestArtifactContract:
 
     def test_required_output_inside_allowed_paths_accepted(self):
         artifacts.ArtifactContract(required_outputs=("/workspace/answer.txt",)).validate()
+
+
+class TestTaskContractResolution:
+    """The supervisor resolves the TaskVersion's declared contract before the
+    agent starts; missing, invalid, or tampered contracts fail loudly (#14)."""
+
+    def test_valid_content_resolves_declared_contract(self):
+        contract = artifacts.resolve_task_contract(dict(TASK_CONTENT))
+        assert contract.required_outputs == ("/workspace/answer.txt",)
+        assert contract == TASK_CONTRACT
+
+    def test_missing_contract_rejected(self):
+        with pytest.raises(artifacts.SealError, match="declares no artifact contract"):
+            artifacts.resolve_task_contract({"prompt": "no contract"})
+
+    def test_execute_run_fails_before_agent_start_on_invalid_contract(self, conn, trial, tmp_path):
+        """A task without a usable contract never starts an agent and never
+        touches a container (#14 reopen)."""
+        import asyncio
+
+        from aco import supervisor
+
+        conn.execute("UPDATE versions SET content = '{}' WHERE id = 'v-task'")
+        conn.commit()
+        asyncio.run(supervisor.execute_run(conn, runs.get_run(conn, trial["run_id"]), tmp_path))
+        run = runs.get_run(conn, trial["run_id"])
+        assert run["status"] == "error"
+        assert run["exit_kind"] == "contract_invalid"
+        assert "declares no artifact contract" in run["exit_detail"]
+
+    def test_missing_digest_rejected(self):
+        with pytest.raises(artifacts.SealError, match="no artifact contract digest"):
+            artifacts.resolve_task_contract({"contract": {"required_outputs": []}})
+
+    def test_digest_mismatch_rejected(self):
+        tampered = dict(TASK_CONTENT, contract_digest="0" * 64)
+        with pytest.raises(artifacts.SealError, match="digest mismatch"):
+            artifacts.resolve_task_contract(tampered)
+
+    def test_tampered_contract_rejected_by_digest(self):
+        tampered = dict(TASK_CONTENT,
+                        contract={"required_outputs": ["/workspace/answer.txt"],
+                                  "max_total_bytes": 10 ** 12})
+        with pytest.raises(artifacts.SealError, match="digest mismatch"):
+            artifacts.resolve_task_contract(tampered)
+
+    def test_unknown_contract_field_rejected(self):
+        with pytest.raises(artifacts.SealError, match="unknown artifact contract fields"):
+            artifacts.contract_from_payload({"required_outputs": [], "require_outputs": []})
+
+    def test_invalid_schema_rejected(self):
+        for payload in ({"required_outputs": "/workspace/answer.txt"},   # not a list
+                        {"required_outputs": [42]},                      # not strings
+                        {"required_outputs": [], "max_total_bytes": -1},
+                        {"required_outputs": ["workspace/answer.txt"]}):  # relative
+            with pytest.raises(artifacts.SealError):
+                artifacts.contract_from_payload(payload)
+
+    def test_two_task_versions_contracts_never_cross(self, conn):
+        """Two TaskVersions with different paths/size limits resolve to their
+        own contracts (#14 reopen)."""
+        strict = artifacts.ArtifactContract(required_outputs=("/workspace/answer.txt",),
+                                            max_total_bytes=1024)
+        loose = artifacts.ArtifactContract(required_outputs=("/workspace/out/prod.txt",),
+                                           max_total_bytes=10 ** 9)
+        conn.execute(
+            "INSERT INTO versions (id, kind, name, version, content, created_at)"
+            " VALUES ('cfg', 'config', 'cfg', 'v1', '{}', 'now')"
+        )
+        for trial_id, contract in (("t-strict", strict), ("t-loose", loose)):
+            content = {"contract": json.loads(json.dumps(artifacts.contract_payload(contract))),
+                       "contract_digest": artifacts.contract_digest(contract)}
+            conn.execute(
+                "INSERT INTO versions (id, kind, name, version, content, created_at)"
+                " VALUES (?, 'task', ?, 'v1', ?, 'now')",
+                (f"v-{trial_id}", trial_id, json.dumps(content)),
+            )
+            conn.execute(
+                "INSERT INTO experiments (id, status, requested, created_at)"
+                " VALUES (?, 'planned', '{}', 'now')", (f"e-{trial_id}",),
+            )
+            conn.execute(
+                "INSERT INTO trials (id, experiment_id, task_version_id, config_version_id,"
+                " repetition, plan_order, requested) VALUES (?, ?, ?, 'cfg', 1, 1, '{}')",
+                (trial_id, f"e-{trial_id}", f"v-{trial_id}"),
+            )
+        conn.commit()
+        assert artifacts.contract_for_trial(conn, "t-strict") == strict
+        assert artifacts.contract_for_trial(conn, "t-loose") == loose
+        assert artifacts.contract_digest(artifacts.contract_for_trial(conn, "t-strict")) \
+            != artifacts.contract_digest(artifacts.contract_for_trial(conn, "t-loose"))
+
+    def test_contract_digest_matches_admission_definition(self):
+        """The digest the supervisor re-verifies is the same definition the
+        admission report publishes (baseline, seal, and recovery share it)."""
+        import hashlib
+
+        contract = artifacts.ArtifactContract(required_outputs=("/workspace/answer.txt",))
+        expected = hashlib.sha256(json.dumps(
+            {"allowed_paths": ["/workspace"],
+             "required_outputs": ["/workspace/answer.txt"],
+             "max_total_bytes": artifacts.CONTRACT_MAX_TOTAL_BYTES},
+            sort_keys=True).encode()).hexdigest()
+        assert artifacts.contract_digest(contract) == expected
+
+    def test_seal_fails_and_submission_errors_when_required_output_missing(
+            self, conn, trial, tmp_path, fake_container):
+        """A task-specific required output that is absent fails the seal and
+        leaves the trial in an explainable non-answer state (#14 reopen)."""
+        workspace, _ = fake_container  # no answer.txt written
+        with pytest.raises(artifacts.SealError, match="required output missing"):
+            seal_trial(conn, trial, tmp_path)
+        status = conn.execute("SELECT status FROM submissions WHERE trial_id='t1'").fetchone()
+        assert status["status"] == "error"
+        assert conn.execute("SELECT 1 FROM sealed_answers").fetchone() is None
+
+    def test_seal_succeeds_when_required_output_present(self, conn, trial, tmp_path, fake_container):
+        workspace, _ = fake_container
+        (workspace / "answer.txt").write_text("present")
+        receipt = seal_trial(conn, trial, tmp_path)
+        assert receipt["status"] == "sealed"
+
+    def test_supervisor_marks_anomaly_when_sealing_fails(self, conn, trial, tmp_path, monkeypatch):
+        """A seal that fails after acceptance leaves an anomaly, never a
+        silent capability sample (#14 reopen)."""
+        from aco import supervisor
+
+        def failing_seal(*args, **kwargs):
+            raise artifacts.SealError("required output missing: /workspace/answer.txt")
+
+        monkeypatch.setattr(artifacts, "seal", failing_seal)
+        supervisor._seal_after_run(conn, trial, "cid-1", "submit", tmp_path,
+                                   tmp_path / "baseline", TASK_CONTRACT)
+        sealed = conn.execute(
+            "SELECT status, anomaly FROM sealed_answers WHERE trial_id='t1'").fetchone()
+        assert sealed["status"] == "anomaly"
+        assert "required output missing" in sealed["anomaly"]
+        run = runs.get_run(conn, trial["run_id"])
+        assert any(p["event"] == "seal_failed" for p in json.loads(run["phases"]))
+
+    def test_recovery_applies_the_task_contract(self, conn, trial, tmp_path):
+        """Restart recovery validates recovered staging against the same task
+        contract, not a default (#14 reopen)."""
+        run_id = trial["run_id"]
+        staging = tmp_path / "sealing" / run_id / "staging"
+        (staging / "workspace").mkdir(parents=True)  # required output missing
+        manifest = artifacts.build_manifest(staging, "t1", run_id, "submit", None)
+        (staging / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+        artifacts.recover(conn, tmp_path)
+        sealed = conn.execute(
+            "SELECT status, anomaly FROM sealed_answers WHERE trial_id='t1'").fetchone()
+        assert sealed["status"] == "anomaly"
+        assert "fails the task contract" in sealed["anomaly"]
+        assert not (tmp_path / "answers").exists()
 
 
 class TestManifest:
@@ -390,7 +556,7 @@ class TestRecover:
     def test_no_container_persists_anomaly_and_seal_failed(self, conn, trial, tmp_path):
         from aco import supervisor
 
-        supervisor._seal_after_run(conn, trial, None, "timeout", tmp_path, tmp_path)
+        supervisor._seal_after_run(conn, trial, None, "timeout", tmp_path, tmp_path, TASK_CONTRACT)
         sealed = conn.execute(
             "SELECT receipt_id, status, anomaly, seal_trigger FROM sealed_answers WHERE trial_id='t1'"
         ).fetchone()
