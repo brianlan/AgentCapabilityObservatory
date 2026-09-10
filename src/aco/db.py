@@ -39,4 +39,10 @@ def migrate(conn: sqlite3.Connection) -> None:
             f"BEGIN;\n{path.read_text()}\n"
             f"INSERT INTO schema_version (version, applied_at) VALUES ({version!r}, '{utcnow()}');\nCOMMIT;"
         )
-        conn.executescript(script)
+        # a table-rebuild migration (0013) must run with FK enforcement off;
+        # PRAGMAs are no-ops inside a transaction, so they wrap the script
+        conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            conn.executescript(script)
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")

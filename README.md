@@ -68,6 +68,14 @@ FastAPI 进程只保存计划与状态；长运行由独立进程承担：
 
 e2e 测试（需要本机 Docker）：`/ssd4/envs/aco_py312/bin/python -m pytest tests/e2e`。
 
+## SkillVersion 与显式 Pi skill 加载（#39）
+
+skill 是内容寻址的不可变版本，不是可变的名字引用：
+
+- **导入**（可信管理端本地操作，与 verifier bundle 导入同一模式）：`aco import-skill <bundle-dir> --name pdf --version v2 --data-root data`。bundle 是含 `SKILL.md` 的目录；导入时校验 name/version 字符集、入口文件、拒绝符号链接与特殊文件（同时封死路径逃逸）、2 MiB 大小上限，并扫描凭证模式（OpenAI/GitHub/AWS/Slack token、私钥块）。registry 登记 `kind: "skill"` 版本（内容摘要 + 入口 + 大小 + 文件数，幂等重导 200、同名同版本不同内容 409），字节复制到 `<data-root>/skills/<version-id>/` 并复核摘要。
+- **引用与 fingerprint**：v1 config 用有序 `skills: [{name, version}]` 引用已登记的 skill 版本（登记 config 时校验解析，v1 引用必须带 version）。skill 集合与顺序参与 TargetProfile fingerprint，因此内容或顺序变化会形成不同的可比结果序列。
+- **Pi 执行**：默认 config 不带 skills —— `--no-skills` 关闭一切发现与加载（可复现空基线）；声明了 skills 的 config 只把登记的字节只读挂载到容器 `/opt/aco-skills/<name>`，并按 config 顺序逐个显式 `--skill` 加载，其余隔离 flags 不变。运行前 supervisor 对每个 skill 重新计算挂载字节的摘要（requested vs observed），任一不一致 => `skills` 阶段记录详情后 trial 以执行异常收尾，绝不启动容器、绝不产生付费调用。
+
 ## API 驱动评测 CLI（#17）
 
 `aco` 命令是统一管理 API 的薄客户端（stdlib `argparse` + `urllib`，无 CLI 框架；不直接访问数据库或执行引擎）。所有输出来自 API；关闭或 Ctrl-C CLI 绝不取消服务端运行，只有显式 `aco cancel` 会取消。

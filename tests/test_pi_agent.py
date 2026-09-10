@@ -22,6 +22,7 @@ from aco.pi_agent import (
     PI_VERSION,
     PiAgent,
     parse_transcript,
+    render_agent_flags,
     render_models_json,
     validate_profile,
 )
@@ -89,15 +90,31 @@ class TestValidateProfile:
             validate_profile(_TargetProfile(adapter_version="9.9.9"))
         with pytest.raises(ValueError, match="assistance_mode"):
             validate_profile(_TargetProfile(assistance_mode="human"))
-        with pytest.raises(ValueError, match="skills"):
-            validate_profile(_TargetProfile(skills=[{"name": "x", "version": "1"}]))
         with pytest.raises(ValueError, match="credentials"):
             validate_profile(_TargetProfile(credentials=["other-ref"]))
         with pytest.raises(ValueError, match="credentials"):
             validate_profile(_TargetProfile(credentials=[]))
+        # declared skills are now valid (#39): the pinned set loads explicitly
+        validate_profile(_TargetProfile(
+            skills=[{"name": "demo", "version": "v1"}]))
         # and the supervisor surface wraps it as UnsupportedTarget
         with pytest.raises(UnsupportedTarget, match="harness_version"):
             translate_profile(_pi_profile(harness_version="0.85.1"))
+
+    def test_default_flags_disable_all_skill_loading(self):
+        flags = render_agent_flags(_TargetProfile())
+        assert "--no-skills" in flags
+        assert "--no-extensions" in flags and "--no-session" in flags
+        assert "--skill" not in flags
+
+    def test_declared_skills_load_explicitly_in_order(self):
+        flags = render_agent_flags(_TargetProfile(skills=[
+            {"name": "b-skill", "version": "v1"},
+            {"name": "a-skill", "version": "v1"}]))
+        # explicit paths only: discovery stays off, order follows config
+        assert "--no-skills" not in flags
+        assert "--skill /opt/aco-skills/b-skill --skill /opt/aco-skills/a-skill" in flags
+        assert "--no-extensions" in flags and "--no-session" in flags
 
     def test_supervisor_dispatches_both_harnesses(self):
         assert translate_profile(_pi_profile())[0] == "pi"

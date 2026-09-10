@@ -37,6 +37,14 @@ PI_PROFILE = {
 }
 DUMMY_KEY = "e2e-dummy-key"
 
+SKILL_MD = (
+    "---\n"
+    "name: e2e-skill\n"
+    "description: reminder that answers must go to /workspace/answer.txt\n"
+    "---\n\n"
+    "When asked to record an answer, write it to /workspace/answer.txt.\n"
+)
+
 
 def docker_available() -> bool:
     import shutil
@@ -160,6 +168,39 @@ class TestPiExecution:
             assert request["model"] == "glm-5.3-flash"
         dump = db_dump(str(pi_stack["root"] / "aco.db"))
         assert DUMMY_KEY not in dump
+
+    def test_declared_skill_is_verified_and_loaded(self, pi_stack):
+        """An opt-in SkillVersion is mounted read-only, verified against the
+        registered digest, and loaded via explicit --skill (#39)."""
+        base = pi_stack["base"]
+        # trusted-side import into the stack's local data root
+        from aco import db as aco_db, skills as aco_skills
+        bundle = pi_stack["root"] / "e2e-skill-bundle"
+        bundle.mkdir(parents=True, exist_ok=True)
+        (bundle / "SKILL.md").write_text(SKILL_MD)
+        conn = aco_db.connect(pi_stack["root"] / "aco.db")
+        try:
+            record = aco_skills.import_skill(bundle, pi_stack["root"],
+                                             "e2e-skill", "v1", conn)
+        finally:
+            conn.close()
+
+        profile = {**PI_PROFILE,
+                   "skills": [{"name": "e2e-skill", "version": "v1"}]}
+        trial_id = create_trial(base, "write the answer file", profile)
+        run = wait_for_run(base, trial_id, timeout=300)
+
+        assert run["status"] == "finished", run
+        assert run["exit_kind"] == "normal"
+        skills_phases = [p for p in run["phases"] if p.get("event") == "skills"]
+        assert skills_phases and skills_phases[0]["verified"] is True
+        entry = skills_phases[0]["skills"][0]
+        assert entry["verified"] is True
+        assert entry["requested"] == record["content"]["bundle"]["digest"]
+        assert entry["requested"] == entry["observed"]
+        status, trial = http("GET", base + f"/v1/trials/{trial_id}")
+        assert status == 200
+        assert trial["runtime_observation"]["source"] == "pi_json_transcript"
 
     def test_provider_auth_failure_is_an_anomaly(self, pi_stack):
         """A 401 from the provider never becomes a capability sample."""

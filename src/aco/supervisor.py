@@ -16,7 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import artifacts, db, lifecycle, pi_agent, runs
+from . import artifacts, db, lifecycle, pi_agent, runs, skills
+from .app import fetch_version
 from .models import TargetProfile, parse_config_content
 
 # pinned at adoption; prototype verified the installed package against this
@@ -91,8 +92,38 @@ def command(*args, check=True):
     return subprocess.run(args, text=True, capture_output=True, timeout=20, check=check)
 
 
+def resolve_skill_mounts(conn: sqlite3.Connection, parsed: TargetProfile,
+                         root: Path) -> list[dict]:
+    """Resolve each declared SkillVersionRef to its imported, verified bytes
+    (#39). Returns one entry per skill with requested vs observed digests;
+    verified=False means the trial must not run (execution anomaly, no paid
+    call). The fake harness never reaches this: it rejects any skill."""
+    state = []
+    for ref in parsed.skills:
+        row = fetch_version(conn, "skill", ref.name, ref.version)
+        entry = {"name": ref.name, "version": ref.version,
+                 "requested": None, "observed": None, "verified": False}
+        if row is None:
+            state.append({**entry, "observed": "version_not_found"})
+            continue
+        entry["requested"] = json.loads(row["content"])["bundle"]["digest"]
+        host_dir = root / "skills" / row["id"]
+        if not host_dir.is_dir():
+            state.append({**entry, "observed": "bundle_missing"})
+            continue
+        try:
+            observed = skills.tree_digest(host_dir)["digest"]
+        except skills.SkillImportError as exc:
+            state.append({**entry, "observed": f"unreadable: {exc}"})
+            continue
+        state.append({**entry, "observed": observed,
+                      "verified": observed == entry["requested"]})
+    return state
+
+
 def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run_id: str,
-                   harness: str = FAKE_HARNESS) -> Path:
+                   harness: str = FAKE_HARNESS,
+                   skill_mounts: list[dict] | None = None) -> Path:
     """Minimal Harbor task dir: registry prompt as instruction, pinned image,
     offline compose override with our identification label. The fake target
     stays fully offline; the pi target gets bridge networking plus a
@@ -108,13 +139,17 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
     if harness == PI_HARNESS:
         (task_dir / "environment" / "Dockerfile").write_text(pi_agent.render_dockerfile())
         compose = task_dir / "offline.yaml"
+        volume_lines = "".join(
+            f'      - "{mount["host_dir"]}:{pi_agent._PI_CONTAINER_SKILL_ROOT}/{mount["name"]}:ro"\n'
+            for mount in (skill_mounts or []))
         compose.write_text(
             "services:\n"
             "  main:\n"
             "    network_mode: bridge\n"
             "    extra_hosts:\n"
             "      - \"host.docker.internal:host-gateway\"\n"
-            "    labels:\n"
+            + ("    volumes:\n" + volume_lines if volume_lines else "")
+            + "    labels:\n"
             f"      {RUN_LABEL}: {run_id}\n"
         )
         return task_dir
@@ -295,7 +330,23 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
 
     image_ref = IMAGE
     agent_import_path = "aco.fake_agent:FakeAgent"
+    skill_mounts: list[dict] = []
     if harness == PI_HARNESS:
+        skill_state = resolve_skill_mounts(
+            conn, parse_config_content(profile), root)
+        runs.add_phase(conn, run_id, "skills", skills=skill_state,
+                       verified=all(s["verified"] for s in skill_state))
+        if not all(s["verified"] for s in skill_state):
+            # declared skill bytes diverge from the registered digest (#39):
+            # terminal execution anomaly before any container or paid call
+            bad = next(s for s in skill_state if not s["verified"])
+            runs.finish_run(conn, run_id, "error", runs.EXIT_HARNESS_FAILURE,
+                            f"skill {bad['name']}@{bad['version']} failed verification:"
+                            f" requested={bad['requested']} observed={bad['observed']}")
+            _fail_before_agent_start(conn, run, "skill_mismatch",
+                                     f"{bad['name']}@{bad['version']}:"
+                                     f" {bad['observed']}")
+            return
         image_ref = await asyncio.to_thread(pi_agent.ensure_image)
         agent_import_path = "aco.pi_agent:PiAgent"
         # the adapter reads these (same process): profile, db root, run id
@@ -316,7 +367,7 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     work_dir = root / "runs" / run_id
     baseline_dir = root / "sealing" / run_id / "baseline"
     task_dir = build_task_dir(work_dir, task_content.get("prompt", ""), agent_timeout_sec,
-                              run_id, harness=harness)
+                              run_id, harness=harness, skill_mounts=skill_mounts)
     trials_dir = work_dir / "trials"
     container_id = None
     agent_started_at: dict | None = None

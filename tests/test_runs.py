@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 
 import pytest
 
@@ -155,3 +156,71 @@ class TestManagerHelpers:
         run_id = runs.create_run(conn, "t1", {}, supervisor_pid=os.getpid())
         reap_lost_supervisors(conn)
         assert runs.get_run(conn, run_id)["status"] == "launching"
+
+
+class TestSkillMaterialization:
+    """Requested vs observed skill digests + read-only mounts (#39)."""
+
+    PI_SKILLS = [{"name": "demo", "version": "v1"}]
+
+    def _profile(self, skills):
+        return {
+            "schema_version": 1, "harness": "pi", "harness_version": "0.84.1",
+            "model": "glm-5.3-flash", "thinking": "max",
+            "provider": "ark-agent-plan", "provider_api_style": "openai-responses",
+            "adapter_version": "0.1.0", "credentials": ["ark-agent-plan-main"],
+            "skills": skills,
+        }
+
+    def _import(self, tmp_path, conn, name="demo", version="v1"):
+        from aco import skills as skills_mod
+        bundle = tmp_path / f"{name}-bundle"
+        (bundle / "inner").mkdir(parents=True, exist_ok=True)
+        (bundle / "SKILL.md").write_text("---\nname: demo\n---\nbody\n")
+        (bundle / "inner" / "n.md").write_text("nested\n")
+        return skills_mod.import_skill(bundle, tmp_path, name, version, conn)
+
+    def test_verified_mount_when_bytes_match(self, tmp_path, conn):
+        from aco.models import parse_config_content
+        from aco.supervisor import resolve_skill_mounts
+        record = self._import(tmp_path, conn)
+        assert record["id"]
+        parsed = parse_config_content(self._profile(self.PI_SKILLS))
+        state = resolve_skill_mounts(conn, parsed, tmp_path)
+        assert len(state) == 1
+        assert state[0]["verified"] is True
+        assert state[0]["requested"] == state[0]["observed"]
+        assert state[0]["requested"] == record["content"]["bundle"]["digest"]
+
+    def test_tampered_bytes_fail_verification(self, tmp_path, conn):
+        from aco.models import parse_config_content
+        from aco.supervisor import resolve_skill_mounts
+        record = self._import(tmp_path, conn)
+        (tmp_path / "skills" / record["id"] / "SKILL.md").write_text("tampered\n")
+        parsed = parse_config_content(self._profile(self.PI_SKILLS))
+        state = resolve_skill_mounts(conn, parsed, tmp_path)
+        assert state[0]["verified"] is False
+        assert state[0]["observed"] != state[0]["requested"]
+
+    def test_missing_bundle_fails_verification(self, tmp_path, conn):
+        from aco.models import parse_config_content
+        from aco.supervisor import resolve_skill_mounts
+        self._import(tmp_path, conn)
+        # registry row exists, bytes gone (e.g. different data root)
+        for row in conn.execute("SELECT id FROM versions WHERE kind='skill'"):
+            shutil.rmtree(tmp_path / "skills" / row["id"])
+        parsed = parse_config_content(self._profile(self.PI_SKILLS))
+        state = resolve_skill_mounts(conn, parsed, tmp_path)
+        assert state[0]["verified"] is False
+        assert state[0]["observed"] == "bundle_missing"
+
+    def test_build_task_dir_mounts_declared_skills_readonly(self, tmp_path):
+        from aco.supervisor import build_task_dir, pi_agent
+        mounts = [{"name": "demo", "host_dir": "/data/skills/abc123"}]
+        task_dir = build_task_dir(tmp_path, "prompt", 30, "run1",
+                                  harness="pi", skill_mounts=mounts)
+        compose = (task_dir / "offline.yaml").read_text()
+        assert f'"/data/skills/abc123:{pi_agent._PI_CONTAINER_SKILL_ROOT}/demo:ro"' in compose
+        # the no-skill compose stays unchanged
+        plain = build_task_dir(tmp_path / "plain", "prompt", 30, "run2", harness="pi")
+        assert "volumes:" not in (plain / "offline.yaml").read_text()
