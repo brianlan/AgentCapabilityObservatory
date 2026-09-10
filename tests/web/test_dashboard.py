@@ -13,7 +13,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from aco import db, runs
-from aco.app import create_app
+from aco.app import create_management_app
+
+MGMT_TOKEN = "test-management-token"
+MGMT_AUTH = {"Authorization": f"Bearer {MGMT_TOKEN}"}
 
 
 @pytest.fixture()
@@ -23,7 +26,8 @@ def root(tmp_path):
 
 @pytest.fixture()
 def client(root):
-    return TestClient(create_app(data_root=str(root)))
+    app = create_management_app(data_root=str(root), token=MGMT_TOKEN)
+    return TestClient(app, headers=MGMT_AUTH)
 
 
 @pytest.fixture()
@@ -67,8 +71,8 @@ def seed(conn):
         (run_id,),
     )
     conn.execute(
-        "INSERT INTO submissions (trial_id, idempotency_key, request_digest, receipt_id, status, answer, created_at)"
-        " VALUES ('t-normal', 'k1', 'd1', 'r-normal', 'sealed', '{}', 'now')"
+        "INSERT INTO submissions (trial_id, idempotency_key, request_digest, receipt_id, status, created_at)"
+        " VALUES ('t-normal', 'k1', 'd1', 'r-normal', 'sealed', 'now')"
     )
     conn.execute(
         "INSERT INTO sealed_answers (trial_id, run_id, receipt_id, digest, manifest, seal_trigger,"
@@ -77,8 +81,8 @@ def seed(conn):
         (run_id, "a" * 64, json.dumps({"files": [{"path": "workspace/answer.txt", "bytes": 8, "type": "file", "sha256": "b" * 64}], "changes": {"additions": 1}})),
     )
     conn.execute(
-        "INSERT INTO submissions (trial_id, idempotency_key, request_digest, receipt_id, status, answer, created_at)"
-        " VALUES ('t-anomaly', 'k2', 'd2', 'r-anomaly', 'error', '{}', 'now')"
+        "INSERT INTO submissions (trial_id, idempotency_key, request_digest, receipt_id, status, created_at)"
+        " VALUES ('t-anomaly', 'k2', 'd2', 'r-anomaly', 'error', 'now')"
     )
     anomalous_run = runs.create_run(conn, "t-anomaly", {"harness": "fake"}, supervisor_pid=1)
     conn.execute(
@@ -222,12 +226,18 @@ def test_patch_download_by_trial_id_only(client, conn, root):
     assert client.get("/dashboard/artifacts/trials/nonexistent/patch").status_code == 404
 
 
-def test_pages_accessible_without_session_token(client, conn):
+def test_dashboard_gated_by_management_token(client, conn, root):
     seed(conn)
-    # the dashboard belongs to the management surface, not the session auth domain
+    # the dashboard belongs to the authenticated management surface (ADR 0001):
+    # the management bearer reaches it, an unauthenticated request does not
     for url in ("/dashboard", "/dashboard/experiments/e1", "/dashboard/trials/t-normal"):
-        resp = client.get(url, headers={"Authorization": ""})
+        resp = client.get(url)
         assert resp.status_code == 200
+    from fastapi.testclient import TestClient
+
+    from aco.app import create_management_app
+    bare = TestClient(create_management_app(data_root=str(root), token=MGMT_TOKEN))
+    assert bare.get("/dashboard").status_code == 401
 
 
 def test_semantic_labels_and_keyboard_access(client, conn):

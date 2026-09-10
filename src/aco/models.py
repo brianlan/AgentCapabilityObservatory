@@ -79,7 +79,11 @@ class ExperimentOut(BaseModel):
 
 
 class SubmitRequest(BaseModel):
-    answer: Any
+    """End-intent only (#12): the official answer is the workspace snapshot
+    sealed by the supervisor (#14), never a session-supplied body."""
+
+    model_config = ConfigDict(extra="forbid")
+
     idempotency_key: str = Field(min_length=1)
 
 

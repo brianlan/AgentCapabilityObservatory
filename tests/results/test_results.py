@@ -13,15 +13,19 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
-from aco.app import create_app
+from aco.app import create_management_app
 
 TASK_CONTENT = {"prompt": "What is 2+2?", "expected_answer": "4"}
 SCORER_CONTENT = {"image": f"registry.test/verifier@sha256:{'a' * 64}",
                   "entrypoint": ["python", "run.py"], "result_schema": "v1"}
 
+MGMT_TOKEN = "test-management-token"
+MGMT_AUTH = {"Authorization": f"Bearer {MGMT_TOKEN}"}
+
 
 def make_client(tmp_path):
-    return TestClient(create_app(data_root=str(tmp_path)))
+    app = create_management_app(data_root=str(tmp_path), token=MGMT_TOKEN)
+    return TestClient(app, headers=MGMT_AUTH)
 
 
 def register_versions(client, tasks=(), configs=(), scorers=(), suites=()):

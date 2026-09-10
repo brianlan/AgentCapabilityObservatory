@@ -184,7 +184,8 @@ def cmd_resume(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--api-url", default=os.environ.get("ACO_API_URL", DEFAULT_API_URL))
-    common.add_argument("--token", default=os.environ.get("ACO_API_TOKEN"))
+    common.add_argument("--token", default=os.environ.get("ACO_MANAGEMENT_TOKEN"),
+                        help="management bearer credential (env ACO_MANAGEMENT_TOKEN)")
     common.add_argument("--json", action="store_true", help="输出稳定 JSON（供脚本使用）")
 
     parser = argparse.ArgumentParser(prog="aco", description="ACO 评测管理 CLI（API 客户端）")

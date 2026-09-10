@@ -23,11 +23,13 @@ POLL_INTERVAL_SEC = 1.0
 SUPERVISOR_TIMEOUT_SEC = 300  # generous ceiling; the supervisor enforces its own shorter one
 
 
-def mint_token(api_url: str, trial_id: str) -> str | None:
-    """Trial-scoped token via the running API; None if the API is unreachable."""
+def mint_token(api_url: str, trial_id: str, token: str) -> str | None:
+    """Trial-scoped token via the authenticated management API; None if the
+    API is unreachable or rejects the mint (a finished trial can never run)."""
     try:
         request = urllib.request.Request(
-            api_url.rstrip("/") + f"/v1/trials/{trial_id}/session-token", data=b"", method="POST"
+            api_url.rstrip("/") + f"/v1/trials/{trial_id}/session-token", data=b"", method="POST",
+            headers={"Authorization": f"Bearer {token}"},
         )
         with urllib.request.urlopen(request, timeout=5) as response:
             return json.loads(response.read())["token"]
@@ -72,7 +74,7 @@ def reap_lost_supervisors(conn) -> None:
         cleanup_container(run["run_id"])
 
 
-def run_one(conn, root: Path, api_url: str) -> bool:
+def run_one(conn, root: Path, api_url: str, api_token: str, session_api_url: str) -> bool:
     """Execute at most one trial. Returns True if a trial was handled."""
     trial_id = claim_next_planned(conn)
     if trial_id is None:
@@ -82,9 +84,9 @@ def run_one(conn, root: Path, api_url: str) -> bool:
         "SELECT content FROM versions WHERE id ="
         " (SELECT config_version_id FROM trials WHERE id = ?)", (trial_id,)
     ).fetchone()["content"])
-    token = mint_token(api_url, trial_id)
+    token = mint_token(api_url, trial_id, api_token)
     if token is None:
-        # API unreachable: unclaim and retry on a later poll
+        # API unreachable or trial not runnable: unclaim and retry on a later poll
         conn.execute("UPDATE trials SET status = 'planned' WHERE id = ?", (trial_id,))
         conn.commit()
         return False
@@ -99,7 +101,9 @@ def run_one(conn, root: Path, api_url: str) -> bool:
         [sys.executable, "-m", "aco.supervisor", "--run-id", run_id, "--data-root", str(root)],
         env={
             **os.environ,
-            "ACO_BASE_URL": api_url,
+            # supervisors and their agents speak only to the Session surface;
+            # the management surface stays out of the evaluated path (ADR 0001)
+            "ACO_BASE_URL": session_api_url,
             "ACO_SESSION_TOKEN": token,
         },
         stdout=subprocess.DEVNULL,
@@ -139,7 +143,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="aco-execution", description=__doc__)
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--api-url", required=True,
-                        help="base URL of the running ACO API (used to mint session tokens)")
+                        help="base URL of the management API (session-token minting)")
+    parser.add_argument("--api-token", default=os.environ.get("ACO_MANAGEMENT_TOKEN"),
+                        help="management bearer credential (env ACO_MANAGEMENT_TOKEN)")
+    parser.add_argument("--session-api-url", required=True,
+                        help="base URL of the Session API passed to supervisors and agents")
     args = parser.parse_args()
 
     root = Path(args.data_root).expanduser()
@@ -161,7 +169,7 @@ def main() -> int:
         # verifications first: re-scoring stays responsive even while a long
         # trial run blocks the single loop (one of each per iteration)
         handled = verification.run_pending(conn, root)
-        handled = run_one(conn, root, args.api_url) or handled
+        handled = run_one(conn, root, args.api_url, args.api_token, args.session_api_url) or handled
         if not handled:
             time.sleep(POLL_INTERVAL_SEC)
 
