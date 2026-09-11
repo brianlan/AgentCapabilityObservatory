@@ -545,7 +545,9 @@ def _register_candidate(conn, bundle: Bundle, data_root: Path,
     with open(lock_path, "a") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
-            _register_candidate_locked(
+            # the report needs the registered task version id; dropping the
+            # result here left every admission report's task_version null
+            return _register_candidate_locked(
                 conn, bundle, verifier_bundle_digest, environment_digest,
                 scorer_name, scorer_version, scorer_content, scorer_assets,
                 task_name, task_version, task_content, task_assets, dest)

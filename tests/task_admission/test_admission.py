@@ -83,6 +83,22 @@ def test_report_schema_and_gate_names(bundle, root, monkeypatch):
     assert set(report["digests"]) == {"verifier_bundle", "environment", "artifact_contract", "task_version"}
 
 
+def test_report_records_registered_task_version(bundle, root, monkeypatch):
+    """Regression: _register_candidate must return the locked registration
+    result; dropping it left report digests.task_version null and keyed the
+    report files by a name digest instead of the registered version id."""
+    patch_containers(monkeypatch, root, lambda gate, index: PASS if gate == "oracle" else FAIL)
+    report = run_report(bundle, root)
+    task_version = report["digests"]["task_version"]
+    assert task_version is not None
+    conn = sqlite3.connect(root / "aco.db")
+    row = conn.execute("SELECT kind, name FROM versions WHERE id = ?", (task_version,)).fetchone()
+    conn.close()
+    assert row == ("task", "synthetic-add")
+    report_dir = root / "admission"
+    assert [p.name for p in report_dir.glob("*.json")] == [f"{task_version}.json"]
+
+
 def test_clean_fixture_passes_leak_scan(bundle):
     """Regression: the unmodified committed fixture must pass the public
     leak scan — unchanged starter files shared with private workspaces are
