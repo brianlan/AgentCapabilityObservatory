@@ -16,7 +16,7 @@ calibrate it. Pilot/Core promotion is a separate, human-reviewed step.
 | Task name | Category | Pilot role | Task version id (v1) |
 | --- | --- | --- | --- |
 | `py-pilot-page-fix` | boundary-condition fix | sanity-control | `79e946a947056f8476cd60d891ac6cabb1c90c53e33005e4e293835901a7722f` |
-| `py-pilot-ratelimit-fix` | boundary-condition fix | uncalibrated | `7736c6d229c38d2ac890bbe3e6d622641202e0a74e58d51659c4e4ca18fc` |
+| `py-pilot-ratelimit-fix` | boundary-condition fix | uncalibrated | `7736c6d229c38d2ac890bbe3e6d622641202e0a74e58d578d51659c4e4ca18fc` |
 | `py-pilot-shipping-fee` | cross-file feature modification | uncalibrated | `ed8729b388b28de7cb395b26b830c4dfede2d239c993e9af895f42a20eee09dc` |
 | `py-pilot-csv-export` | cross-file feature modification | uncalibrated | `512a417ea2bc82ed1da0982052bd7325a0fb5df122f5b198ca6a6e1afb5b6ace` |
 | `py-pilot-log-summary` | structured data processing | sanity-control | `fd65f572c9ac7862e94772ed062dd9e08be28e572d0f0b0613a63660918fc7ae` |
@@ -31,3 +31,14 @@ ACO_MANAGEMENT_TOKEN=<token> python -m aco.admission admit \
 
 The admission run is idempotent: bundle digests and the registered version
 ids are content-addressed, so a rerun rewrites the same report files.
+
+Instruction single source (#20 reopen): each bundle's `task.toml` must
+declare `instruction = "<path>"`, a path inside `public/environment/`
+(the six Pilot bundles use `workspace/README.md`). Admission publishes the
+public environment bytes into the data root's content-addressed store and
+registers the reference; the Session API serves the instruction from that
+immutable asset, and the supervisor materializes the same verified bytes
+into `/workspace` before the agent starts. Re-admitting the six private
+tasks therefore requires adding the `instruction` line to each `task.toml`,
+and the rebuilt TaskVersion ids in the table above must be updated from the
+new reports.

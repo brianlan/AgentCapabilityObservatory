@@ -5,6 +5,7 @@ for the singleton manager to run it through the supervisor. Skipped when no
 Docker daemon is reachable.
 """
 
+import hashlib
 import json
 import shutil
 import socket
@@ -479,3 +480,87 @@ class TestSealedAnswers:
         assert answer["seal_trigger"] == "timeout"
         assert answer["status"] == "sealed"  # eligible: stays a capability sample
         assert trial_status == "sealed"  # the funnel terminalised the trial
+
+
+class TestEnvironmentMaterialization:
+    """Registered TaskVersion environments: verified bytes materialized into
+    /workspace before any agent call; broken sources fail pre-agent (#20)."""
+
+    def _register_with_environment(self, base: str, root, *, tamper: bool = False):
+        suffix = uuid.uuid4().hex[:8]
+        from aco import artifacts as aco_artifacts
+        from aco.verification import runner
+        env_dir = root / "env-src"
+        (env_dir / "workspace").mkdir(parents=True, exist_ok=True)
+        (env_dir / "workspace" / "README.md").write_text(
+            "FAKE:submit\nimplement add(a, b) per the registered environment\n"
+            f"bundle instance: {suffix}\n")
+        (env_dir / "workspace" / "starter.py").write_text(f"a, b = 2, 4  # {suffix}\n")
+        digest = runner.bundle_digest(env_dir)
+        store_dir = root / "environments" / digest
+        if not store_dir.exists():
+            shutil.copytree(env_dir, store_dir)
+        if tamper:
+            (store_dir / "workspace" / "README.md").write_text("tampered!")
+        contract = aco_artifacts.ArtifactContract(required_outputs=("/workspace/answer.txt",))
+        task_content = {"instruction": {"asset": "environment", "path": "workspace/README.md"},
+                        "contract": {"required_outputs": ["/workspace/answer.txt"]},
+                        "contract_digest": aco_artifacts.contract_digest(contract)}
+        for kind, name, content, assets in (
+            ("task", f"task-{suffix}", task_content, [{"name": "environment", "digest": digest}]),
+            ("config", f"cfg-{suffix}", {"harness": "fake", "model": "none"}, []),
+        ):
+            status, body = http("POST", base + "/v1/versions",
+                                {"kind": kind, "name": name, "version": "v1",
+                                 "content": content, "assets": assets})
+            assert status in (200, 201), body
+        status, body = http("POST", base + "/v1/experiments", {
+            "task": {"name": f"task-{suffix}", "version": "v1"},
+            "targets": [{"name": f"cfg-{suffix}", "version": "v1"}],
+        })
+        assert status == 202, body
+        return body["trials"][0]["id"], env_dir, digest
+
+    def test_registered_environment_materializes_into_trial(self, stack):
+        base, root = stack["base"], stack["root"]
+        trial_id, env_dir, digest = self._register_with_environment(base, root)
+        run = wait_for_run(base, trial_id)
+
+        assert run["status"] == "finished" and run["exit_kind"] == "normal"
+        # the instruction came from the registered asset — the version
+        # declares no prompt at all
+        instruction = (root / "runs" / run["run_id"] / "task" / "instruction.md").read_text()
+        assert instruction == (env_dir / "workspace" / "README.md").read_text()
+        # the initial environment files are inside the sealed answer, with the
+        # exact registered digests: baseline, instruction, and seal share one
+        # environment digest
+        conn = sqlite3.connect(root / "aco.db")
+        seal_digest = conn.execute(
+            "SELECT digest FROM sealed_answers WHERE trial_id = ?", (trial_id,)).fetchone()[0]
+        conn.close()
+        answer_dir = root / "answers" / seal_digest
+        sealed = {entry["path"]: entry["sha256"] for entry in read_manifest(answer_dir)["files"]}
+        for rel in ("README.md", "starter.py"):
+            expected = (env_dir / "workspace" / rel).read_bytes()
+            assert sealed[f"workspace/{rel}"] == hashlib.sha256(expected).hexdigest()
+
+    def test_tampered_environment_fails_before_agent_start(self, stack):
+        base, root = stack["base"], stack["root"]
+        trial_id, _, _ = self._register_with_environment(base, root, tamper=True)
+        run = wait_for_run(base, trial_id)
+
+        assert run["status"] == "error" and run["exit_kind"] == "environment_invalid"
+        events = [phase["event"] for phase in run["phases"]]
+        assert "agent_start" not in events  # failed before any agent/paid call
+        conn = sqlite3.connect(root / "aco.db")
+        conn.row_factory = sqlite3.Row
+        try:
+            answer = conn.execute(
+                "SELECT status, seal_trigger FROM sealed_answers WHERE trial_id = ?",
+                (trial_id,)).fetchone()
+            trial_status = conn.execute(
+                "SELECT status FROM trials WHERE id = ?", (trial_id,)).fetchone()[0]
+        finally:
+            conn.close()
+        assert answer["seal_trigger"] == "environment_invalid" and answer["status"] == "anomaly"
+        assert trial_status == "anomaly"
