@@ -4,7 +4,10 @@ import sqlite3
 
 
 def make_config(name):
-    return {"harness": "opencode", "model": "model-a", "credentials": [f"{name}-key"]}
+    # a bare executable fake target: plan-expansion tests exercise the
+    # experiment flow, not target validation (#36 reopen rejects
+    # unenforceable configs at creation)
+    return {"harness": "fake", "model": "none"}
 
 
 def setup_registry(register, tasks, configs):
@@ -144,6 +147,8 @@ PI_PROFILE_CONTENT = {
     "provider": "ark-agent-plan",
     "provider_api_style": "openai-responses",
     "adapter_version": "0.1.0",
+    "prompt_digest": "sha256:" + "a" * 64,
+    "environment": "sha256:" + "b" * 64,
     "credentials": ["ark-agent-plan-main"],
 }
 
@@ -157,7 +162,7 @@ def test_real_provider_target_requires_allow_paid_run(client, register):
     })
     assert resp.status_code == 403, resp.text
     assert resp.json()["error"]["code"] == "paid_run_not_allowed"
-    # legacy/unsupported harnesses are not paid targets: creation stays open
+    # non-pi harnesses are not paid targets: creation stays open
     resp = client.post("/v1/experiments", json={
         "task": {"name": "arith", "version": "v1"},
         "targets": [{"name": "cfg-a", "version": "v1"}],

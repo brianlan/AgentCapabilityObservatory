@@ -279,14 +279,30 @@ class TestHarborExecution:
 
     def test_unsupported_target_fails_without_side_effects(self, stack):
         base = stack["base"]
-        trial_id = create_trial(base, "never runs", {"harness": "codex", "model": "gpt"})
-        run = wait_for_run(base, trial_id)
-        assert run["status"] == "error"
-        assert run["exit_kind"] == "unsupported_target"
-        assert "unsupported harness 'codex'" in run["exit_detail"]
-        # explicit failure only: no container was ever created
-        assert run["container_id"] is None
-        assert "agent_start" not in [p["event"] for p in run["phases"]]
+        # an unsupported harness is rejected at plan creation (#36 reopen:
+        # unenforceable configs never become trials), so no run, container,
+        # or paid call can ever exist for it
+        import uuid as uuid_mod
+        suffix = uuid_mod.uuid4().hex[:8]
+        from aco import artifacts as aco_artifacts
+        contract = aco_artifacts.ArtifactContract(required_outputs=("/workspace/answer.txt",))
+        task_content = {"prompt": "never runs", "expected_answer": "hidden",
+                        "contract": {"required_outputs": ["/workspace/answer.txt"]},
+                        "contract_digest": aco_artifacts.contract_digest(contract)}
+        for kind, name, content in (
+            ("task", f"task-{suffix}", task_content),
+            ("config", f"cfg-{suffix}", {"harness": "codex", "model": "gpt"}),
+        ):
+            status, _ = http("POST", base + "/v1/versions",
+                             {"kind": kind, "name": name, "version": "v1", "content": content})
+            assert status in (200, 201)
+        status, body = http("POST", base + "/v1/experiments", {
+            "task": {"name": f"task-{suffix}", "version": "v1"},
+            "targets": [{"name": f"cfg-{suffix}", "version": "v1"}],
+        })
+        assert status == 422, body
+        assert body["error"]["code"] == "unsupported_target"
+        assert "unsupported harness 'codex'" in body["error"]["message"]
 
 
 def published_dirs(root) -> list:

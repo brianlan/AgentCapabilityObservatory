@@ -22,14 +22,14 @@ PI_PROFILE = {
     "model": "glm-5.3-flash",
     "thinking": "max",
     "provider": "ark-agent-plan",
-    "provider_api_style": "agent-plan",
-    "adapter_version": "aco-pi-1",
+    "provider_api_style": "openai-responses",
+    "adapter_version": "0.1.0",
     "assistance_mode": "none",
     "prompt_digest": "sha256:" + "0" * 64,
-    "environment": "registry.local/aco-pi@sha256:" + "1" * 64,
-    "resources": {"cpus": 2, "memory_mb": 4096, "timeout_sec": 600, "network": "offline"},
+    "environment": "sha256:" + "1" * 64,
+    "resources": {"cpus": 2, "memory_mb": 4096, "timeout_sec": 600},
     "skills": [{"name": "pdf", "version": "v2"}, {"name": "search", "version": "v1"}],
-    "credentials": ["ark-main"],
+    "credentials": ["ark-agent-plan-main"],
 }
 
 
@@ -81,7 +81,13 @@ class TestTargetProfileSchema:
         assert cfg["model"] == "glm-5.3-flash" and cfg["thinking"] == "max"
         assert cfg["provider"] == "ark-agent-plan"
         assert [s["name"] for s in cfg["skills"]] == ["pdf", "search"]  # ordered
-        assert cfg["credentials"] == ["ark-main"]  # logical ref, never a value
+        assert cfg["credentials"] == ["ark-agent-plan-main"]  # logical ref, never a value
+        # the effective execution contract is materialized into every trial
+        # (#36 reopen): the conditions the supervisor will actually apply
+        assert trial["requested"]["effective"] == {
+            "harness": "pi", "agent_timeout_sec": 600,
+            "network_policy": "allowlist", "cpus": 2, "memory_mb": 4096,
+        }
 
     def test_unknown_field_fails_on_v1_path(self, register):
         bad = dict(PI_PROFILE, temperature=0.7)
@@ -102,8 +108,7 @@ class TestTargetProfileSchema:
         assert resp.json()["error"]["code"] == "invalid_content"
         # and a legitimately registered profile's trial snapshot carries only
         # the declared ref fields — no value-shaped key ever appears
-        register("config", "t1", "v1", {"harness": "fake", "model": "none",
-                                        "credentials": ["ark-main"]})
+        register("config", "t1", "v1", {"harness": "fake", "model": "none"})
         trial = create_trial(client)
         assert "sk-secret-value" not in str(trial["requested"])
         assert set(trial["requested"]["config"]) <= set(TargetProfile.model_fields)
@@ -115,6 +120,71 @@ class TestTargetProfileSchema:
         assert ok.status_code in (200, 201)
         register("config", "bad", "v1", dict(PI_PROFILE, assistance_mode="auto"),
                  expect=(422,))
+
+    def test_content_references_must_be_canonical_digests(self, register):
+        # prompt_digest / environment carry exactly sha256:<64 hex> (#36
+        # reopen): free text, tags, or registry refs cannot be verified
+        # against what actually runs
+        for field, bad in (("prompt_digest", "please-behave"),
+                           ("prompt_digest", "registry.local/x@sha256:" + "0" * 64),
+                           ("environment", "aco-pi-agent:0.84.1"),
+                           ("environment", "sha256:xyz")):
+            resp = register("config", "bad-digest", "v1",
+                            dict(PI_PROFILE, **{field: bad}), expect=(422,))
+            assert resp.json()["error"]["code"] == "invalid_content"
+
+    def test_execution_policy_values_are_positive_and_bounded(self, register):
+        from aco.models import ExecutionPolicy, parse_config_content
+        # accepted range works
+        parse_config_content(dict(PI_PROFILE, resources={"cpus": 0.5, "memory_mb": 128,
+                                                         "timeout_sec": 1}))
+        # zero, negative, and over-cap values all fail the schema
+        for bad in ({"cpus": 0}, {"cpus": -1}, {"cpus": 65},
+                    {"memory_mb": 0}, {"memory_mb": -100}, {"memory_mb": 65537},
+                    {"timeout_sec": 0}, {"timeout_sec": 86401}):
+            with pytest.raises(ValueError):
+                ExecutionPolicy.model_validate(bad)
+        resp = register("config", "bad-resources", "v1",
+                        dict(PI_PROFILE, resources={"cpus": 0}), expect=(422,))
+        assert resp.json()["error"]["code"] == "invalid_content"
+
+    def test_declared_but_unenforceable_pi_fields_reject_the_plan(self, client, register):
+        register_task(register)
+        register_pi_skills(register)
+        # a field the run path cannot enforce must reject the experiment —
+        # never produce a fingerprint over conditions that will not hold
+        cases = (
+            {"prompt_digest": None},
+            {"environment": None},
+            {"resources": {"network": "offline"}},
+        )
+        for index, override in enumerate(cases):
+            register("config", f"unenforceable-{index}", "v1", dict(PI_PROFILE, **override))
+            resp = client.post("/v1/experiments", json={
+                "task": {"name": "arith", "version": "v1"},
+                "targets": [{"name": f"unenforceable-{index}", "version": "v1"}],
+                "allow_paid_run": True})
+            assert resp.status_code == 422, override
+            assert resp.json()["error"]["code"] == "unsupported_target"
+
+    def test_fake_profile_rejects_conditions_it_cannot_enforce(self, client, register):
+        register_task(register)
+        register("config", "t1", "v1", {"harness": "fake", "model": "none"})
+        # changing only a field the fake path never enforces must not mint a
+        # new comparable series — the config is rejected instead (v1 shape:
+        # the legacy path cannot even declare these fields)
+        for index, extra in enumerate((
+                {"environment": "sha256:" + "1" * 64},
+                {"prompt_digest": "sha256:" + "0" * 64},
+                {"resources": {"timeout_sec": 60}},
+                {"assistance_mode": "human"})):
+            register("config", f"fake-extra-{index}", "v1",
+                     {"schema_version": 1, "harness": "fake", "model": "none", **extra})
+            resp = client.post("/v1/experiments", json={
+                "task": {"name": "arith", "version": "v1"},
+                "targets": [{"name": f"fake-extra-{index}", "version": "v1"}]})
+            assert resp.status_code == 422, extra
+            assert resp.json()["error"]["code"] == "unsupported_target"
 
     def test_skills_default_empty_not_inferred(self, client, register):
         register_task(register)
@@ -128,15 +198,29 @@ class TestTargetProfileSchema:
         register("config", "assisted", "v1",
                  {"schema_version": 1, "harness": "fake", "model": "none",
                   "assistance_mode": "human"})
-        for name in ("bare", "assisted"):
-            resp = client.post("/v1/experiments", json={
-                "task": {"name": "arith", "version": "v1"},
-                "targets": [{"name": name, "version": "v1"}]})
-            assert resp.status_code == 202, resp.text
+        # a bare fake target plans normally
+        resp = client.post("/v1/experiments", json={
+            "task": {"name": "arith", "version": "v1"},
+            "targets": [{"name": "bare", "version": "v1"}]})
+        assert resp.status_code == 202, resp.text
+        # a fake target cannot apply human assistance (#36 reopen: declared
+        # conditions must be enforceable), so the assisted config is rejected
+        # instead of minting a series whose conditions would not hold
+        resp = client.post("/v1/experiments", json={
+            "task": {"name": "arith", "version": "v1"},
+            "targets": [{"name": "assisted", "version": "v1"}]})
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["error"]["code"] == "unsupported_target"
         data = client.get("/v1/results").json()
-        keys = [(s["key"]["config"], s["key"]["fingerprint"]) for s in data["series"]]
-        assert len(keys) == 2, keys
-        assert len({fp for _, fp in keys}) == 2  # different series, always
+        assert len(data["series"]) == 1
+        # at the schema level the modes still can never share a fingerprint
+        from aco.models import parse_config_content
+        none_fp = trial_fingerprint(
+            parse_config_content({"harness": "fake", "model": "none"}))
+        human_fp = trial_fingerprint(
+            parse_config_content({"harness": "fake", "model": "none"}).model_copy(
+                update={"assistance_mode": "human"}))
+        assert none_fp != human_fp
 
 
 BASE = parse_config_content({"harness": "fake", "model": "none"})
@@ -166,7 +250,7 @@ class TestTrialFingerprint:
         {"adapter_version": "aco-pi-1"},
         {"assistance_mode": "human"},
         {"prompt_digest": "sha256:" + "0" * 64},
-        {"environment": "registry.local/x@sha256:" + "1" * 64},
+        {"environment": "sha256:" + "1" * 64},
         {"resources": {"network": "online"}},
         {"resources": {"timeout_sec": 60}},
         {"skills": [{"name": "search", "version": "v1"}]},

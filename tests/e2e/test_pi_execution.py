@@ -6,6 +6,7 @@ Docker-gated like the fake e2e. The provider is a local mock Ark endpoint
 assert never leaks into the database.
 """
 
+import hashlib
 import os
 import sqlite3
 import subprocess
@@ -36,6 +37,17 @@ PI_PROFILE = {
     "credentials": ["ark-agent-plan-main"],
 }
 DUMMY_KEY = "e2e-dummy-key"
+PROMPT = "write the answer file"
+# the declared prompt digest is verified against the instruction the agent
+# actually receives (#36 reopen)
+PROMPT_DIGEST = "sha256:" + hashlib.sha256(PROMPT.encode()).hexdigest()
+
+
+def pi_profile(image_digest: str) -> dict:
+    """An executable pi profile: the environment digest pins the actual
+    built image, verified by the supervisor before any paid call."""
+    return {**PI_PROFILE, "prompt_digest": PROMPT_DIGEST,
+            "environment": image_digest}
 
 SKILL_MD = (
     "---\n"
@@ -112,6 +124,12 @@ def stop_stack(stack):
 def pi_stack(tmp_path_factory):
     mock = MockArk()
     root = tmp_path_factory.mktemp("aco-pi-e2e")
+    # build the pinned image once and read its content digest: the profile's
+    # declared environment must be the digest of the image that will run
+    # (#36 reopen) — this also warms the docker cache for the module
+    from aco.pi_agent import ensure_image
+    from aco.supervisor import image_digest
+    built_digest = image_digest(ensure_image())
     stack = start_stack(root, free_port(), free_port(), {
         "ACO_DATA_ROOT": str(root),
         "ARK_AGENT_PLAN_API_KEY": DUMMY_KEY,
@@ -119,6 +137,7 @@ def pi_stack(tmp_path_factory):
         "ARK_AGENT_PLAN_BASE_URL": f"http://host.docker.internal:{mock.port}/ark",
     })
     stack["mock"] = mock
+    stack["image_digest"] = built_digest
     yield stack
     stop_stack(stack)
     mock.close()
@@ -142,7 +161,7 @@ class TestPiExecution:
         """Claim -> pi tool call -> submit -> sealed answer + observation."""
         base = pi_stack["base"]
         trial_id = create_trial(
-            base, "write the answer file", {**PI_PROFILE}, allow_paid_run=True)
+            base, PROMPT, pi_profile(pi_stack["image_digest"]), allow_paid_run=True)
         run = wait_for_run(base, trial_id, timeout=900)  # first run builds the image
 
         assert run["status"] == "finished", run
@@ -187,7 +206,7 @@ class TestPiExecution:
         finally:
             conn.close()
 
-        profile = {**PI_PROFILE,
+        profile = {**pi_profile(pi_stack["image_digest"]),
                    "skills": [{"name": "e2e-skill", "version": "v1"}]}
         trial_id = create_trial(base, "write the answer file", profile,
                                 allow_paid_run=True)
@@ -218,7 +237,8 @@ class TestPiExecution:
         base = pi_stack["base"]
         pi_stack["mock"].scenario = "auth_fail"
         try:
-            trial_id = create_trial(base, "write the answer file", {**PI_PROFILE},
+            trial_id = create_trial(base, PROMPT,
+                                    pi_profile(pi_stack["image_digest"]),
                                     allow_paid_run=True)
             run = wait_for_run(base, trial_id, timeout=300)
         finally:
@@ -243,17 +263,78 @@ class TestPiExecution:
         assert pi_stack["mock"].requests  # the model call was attempted
 
 
+class TestEnvironmentVerification:
+    """The declared prompt/environment digests are verified against what
+    actually runs, before any container or paid call (#36 reopen): a mismatch
+    is a terminal pre-agent execution anomaly, never a capability sample."""
+
+    @staticmethod
+    def _assert_pre_agent_anomaly(root, trial_id, run, detail_fragment,
+                                  mock_requests_before, mock_requests_after):
+        assert run["status"] == "error", run  # terminal, never a sample
+        assert run["exit_kind"] == "harness_failure", run
+        assert detail_fragment in (run["exit_detail"] or "")
+        events = [phase["event"] for phase in run["phases"]]
+        assert "agent_start" not in events  # the agent never ran
+        # the module-shared mock accumulates requests across tests: no NEW
+        # model call was paid for this failed trial
+        assert mock_requests_after == mock_requests_before
+        conn = sqlite3.connect(str(root / "aco.db"))
+        conn.row_factory = sqlite3.Row
+        try:
+            answer = conn.execute(
+                "SELECT status, seal_trigger FROM sealed_answers WHERE trial_id = ?",
+                (trial_id,)).fetchone()
+            assert answer["status"] == "anomaly"
+            assert answer["seal_trigger"] == "target_failure"
+        finally:
+            conn.close()
+
+    def test_environment_digest_mismatch_fails_before_agent_start(self, pi_stack):
+        base = pi_stack["base"]
+        profile = {**pi_profile(pi_stack["image_digest"]),
+                   "environment": "sha256:" + "9" * 64}
+        before = len(pi_stack["mock"].requests)
+        trial_id = create_trial(base, PROMPT, profile, allow_paid_run=True)
+        run = wait_for_run(base, trial_id, timeout=300)
+        # the image_digest phase recorded the verified mismatch as evidence
+        digest_phases = [p for p in run["phases"] if p.get("event") == "image_digest"]
+        assert digest_phases and digest_phases[0]["requested"] != \
+            digest_phases[0]["observed"]
+        self._assert_pre_agent_anomaly(pi_stack["root"], trial_id, run,
+                                       "environment image digest mismatch",
+                                       before, len(pi_stack["mock"].requests))
+
+    def test_prompt_digest_mismatch_fails_before_agent_start(self, pi_stack):
+        base = pi_stack["base"]
+        profile = {**pi_profile(pi_stack["image_digest"]),
+                   "prompt_digest": "sha256:" + "8" * 64}
+        before = len(pi_stack["mock"].requests)
+        trial_id = create_trial(base, PROMPT, profile, allow_paid_run=True)
+        run = wait_for_run(base, trial_id, timeout=300)
+        # the prompt check precedes the image build: no image evidence either
+        assert "image_digest" not in [p["event"] for p in run["phases"]]
+        self._assert_pre_agent_anomaly(pi_stack["root"], trial_id, run,
+                                       "prompt digest mismatch",
+                                       before, len(pi_stack["mock"].requests))
+
+
 class TestPiCredentialMissing:
     def test_fails_explicitly_before_any_model_call(self, tmp_path_factory):
         mock = MockArk()
         root = tmp_path_factory.mktemp("aco-pi-e2e-nokey")
+        # this stack has no pi_stack fixture: pin the image digest locally
+        from aco.pi_agent import ensure_image
+        from aco.supervisor import image_digest
+        built_digest = image_digest(ensure_image())
         stack = start_stack(root, free_port(), free_port(), {
             "ACO_DATA_ROOT": str(root),
             # ARK_AGENT_PLAN_API_KEY deliberately absent
             "ARK_AGENT_PLAN_BASE_URL": f"http://host.docker.internal:{mock.port}/ark",
         })
         try:
-            trial_id = create_trial(stack["base"], "write the answer file", {**PI_PROFILE},
+            trial_id = create_trial(stack["base"], PROMPT,
+                                    pi_profile(built_digest),
                                     allow_paid_run=True)
             run = wait_for_run(stack["base"], trial_id, timeout=300)
         finally:
@@ -335,7 +416,8 @@ class TestNetworkIsolation:
         # hold the mock response so the trial stays open during the probes
         pi_stack["mock"].delay = 25
         try:
-            trial_id = create_trial(base, "write the answer file", {**PI_PROFILE},
+            trial_id = create_trial(base, PROMPT,
+                                    pi_profile(pi_stack["image_digest"]),
                                     allow_paid_run=True)
             # the trial's single allowlisted target, from the recorded policy
             gateway_ip = wait_phase(base, trial_id, "network_policy",
@@ -413,7 +495,8 @@ class TestNetworkIsolation:
         pi_stack["mock"].delay = 0
         pi_stack["mock"].delay_after_tool = 30
         try:
-            trial_id = create_trial(base, "write the answer file", {**PI_PROFILE},
+            trial_id = create_trial(base, PROMPT,
+                                    pi_profile(pi_stack["image_digest"]),
                                     allow_paid_run=True)
             container_id = wait_running_container(base, trial_id)
             # the trial's single allowlisted target, from the recorded policy;

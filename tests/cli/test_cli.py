@@ -50,7 +50,7 @@ def write(tmp_path, name, content):
 
 def test_register_and_run_map_args_to_payload(api, state, tmp_path, capsys):
     task_file = write(tmp_path, "task.json", {"prompt": "Do the thing", "tests": []})
-    config_file = write(tmp_path, "config.json", {"harness": "fake", "model": "fake-model"})
+    config_file = write(tmp_path, "config.json", {"harness": "fake", "model": "none"})
     assert main(["register", "task", "demo-task", "v1", task_file, "--api-url", api]) == 0
     assert main(["register", "config", "demo-cfg", "v1", config_file, "--api-url", api]) == 0
     # idempotent re-registration of identical content succeeds
@@ -74,7 +74,7 @@ def test_register_and_run_map_args_to_payload(api, state, tmp_path, capsys):
 
 def test_run_with_suite_and_idempotency_key_replays(api, state, tmp_path, capsys):
     write(tmp_path, "task.json", {"prompt": "T", "tests": []})
-    write(tmp_path, "config.json", {"harness": "fake", "model": "fake-model"})
+    write(tmp_path, "config.json", {"harness": "fake", "model": "none"})
     assert main(["register", "task", "s-task", "v1", str(tmp_path / "task.json"), "--api-url", api]) == 0
     assert main(["register", "suite", "s-suite", "v1",
                  write(tmp_path, "suite.json", {"tasks": [{"name": "s-task", "version": "v1"}]}),
@@ -101,7 +101,7 @@ def test_run_replays_from_server_after_state_file_loss(api, state, tmp_path, cap
     """#35: the server owns idempotency — losing the local ledger must not
     duplicate the batch, and the same key with a different body must conflict."""
     write(tmp_path, "task.json", {"prompt": "T", "tests": []})
-    write(tmp_path, "config.json", {"harness": "fake", "model": "fake-model"})
+    write(tmp_path, "config.json", {"harness": "fake", "model": "none"})
     assert main(["register", "task", "sl-task", "v1", str(tmp_path / "task.json"), "--api-url", api]) == 0
     assert main(["register", "config", "sl-cfg", "v1", str(tmp_path / "config.json"), "--api-url", api]) == 0
 
@@ -155,7 +155,7 @@ def test_http_error_exit_code_and_message(api, state, capsys):
 
 def test_cancel_then_resume_rejected(api, state, tmp_path, capsys):
     write(tmp_path, "t.json", {"prompt": "C", "tests": []})
-    write(tmp_path, "c.json", {"harness": "fake", "model": "fake-model"})
+    write(tmp_path, "c.json", {"harness": "fake", "model": "none"})
     main(["register", "task", "c-task", "v1", str(tmp_path / "t.json"), "--api-url", api])
     main(["register", "config", "c-cfg", "v1", str(tmp_path / "c.json"), "--api-url", api])
     main(["run", "--task", "c-task@v1", "--target", "c-cfg@v1", "--api-url", api])
@@ -178,7 +178,7 @@ def test_cancel_then_resume_rejected(api, state, tmp_path, capsys):
 
 def test_ctrl_c_stops_watcher_without_cancelling(api, state, tmp_path, capsys, monkeypatch):
     write(tmp_path, "t.json", {"prompt": "W", "tests": []})
-    write(tmp_path, "c.json", {"harness": "fake", "model": "fake-model"})
+    write(tmp_path, "c.json", {"harness": "fake", "model": "none"})
     main(["register", "task", "w-task", "v1", str(tmp_path / "t.json"), "--api-url", api])
     main(["register", "config", "w-cfg", "v1", str(tmp_path / "c.json"), "--api-url", api])
     main(["run", "--task", "w-task@v1", "--target", "w-cfg@v1", "--api-url", api])
@@ -212,7 +212,7 @@ def test_wait_json_stdout_is_single_parseable_document(api, state, tmp_path, cap
     """--wait --json: stdout carries exactly one JSON value even across polls
     and a Ctrl-C interruption; progress and the notice stay on stderr."""
     write(tmp_path, "t.json", {"prompt": "WJ", "tests": []})
-    write(tmp_path, "c.json", {"harness": "fake", "model": "fake-model"})
+    write(tmp_path, "c.json", {"harness": "fake", "model": "none"})
     main(["register", "task", "wj-task", "v1", str(tmp_path / "t.json"), "--api-url", api])
     main(["register", "config", "wj-cfg", "v1", str(tmp_path / "c.json"), "--api-url", api])
     main(["run", "--task", "wj-task@v1", "--target", "wj-cfg@v1", "--api-url", api])
@@ -245,7 +245,7 @@ def test_wait_json_terminal_output_is_single_document(api, state, tmp_path, caps
     from urllib.request import Request, urlopen
 
     write(tmp_path, "t.json", {"prompt": "WT", "tests": []})
-    write(tmp_path, "c.json", {"harness": "fake", "model": "fake-model"})
+    write(tmp_path, "c.json", {"harness": "fake", "model": "none"})
     main(["register", "task", "wt-task", "v1", str(tmp_path / "t.json"), "--api-url", api])
     main(["register", "config", "wt-cfg", "v1", str(tmp_path / "c.json"), "--api-url", api])
     main(["run", "--task", "wt-task@v1", "--target", "wt-cfg@v1", "--api-url", api,
@@ -282,7 +282,7 @@ def test_output_never_contains_credentials(api, state, capsys):
 
 def test_json_run_output_is_stable(api, state, tmp_path, capsys):
     write(tmp_path, "t.json", {"prompt": "J", "tests": []})
-    write(tmp_path, "c.json", {"harness": "fake", "model": "fake-model"})
+    write(tmp_path, "c.json", {"harness": "fake", "model": "none"})
     main(["register", "task", "j-task", "v1", str(tmp_path / "t.json"), "--api-url", api])
     main(["register", "config", "j-cfg", "v1", str(tmp_path / "c.json"), "--api-url", api])
     capsys.readouterr()  # discard human-readable register output
@@ -305,6 +305,8 @@ PI_CONFIG = {
     "provider": "ark-agent-plan",
     "provider_api_style": "openai-responses",
     "adapter_version": "0.1.0",
+    "prompt_digest": "sha256:" + "a" * 64,
+    "environment": "sha256:" + "b" * 64,
     "credentials": ["ark-agent-plan-main"],
 }
 

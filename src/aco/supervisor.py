@@ -148,12 +148,27 @@ def _validate_fake_profile(parsed: TargetProfile) -> None:
             f"fake target does not support model={parsed.model!r};"
             " the fake agent calls no model in V1"
         )
-    for field in ("provider", "thinking", "skills", "credentials"):
+    # declared-is-enforced (#36 reopen): the fake path controls none of
+    # these conditions, so a declared value would enter the fingerprint
+    # without ever taking effect — reject, never silently ignore
+    for field in ("provider", "thinking", "skills", "credentials",
+                  "harness_version", "adapter_version", "provider_api_style",
+                  "prompt_digest", "environment"):
         if getattr(parsed, field):
             raise UnsupportedTarget(
                 f"fake target does not support {field}={getattr(parsed, field)!r};"
                 " only a bare fake profile executes in V1"
             )
+    if parsed.assistance_mode != "none":
+        raise UnsupportedTarget(
+            f"fake target does not support assistance_mode="
+            f"{parsed.assistance_mode!r}; only 'none' executes in V1"
+        )
+    if parsed.resources is not None:
+        raise UnsupportedTarget(
+            f"fake target does not support resources={parsed.resources.model_dump()!r};"
+            " the fake run has no controllable execution conditions in V1"
+        )
 
 
 def translate_profile(profile: dict) -> tuple[str, int]:
@@ -181,6 +196,27 @@ def translate_profile(profile: dict) -> tuple[str, int]:
         f"unsupported harness {parsed.harness!r}: only {FAKE_HARNESS!r} and"
         f" {PI_HARNESS!r} execute in V1"
     )
+
+
+def effective_conditions(profile: dict) -> dict:
+    """The execution conditions the supervisor will actually apply to this
+    profile — materialized into every trial's request snapshot at experiment
+    creation (#36 reopen), so a trial carries the effective contract, not
+    just declared fields. Unsupported/invalid profiles raise
+    UnsupportedTarget; the API maps that to 422 before any plan exists."""
+    harness, agent_timeout_sec = translate_profile(profile)
+    parsed = parse_config_content(profile)
+    effective = {
+        "harness": harness,
+        "agent_timeout_sec": agent_timeout_sec,
+        "network_policy": "offline" if harness == FAKE_HARNESS else "allowlist",
+    }
+    if parsed.resources is not None:
+        for key in ("cpus", "memory_mb"):
+            value = getattr(parsed.resources, key)
+            if value is not None:
+                effective[key] = value
+    return effective
 
 
 def command(*args, check=True):
@@ -308,6 +344,13 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
         f"      {RUN_LABEL}: {run_id}\n"
     )
     return task_dir
+
+
+def image_digest(image_ref: str) -> str:
+    """The image's content digest (`docker inspect` RepoDigests/Id), the
+    observed half of the environment verification (#36 reopen)."""
+    result = command("docker", "image", "inspect", "--format", "{{.Id}}", image_ref)
+    return result.stdout.strip()
 
 
 def discover_container(run_id: str) -> str:
@@ -494,9 +537,26 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     image_ref = IMAGE
     agent_import_path = "aco.fake_agent:FakeAgent"
     skill_mounts: list[dict] = []
+    env_overrides: dict = {}
     if harness == PI_HARNESS:
+        parsed_profile = parse_config_content(profile)
+        # the declared prompt digest is a controlled condition (#36 reopen):
+        # the instruction the agent will run on must be exactly the bytes the
+        # profile pinned, checked before any container or paid call
+        instruction = task_content.get("prompt", "")
+        requested_prompt = parsed_profile.prompt_digest
+        observed_prompt = ("sha256:"
+                           + hashlib.sha256(instruction.encode()).hexdigest())
+        if requested_prompt != observed_prompt:
+            detail = (f"prompt digest mismatch: requested={requested_prompt}"
+                      f" observed={observed_prompt}")
+            runs.finish_run(conn, run_id, "error", runs.EXIT_HARNESS_FAILURE, detail)
+            # target_failure: the sealed_answers trigger vocabulary (0012)
+            # has no dedicated environment trigger yet (#57's 0015 adds one)
+            _fail_before_agent_start(conn, run, "target_failure", detail)
+            return
         skill_state = resolve_skill_mounts(
-            conn, parse_config_content(profile), root)
+            conn, parsed_profile, root)
         runs.add_phase(conn, run_id, "skills", skills=skill_state,
                        verified=all(s["verified"] for s in skill_state))
         if not all(s["verified"] for s in skill_state):
@@ -515,7 +575,26 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         skill_mounts = [{"name": s["name"], "host_dir": s["host_dir"]}
                         for s in skill_state]
         image_ref = await asyncio.to_thread(pi_agent.ensure_image)
+        # the declared environment digest is verified against the image that
+        # will actually run (#36 reopen): a rebuilt image with different
+        # bytes must never pass as the same controlled condition
+        observed_image = await asyncio.to_thread(image_digest, image_ref)
+        requested_image = parsed_profile.environment
+        runs.add_phase(conn, run_id, "image_digest", requested=requested_image,
+                       observed=observed_image)
+        if observed_image != requested_image:
+            detail = (f"environment image digest mismatch:"
+                      f" requested={requested_image} observed={observed_image}")
+            runs.finish_run(conn, run_id, "error", runs.EXIT_HARNESS_FAILURE, detail)
+            _fail_before_agent_start(conn, run, "target_failure", detail)
+            return
         agent_import_path = "aco.pi_agent:PiAgent"
+        # declared resources become enforced environment overrides (#36 reopen)
+        if parsed_profile.resources is not None:
+            if parsed_profile.resources.cpus is not None:
+                env_overrides["override_cpus"] = parsed_profile.resources.cpus
+            if parsed_profile.resources.memory_mb is not None:
+                env_overrides["override_memory_mb"] = parsed_profile.resources.memory_mb
         # the adapter reads these (same process): profile, db root, run id
         os.environ["ACO_TARGET_PROFILE"] = json.dumps(profile, sort_keys=True)
         os.environ["ACO_DATA_ROOT"] = str(root)
@@ -599,7 +678,8 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         trial_name=f"aco-{run_id[:12]}",
         trials_dir=trials_dir,
         agent=AgentConfig(import_path=agent_import_path),
-        environment=EnvironmentConfig(extra_docker_compose=[task_dir / "offline.yaml"]),
+        environment=EnvironmentConfig(extra_docker_compose=[task_dir / "offline.yaml"],
+                                      **env_overrides),
         # harbor scoring is disabled permanently; ACO owns all official results
         verifier=VerifierConfig(disable=True),
         artifacts=["/workspace"],

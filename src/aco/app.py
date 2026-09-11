@@ -234,6 +234,15 @@ def create_experiment(
             # materialize the full request snapshot: the normalized profile
             # (defaults included) plus its fingerprint (#36)
             profile = parse_config_content(json.loads(config_row["content"]))
+            # the effective execution contract is fixed at plan creation
+            # (#36 reopen): unsupported/invalid profiles are rejected here —
+            # before any plan, never before the paid call — and every trial
+            # carries the conditions the supervisor will actually apply
+            from .supervisor import UnsupportedTarget, effective_conditions
+            try:
+                effective = effective_conditions(json.loads(config_row["content"]))
+            except UnsupportedTarget as exc:
+                raise AppError(422, "unsupported_target", str(exc)) from exc
             fingerprint = trial_fingerprint(profile)
             for repetition in range(1, req.repetitions + 1):
                 trial_rows.append((
@@ -245,7 +254,8 @@ def create_experiment(
                     len(trial_rows) + 1,
                     fingerprint,
                     canonical({"task": {"name": task_row["name"], "version": task_row["version"]},
-                               "config": profile.model_dump(), "answer_slot": SINGLE_ANSWER_SLOT}),
+                               "config": profile.model_dump(), "effective": effective,
+                               "answer_slot": SINGLE_ANSWER_SLOT}),
                 ))
 
     requested = req.model_dump()

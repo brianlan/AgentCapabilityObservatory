@@ -158,7 +158,20 @@ def render_models_json(profile: TargetProfile, base_url: str) -> dict[str, Any]:
 
 
 def validate_profile(profile: TargetProfile) -> int:
-    """Explicit checks for the first real target; returns the agent timeout."""
+    """Explicit checks for the first real target; returns the agent timeout.
+
+    The declared-is-enforced contract (#36 reopen): every controlled field
+    this profile declares must actually take effect, and anything the pi
+    path cannot enforce is rejected before the paid call —
+    - harness_version / adapter_version: pinned and rendered into the image;
+    - prompt_digest: verified against the instruction the agent receives;
+    - environment: verified against the built image's observed digest;
+    - resources.timeout_sec: the agent timeout in task.toml;
+    - resources.cpus / memory_mb: Harbor environment overrides;
+    - resources.network: NEVER declarable — the egress policy is ACO
+      infrastructure (the fixed per-trial gateway allowlist, #38), so a
+      declared offline/online value would be an unenforced claim.
+    """
     if profile.harness_version != PI_VERSION:
         raise ValueError(f"unsupported harness_version {profile.harness_version!r}; pin {PI_VERSION!r}")
     if profile.adapter_version != ADAPTER_VERSION:
@@ -170,6 +183,19 @@ def validate_profile(profile: TargetProfile) -> int:
             f"unsupported credentials {profile.credentials!r};"
             f" exactly [{ARK_CREDENTIAL_REF!r}] is supported"
         )
+    if profile.prompt_digest is None:
+        raise ValueError(
+            "prompt_digest is required: the instruction the agent runs on"
+            " is a controlled condition verified against this digest")
+    if profile.environment is None:
+        raise ValueError(
+            "environment is required: the pinned agent image digest is a"
+            " controlled condition verified at run time")
+    if profile.resources is not None and profile.resources.network is not None:
+        raise ValueError(
+            f"unsupported resources.network {profile.resources.network!r};"
+            " the egress policy is the fixed per-trial gateway allowlist"
+            " and cannot be overridden")
     if profile.resources is not None and profile.resources.timeout_sec is not None:
         return profile.resources.timeout_sec
     return DEFAULT_AGENT_TIMEOUT_SEC
