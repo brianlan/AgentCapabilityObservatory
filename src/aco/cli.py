@@ -201,6 +201,16 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_build_agent_image(args) -> int:
+    """Pre-build the pinned pi trial image and print its immutable digest
+    (#38 reopen). Build-time npm/apt traffic only; trial runtime stays
+    restricted to Session + gateway."""
+    from .pi_agent import build_image
+    digest = build_image()
+    print(digest)
+    return 0
+
+
 def cmd_cancel(args) -> int:
     client = Client(args.api_url, token=args.token)
     _, summary = client.post(f"/v1/experiments/{args.experiment_id}/cancel")
@@ -273,6 +283,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", required=True)
     p.add_argument("--data-root", default="data")
     p.set_defaults(func=cmd_import_skill)
+
+    # operator prebuild of the pinned pi trial image (#38 reopen): runs the
+    # docker build + digest resolution outside the trial hot path
+    p = sub.add_parser("build-agent-image", parents=[common],
+                       help="预构建并固定 Pi Trial 镜像，输出不可变 digest")
+    p.set_defaults(func=cmd_build_agent_image)
     return parser
 
 

@@ -28,6 +28,9 @@ class MockArk:
         # in-run submit test submits inside it, #38)
         self.delay = 0.0
         self.delay_after_tool = 0.0
+        # override the tool-call turn's bash command (e.g. the materialized
+        # python-task test runs the workspace check script, #38 reopen)
+        self.bash_command = None
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -70,7 +73,8 @@ class MockArk:
                     call = {"type": "function_call", "id": "fc_1", "call_id": "call_1",
                             "name": "bash",
                             "arguments": json.dumps(
-                                {"command": f"printf '%s' '{ANSWER_TEXT}' > /workspace/answer.txt"})}
+                                {"command": outer.bash_command
+                                 or f"printf '%s' '{ANSWER_TEXT}' > /workspace/answer.txt"})}
                     sse({"type": "response.created", "response": {"id": "resp_1", "model": model}})
                     sse({"type": "response.output_item.added", "output_index": 0, "item": call})
                     sse({"type": "response.output_item.done", "output_index": 0, "item": call})

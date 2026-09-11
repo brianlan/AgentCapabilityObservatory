@@ -7,6 +7,7 @@ assert never leaks into the database.
 """
 
 import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -15,7 +16,7 @@ import time
 
 import pytest
 
-from mock_ark import MockArk
+from mock_ark import ANSWER_TEXT, MockArk
 from test_execution import (
     HEALTH_TIMEOUT,
     MGMT_TOKEN,
@@ -133,9 +134,8 @@ def pi_stack(tmp_path_factory):
     # build the pinned image once and read its content digest: the profile's
     # declared environment must be the digest of the image that will run
     # (#36 reopen) — this also warms the docker cache for the module
-    from aco.pi_agent import ensure_image
-    from aco.supervisor import image_digest
-    built_digest = image_digest(ensure_image())
+    from aco.pi_agent import build_image
+    built_digest = build_image()
     stack = start_stack(root, free_port(), free_port(), {
         "ACO_DATA_ROOT": str(root),
         "ARK_AGENT_PLAN_API_KEY": DUMMY_KEY,
@@ -247,6 +247,90 @@ class TestPiExecution:
         status, trial = http("GET", base + f"/v1/trials/{trial_id}")
         assert status == 200
         assert trial["runtime_observation"]["source"] == "pi_json_transcript"
+
+    def test_materialized_python_task_runs_visible_check_and_seals(self, pi_stack):
+        """A materialized Python task (#20) under the mock provider: the
+        registered environment carries a visible python check script; the
+        agent runs it with python3 inside the digest-pinned image (proving
+        the build-time python3 layer end-to-end), the check's effect lands
+        in the sealed answer, and the submission seals (#38 reopen required
+        test)."""
+        import uuid as uuid_mod
+        from aco import artifacts as aco_artifacts
+        from aco import environments as aco_env
+        from aco.verification import runner as aco_runner
+
+        base = pi_stack["base"]
+        suffix = uuid_mod.uuid4().hex[:8]
+        check_script = "import sys\nprint('PY-CHECK-OK', sys.version_info[0])\n"
+        env_src = pi_stack["root"] / f"py-env-{suffix}"
+        (env_src / "workspace").mkdir(parents=True)
+        (env_src / "workspace" / "instruction.md").write_text(PROMPT)
+        (env_src / "workspace" / "check_answer.py").write_text(check_script)
+        digest = aco_runner.bundle_digest(env_src)
+        aco_env.publish(pi_stack["root"], env_src, digest)
+        contract = aco_artifacts.ArtifactContract(required_outputs=("/workspace/answer.txt",))
+        task_content = {
+            "expected_answer": "hidden",
+            "instruction": {"asset": "environment", "path": "workspace/instruction.md"},
+            "contract": {"required_outputs": ["/workspace/answer.txt"]},
+            "contract_digest": aco_artifacts.contract_digest(contract)}
+        profile = pi_profile(pi_stack["image_digest"])
+        status, body = http("POST", base + "/v1/versions",
+                            {"kind": "task", "name": f"task-{suffix}", "version": "v1",
+                             "content": task_content,
+                             "assets": [{"name": "environment", "digest": digest}]})
+        assert status in (200, 201), body
+        status, body = http("POST", base + "/v1/versions",
+                            {"kind": "config", "name": f"cfg-{suffix}", "version": "v1",
+                             "content": profile})
+        assert status in (200, 201), body
+
+        # the mock agent runs the materialized check with python3 before
+        # writing the answer: only a working python3 in the pinned image
+        # produces both the check output and the deliverable
+        pi_stack["mock"].bash_command = (
+            "python3 /workspace/check_answer.py > /workspace/check_out.txt 2>&1"
+            f" && printf '%s' '{ANSWER_TEXT}' > /workspace/answer.txt")
+        try:
+            status, body = http("POST", base + "/v1/experiments", {
+                "task": {"name": f"task-{suffix}", "version": "v1"},
+                "targets": [{"name": f"cfg-{suffix}", "version": "v1"}],
+                "allow_paid_run": True})
+            assert status == 202, body
+            trial_id = body["trials"][0]["id"]
+            run = wait_for_run(base, trial_id, timeout=300)
+        finally:
+            pi_stack["mock"].bash_command = None
+
+        assert run["status"] == "finished", run
+        assert run["exit_kind"] == "normal", run  # the submission sealed
+        assert "image_digest" in [p["event"] for p in run["phases"]]
+
+        conn = sqlite3.connect(str(pi_stack["root"] / "aco.db"))
+        conn.row_factory = sqlite3.Row
+        try:
+            answer = conn.execute(
+                "SELECT digest, status, seal_trigger FROM sealed_answers "
+                "WHERE trial_id = ?", (trial_id,)).fetchone()
+        finally:
+            conn.close()
+        assert answer["status"] == "sealed", answer
+
+        # the visible check ran inside the container: its output (and the
+        # registered script itself, byte-identical to the asset) is in the
+        # content-addressed seal
+        answer_dir = pi_stack["root"] / "answers" / answer["digest"]
+        manifest = {entry["path"]: entry["sha256"]
+                    for entry in json.loads((answer_dir / "manifest.json").read_text())["files"]}
+        assert hashlib.sha256(check_script.encode()).hexdigest() == \
+            manifest["workspace/check_answer.py"]
+        check_out = (answer_dir / "workspace" / "check_out.txt").read_text()
+        assert "PY-CHECK-OK 3" in check_out, check_out
+        # the deliverable the check gated on is also in the seal
+        assert (answer_dir / "workspace" / "answer.txt").read_text() == ANSWER_TEXT
+        status, trial = http("GET", base + f"/v1/trials/{trial_id}")
+        assert "bash" in trial["runtime_observation"]["tool_calls"]
 
     def test_provider_auth_failure_is_an_anomaly(self, pi_stack):
         """A 401 from the provider never becomes a capability sample."""
@@ -405,9 +489,8 @@ class TestPiCredentialMissing:
         mock = MockArk()
         root = tmp_path_factory.mktemp("aco-pi-e2e-nokey")
         # this stack has no pi_stack fixture: pin the image digest locally
-        from aco.pi_agent import ensure_image
-        from aco.supervisor import image_digest
-        built_digest = image_digest(ensure_image())
+        from aco.pi_agent import build_image
+        built_digest = build_image()
         stack = start_stack(root, free_port(), free_port(), {
             "ACO_DATA_ROOT": str(root),
             # ARK_AGENT_PLAN_API_KEY deliberately absent
