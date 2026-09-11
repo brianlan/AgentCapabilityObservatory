@@ -39,14 +39,25 @@ class SkillVersionRef(BaseModel):
 
 
 class ExecutionPolicy(BaseModel):
-    """Resource / timeout / network conditions of a target (#36)."""
+    """Resource / timeout / network conditions of a target (#36 reopen).
+
+    Every declared value must be positive and bounded — a declared condition
+    is an enforced condition (supervisor applies cpus/memory_mb as Harbor
+    environment overrides, timeout_sec as the agent timeout)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    cpus: float | None = None
-    memory_mb: int | None = None
-    timeout_sec: int | None = None
+    # cpus is an integer: Harbor's EnvironmentConfig.override_cpus is an int,
+    # so a fractional declaration could never be enforced (#36 reopen)
+    cpus: int | None = Field(default=None, gt=0, le=64)
+    memory_mb: int | None = Field(default=None, gt=0, le=65536)
+    timeout_sec: int | None = Field(default=None, gt=0, le=86400)
     network: Literal["offline", "online"] | None = None
+
+
+# canonical content digest reference: prompt_digest / environment carry
+# exactly this form (#36 reopen) — never free text
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class TargetProfile(BaseModel):
@@ -73,6 +84,13 @@ class TargetProfile(BaseModel):
     resources: ExecutionPolicy | None = None
     skills: list[SkillVersionRef] = Field(default_factory=list)  # ordered
     credentials: list[str] = Field(default_factory=list)  # refs only
+
+    @field_validator("prompt_digest", "environment")
+    @classmethod
+    def _canonical_digest(cls, value: str | None) -> str | None:
+        if value is not None and not _DIGEST_RE.match(value):
+            raise ValueError("content references must be canonical digests sha256:<64 hex>")
+        return value
 
 
 def parse_config_content(content: dict) -> TargetProfile:

@@ -38,7 +38,7 @@ def register_versions(client, tasks=(), configs=(), scorers=(), suites=()):
     for name in configs:
         resp = client.post("/v1/versions", json={
             "kind": "config", "name": name, "version": "v1",
-            "content": {"harness": "opencode", "model": f"model-{name}", "credentials": []}})
+            "content": {"harness": "fake", "model": "none"}})
         assert resp.status_code == 201, resp.text
         ids[f"config:{name}"] = resp.json()["id"]
     for name in scorers:
