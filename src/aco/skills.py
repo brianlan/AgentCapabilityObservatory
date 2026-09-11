@@ -20,7 +20,7 @@ import re
 import shutil
 from pathlib import Path
 
-from .app import register_version
+from .app import AppError, register_version
 from .models import AssetRef, VersionRegistration
 
 SKILL_ENTRY = "SKILL.md"
@@ -40,6 +40,40 @@ _CREDENTIAL_PATTERNS = (
 
 class SkillImportError(ValueError):
     """A skill bundle failed import validation."""
+
+
+_BUNDLE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def validate_skill_registration(reg: VersionRegistration) -> None:
+    """Strict shared schema for every SkillVersion registration entry
+    (#39 reopen): the generic Registry API must not accept a skill record
+    the trusted import path could never produce — a malformed row would
+    crash the supervisor at resolve time or mount nothing runnable."""
+    def reject(detail: str) -> None:
+        raise AppError(422, "invalid_content", f"skill content invalid: {detail}")
+
+    if not NAME_RE.match(reg.name):
+        reject(f"name {reg.name!r} must match {NAME_RE.pattern}")
+    if not VERSION_RE.match(reg.version):
+        reject(f"version {reg.version!r} must match {VERSION_RE.pattern}")
+    content = reg.content
+    if not isinstance(content, dict) or set(content) != {"schema_version", "entry", "bundle"}:
+        reject("content must be exactly schema_version, entry, bundle")
+    if content["schema_version"] != 1 or content["entry"] != SKILL_ENTRY:
+        reject(f"schema_version must be 1 and entry must be {SKILL_ENTRY}")
+    bundle = content["bundle"]
+    if not isinstance(bundle, dict) or set(bundle) != {"digest", "bytes", "files"}:
+        reject("bundle must be exactly digest, bytes, files")
+    if not isinstance(bundle["digest"], str) or not _BUNDLE_DIGEST_RE.match(bundle["digest"]):
+        reject("bundle.digest must be 64 lowercase hex chars")
+    for size_field in ("bytes", "files"):
+        value = bundle[size_field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            reject(f"bundle.{size_field} must be a positive integer")
+    assets = reg.assets
+    if len(assets) != 1 or assets[0].name != "bundle" or assets[0].digest != bundle["digest"]:
+        reject("assets must be exactly one 'bundle' asset whose digest equals bundle.digest")
 
 
 def tree_digest(bundle: Path) -> dict:
