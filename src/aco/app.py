@@ -511,7 +511,7 @@ def create_session_app(data_root: str | None = None) -> FastAPI:
 
     from .api.session import register_session_routes
 
-    register_session_routes(app, conn)
+    register_session_routes(app, conn, root)
     return app
 
 

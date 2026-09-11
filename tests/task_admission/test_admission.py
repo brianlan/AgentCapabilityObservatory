@@ -79,7 +79,8 @@ def test_report_schema_and_gate_names(bundle, root, monkeypatch):
     patch_containers(monkeypatch, root, lambda gate, index: PASS if gate == "oracle" else FAIL)
     report = run_report(bundle, root)
     assert report["schema"] == admission.SCHEMA
-    assert set(report["gates"]) == {"static", "oracle", "nop", "cheats", "rescore", "registration"}
+    assert set(report["gates"]) == {"static", "oracle", "nop", "cheats", "rescore",
+                                    "registration", "rebuild"}
     assert set(report["digests"]) == {"verifier_bundle", "environment", "artifact_contract", "task_version"}
 
 
@@ -416,8 +417,10 @@ def test_partial_copy_failure_leaves_no_staging_or_rows(bundle, root, monkeypatc
     copy must not leave a partial .import-* directory or registered rows."""
     real_copytree = shutil.copytree
 
-    def copy_then_fail(src, dst, **kwargs):
-        real_copytree(src, dst, **kwargs)  # complete the copy...
+    def copy_then_fail(src, dst, *args, **kwargs):
+        real_copytree(src, dst, *args, **kwargs)  # complete the copy...
+        if "verifiers" not in str(dst):
+            return  # the environment publish copies cleanly; target the verifier staging
         (Path(dst) / "run.py").unlink()    # ...then simulate a mid-copy error
         raise OSError("injected disk failure mid-copy")
 
@@ -440,7 +443,9 @@ def test_staging_digest_failure_leaves_no_staging_or_rows(bundle, root, monkeypa
     real_digest = admission.runner.bundle_digest
 
     def wrong_for_staging(path):
-        if ".import-" in str(path):
+        # the environment publish stages under environments/.import-*; the
+        # regression target is the verifier staging copy only
+        if ".import-" in str(path) and "verifiers" in str(path):
             return "0" * 64  # digest check fails only for the staging copy
         return real_digest(path)
 
@@ -521,3 +526,56 @@ def test_repo_contains_only_the_synthetic_fixture():
     # the fixture is openly synthetic by its own provenance
     manifest = (FIXTURE / "task.toml").read_text()
     assert "synthetic fixture" in manifest
+
+
+def test_delete_author_source_then_rebuild_from_data_root(bundle, root, monkeypatch):
+    """Required regression (#20 reopen): after registration the author's
+    source directory can be deleted — instruction and initial workspace must
+    rebuild from the data root + registered TaskVersion alone."""
+    patch_containers(monkeypatch, root, lambda gate, index: PASS if gate == "oracle" else FAIL)
+    report = run_report(bundle, root)
+    assert report["all_passed"] is True
+
+    author_workspace = {
+        p.relative_to(bundle / "public/environment/workspace").as_posix():
+            admission._digest(p.read_bytes())
+        for p in (bundle / "public/environment/workspace").rglob("*") if p.is_file()
+    }
+    author_instruction = (bundle / "public/environment/workspace/README.md").read_text()
+    shutil.rmtree(bundle)  # the author tree is gone
+
+    conn = sqlite3.connect(root / "aco.db")
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT content, assets FROM versions WHERE id = ?",
+                       (report["digests"]["task_version"],)).fetchone()
+    conn.close()
+    from aco import environments as aco_environments
+    instruction, env_dir = aco_environments.resolve_instruction(
+        json.loads(row["content"]), json.loads(row["assets"]), root)
+    assert instruction == author_instruction
+    assert (env_dir / "workspace" / "README.md").read_text() == author_instruction
+    rebuilt = {
+        p.relative_to(env_dir / "workspace").as_posix(): admission._digest(p.read_bytes())
+        for p in (env_dir / "workspace").rglob("*") if p.is_file()
+    }
+    assert rebuilt == author_workspace
+    assert verification_runner.bundle_digest(env_dir) == report["digests"]["environment"]
+    assert report["gates"]["rebuild"]["ok"] is True
+
+
+def test_environment_store_contains_only_public_assets(bundle, root, monkeypatch):
+    """Required regression (#20 reopen): the published environment store must
+    contain no hidden asset bytes — verifier/reference/wrong-answer content
+    can never reach the materialized /workspace through the store."""
+    patch_containers(monkeypatch, root, lambda gate, index: PASS if gate == "oracle" else FAIL)
+    report = run_report(bundle, root)
+    assert report["all_passed"] is True
+
+    digest = report["digests"]["environment"]
+    store_tree = root / "environments" / digest
+    stored = {admission._digest(p.read_bytes()) for p in store_tree.rglob("*") if p.is_file()}
+    hidden = admission._hidden_digests(admission.Bundle.load(bundle))
+    assert not (stored & hidden), "hidden asset bytes inside the environment store"
+    # the store is byte-identical to the author's public environment
+    public = set(admission._tree_digests(bundle / "public/environment").values())
+    assert stored == public

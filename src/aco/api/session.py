@@ -17,10 +17,12 @@ import secrets
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from .. import environments
 from ..app import AppError, canonical
 from ..db import utcnow
 from ..models import SubmitRequest
@@ -87,7 +89,8 @@ def trial_from_token(conn: sqlite3.Connection, request: Request) -> sqlite3.Row:
     return row
 
 
-def claim_session_task(conn: sqlite3.Connection, trial: sqlite3.Row) -> dict:
+def claim_session_task(conn: sqlite3.Connection, trial: sqlite3.Row,
+                       data_root: Path) -> dict:
     now = utcnow()
     # atomic: only the first claim sets opened_at; repeats never reset it
     with conn:
@@ -100,16 +103,24 @@ def claim_session_task(conn: sqlite3.Connection, trial: sqlite3.Row) -> dict:
         (trial["id"],),
     ).fetchone()
     task = conn.execute(
-        "SELECT name, version, content FROM versions WHERE id = ?", (row["task_version_id"],)
+        "SELECT name, version, content, assets FROM versions WHERE id = ?", (row["task_version_id"],)
     ).fetchone()
     first_claim = row["opened_at"] == now
     logger.info("session_task_claimed trial_id=%s first_claim=%s", row["id"], first_claim)
-    # minimal public surface: instruction only; hidden tests/answers never leave the registry
+    # the instruction comes from its single declared source — the registered
+    # immutable public asset when the version declares one, else the version's
+    # prompt field (#20 reopen); a broken source is refused, never an empty
+    # prompt. Hidden tests/answers never leave the registry either way.
+    try:
+        instruction, _ = environments.resolve_instruction(
+            json.loads(task["content"]), json.loads(task["assets"]), data_root)
+    except environments.EnvironmentInvalid as exc:
+        raise AppError(500, "task_environment_invalid", str(exc)) from exc
     return {
         "trial_id": row["id"],
         "status": row["status"],
         "task": {"name": task["name"], "version": task["version"]},
-        "instruction": json.loads(task["content"]).get("prompt"),
+        "instruction": instruction,
         "opened_at": row["opened_at"],
     }
 
@@ -158,12 +169,12 @@ def session_submission(conn: sqlite3.Connection, trial: sqlite3.Row) -> dict:
     return {"receipt_id": row["receipt_id"], "status": row["status"], "submitted_at": row["created_at"]}
 
 
-def register_session_routes(app, conn: sqlite3.Connection) -> None:
+def register_session_routes(app, conn: sqlite3.Connection, data_root: Path) -> None:
     """The only operations an evaluated session can reach (#12)."""
 
     @app.get("/v1/session/task")
     async def get_session_task(request: Request):
-        return claim_session_task(conn, trial_from_token(conn, request))
+        return claim_session_task(conn, trial_from_token(conn, request), data_root)
 
     @app.post("/v1/session/submit", status_code=202)
     async def post_session_submit(request: Request, req: SubmitRequest):

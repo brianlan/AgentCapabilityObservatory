@@ -18,7 +18,7 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-from . import artifacts, db, lifecycle, pi_agent, runs, skills
+from . import artifacts, db, environments, lifecycle, pi_agent, runs, skills
 from .app import fetch_version
 from .models import TargetProfile, parse_config_content
 
@@ -226,9 +226,15 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
                    harness: str = FAKE_HARNESS,
                    skill_mounts: list[dict] | None = None,
                    allowed_hosts: list[str] | None = None,
-                   gateway: dict | None = None) -> Path:
+                   gateway: dict | None = None,
+                   environment_dir: Path | None = None) -> Path:
     """Minimal Harbor task dir: registry prompt as instruction, pinned image,
     compose override with our identification label.
+
+    When the task version declares a registered environment asset, its
+    verified ``workspace/`` subtree is copied into the image build context
+    and COPYed into /workspace at image build — the registered bytes are
+    materialized before any agent call (#20 reopen).
 
     The fake target stays fully offline (network_mode none). The pi target
     runs under Harbor's egress-control sidecar: task.toml declares
@@ -240,6 +246,16 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
     task_dir = work_dir / "task"
     (task_dir / "environment").mkdir(parents=True)
     (task_dir / "instruction.md").write_text(instruction)
+    # the verified environment bytes, copied per run and bind-mounted at
+    # /workspace: the registered tree is materialized before any agent call
+    # (#20 reopen). A copy — never a mount of the store itself, and no
+    # Dockerfile bake: harbor uses the prebuilt docker_image when one is
+    # declared, so a build-context COPY would be dead code.
+    workspace_mount = None
+    if environment_dir is not None:
+        materialized = task_dir / "workspace"
+        environments.materialize(environment_dir, materialized)
+        workspace_mount = f'      - "{materialized}:/workspace"\n'
     image = pi_agent.PI_IMAGE_TAG if harness == PI_HARNESS else IMAGE
     if harness == PI_HARNESS:
         hosts = ", ".join(f'"{h}"' for h in (allowed_hosts or [gateway_ip(run_id)]))
@@ -260,10 +276,15 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
         )
         subnet, ip = gateway["subnet"], gateway["ip"]
         compose = task_dir / "offline.yaml"
-        # declared skills mount read-only into the evaluated container only (#39)
+        # declared skills mount read-only into the evaluated container only (#39);
+        # the materialized environment owns /workspace (#20 reopen)
         skill_volume_lines = "".join(
             f'      - "{mount["host_dir"]}:{pi_agent._PI_CONTAINER_SKILL_ROOT}/{mount["name"]}:ro"\n'
             for mount in (skill_mounts or []))
+        main_volumes = ""
+        if workspace_mount or skill_mounts:
+            main_volumes = ("    volumes:\n" + (workspace_mount or "")
+                            + skill_volume_lines)
         compose.write_text(
             "services:\n"
             f"  {GATEWAY_SERVICE}:\n"
@@ -283,7 +304,7 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
             "    depends_on:\n"
             f"      {GATEWAY_SERVICE}:\n"
             "        condition: service_started\n"
-            + ("    volumes:\n" + skill_volume_lines if skill_volume_lines else "")
+            + main_volumes
             + "    labels:\n"
             f"      {RUN_LABEL}: {run_id}\n"
             "networks:\n"
@@ -298,13 +319,16 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
         f'schema_version = "1.4"\n[environment]\ndocker_image = "{image}"\n'
         f'network_mode = "public"\n[agent]\ntimeout_sec = {agent_timeout_sec}\n'
     )
-    (task_dir / "environment" / "Dockerfile").write_text(f"FROM {IMAGE}\n")
+    (task_dir / "environment" / "Dockerfile").write_text(
+        f"FROM {IMAGE}\n"
+        + ("COPY workspace/ /workspace/\n" if environment_dir is not None else ""))
     compose = task_dir / "offline.yaml"
     compose.write_text(
         "services:\n"
         "  main:\n"
         "    network_mode: none\n"
-        "    labels:\n"
+        + ("    volumes:\n" + workspace_mount if workspace_mount else "")
+        + "    labels:\n"
         f"      {RUN_LABEL}: {run_id}\n"
     )
     return task_dir
@@ -483,6 +507,21 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         _fail_before_agent_start(conn, run, "contract_invalid", str(exc))
         return
 
+    # resolve the instruction from its single declared source and verify the
+    # registered environment bytes against the content-addressed store before
+    # any container build or paid call — never an empty workspace/prompt
+    # fallback (#20 reopen)
+    try:
+        task_assets = json.loads(conn.execute(
+            "SELECT assets FROM versions WHERE id = ?", (trial["task_version_id"],)
+        ).fetchone()["assets"])
+        instruction, env_dir = environments.resolve_instruction(task_content, task_assets, root)
+    except environments.EnvironmentInvalid as exc:
+        runs.finish_run(conn, run_id, "error", runs.EXIT_ENVIRONMENT_INVALID,
+                        f"task environment invalid: {exc}")
+        _fail_before_agent_start(conn, run, "environment_invalid", str(exc))
+        return
+
     # fail before any side effect on unsupported profiles
     try:
         harness, agent_timeout_sec = translate_profile(profile)
@@ -556,9 +595,10 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
                        session_upstream_host=urllib.parse.urlsplit(
                            gateway["session_upstream"]).hostname,
                        enforcement="harbor-egress-sidecar", harbor_version=HARBOR_VERSION)
-    task_dir = build_task_dir(work_dir, task_content.get("prompt", ""), agent_timeout_sec,
+    task_dir = build_task_dir(work_dir, instruction, agent_timeout_sec,
                               run_id, harness=harness, skill_mounts=skill_mounts,
-                              allowed_hosts=allowed_hosts, gateway=gateway)
+                              allowed_hosts=allowed_hosts, gateway=gateway,
+                              environment_dir=env_dir)
     trials_dir = work_dir / "trials"
     container_id = None
     agent_started_at: dict | None = None

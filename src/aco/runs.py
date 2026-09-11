@@ -19,6 +19,7 @@ EXIT_TIMEOUT = "timeout"
 EXIT_SUPERVISOR_LOST = "supervisor_lost"
 EXIT_UNSUPPORTED_TARGET = "unsupported_target"
 EXIT_CONTRACT_INVALID = "contract_invalid"
+EXIT_ENVIRONMENT_INVALID = "environment_invalid"
 EXIT_CANCELLED = "cancelled"
 # execution-condition failures recorded as anomalies, never capability fails (#37)
 EXIT_PROVIDER_FAILURE = "provider_failure"
