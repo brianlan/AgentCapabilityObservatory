@@ -468,6 +468,20 @@ def tls_stack(tmp_path, monkeypatch):
     stub.close()
 
 
+def _evidence_lines(evidence_path):
+    """The success-path evidence line is written after the response streams
+    out — poll briefly instead of racing the relay thread."""
+    import time
+    for _ in range(40):
+        if evidence_path.exists():
+            entries = [json.loads(line)
+                       for line in evidence_path.read_text().splitlines()]
+            if entries:
+                return entries
+        time.sleep(0.05)
+    return []
+
+
 def test_https_upstream_dials_tls_and_streams(tls_stack):
     """An https upstream is dialed as verified TLS (CA bundle) and the
     streaming response relays back intact; SNI/Host follow the upstream
@@ -478,7 +492,7 @@ def test_https_upstream_dials_tls_and_streams(tls_stack):
     path, host = tls_stack["stub"].requests[-1]
     assert path == "/api/v3/responses"
     assert host == f"127.0.0.1:{tls_stack['stub'].port}"
-    entries = [json.loads(line) for line in tls_stack["evidence"].read_text().splitlines()]
+    entries = _evidence_lines(tls_stack["evidence"])
     assert entries[-1]["status"] == 200
 
 

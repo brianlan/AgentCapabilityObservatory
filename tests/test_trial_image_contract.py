@@ -86,6 +86,9 @@ def test_trial_start_never_builds_the_agent_image(tmp_path, conn, monkeypatch):
     prebuild is a terminal execution anomaly, not a build attempt."""
     register_pi_trial(conn)
     run = start_run(conn)
+    # this test exercises the prebuild contract, not the CI gate: CI
+    # environments (GitHub Actions sets CI=true) must not shortcut it
+    monkeypatch.delenv("CI", raising=False)
 
     def forbidden_build(*_args, **_kwargs):
         raise AssertionError("trial start must never build the agent image")
