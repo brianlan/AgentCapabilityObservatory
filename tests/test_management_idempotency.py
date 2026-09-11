@@ -21,7 +21,7 @@ from aco.app import create_management_app
 MGMT_TOKEN = "test-management-token"
 MGMT_AUTH = {"Authorization": f"Bearer {MGMT_TOKEN}"}
 TASK_CONTENT = {"prompt": "P", "tests": []}
-CONFIG_CONTENT = {"harness": "fake", "model": "fake-model"}
+CONFIG_CONTENT = {"harness": "fake", "model": "none"}
 
 
 @pytest.fixture

@@ -24,7 +24,7 @@ MGMT_OPERATIONS = [
 
 def setup_experiment(client, register, task_name="arith", config_name="cfg-a"):
     register("task", task_name, "v1", dict(TASK_CONTENT, prompt=f"task {task_name}"))
-    register("config", config_name, "v1", {"harness": "opencode", "model": "model-a"})
+    register("config", config_name, "v1", {"harness": "fake", "model": "none"})
     experiment = client.post("/v1/experiments", json={
         "task": {"name": task_name, "version": "v1"},
         "targets": [{"name": config_name, "version": "v1"}],
