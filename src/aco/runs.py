@@ -49,6 +49,43 @@ def create_run(
     return run_id
 
 
+def proc_start_tick(pid: int) -> str | None:
+    """Field 22 of /proc/<pid>/stat: the process's start time in clock ticks.
+
+    A reused PID keeps its number but not its start time, so (pid, tick)
+    identifies the exact process we launched. None if the process is gone."""
+    try:
+        stat = open(f"/proc/{pid}/stat").read()
+    except OSError:
+        return None
+    # comm (field 2) may contain spaces and parens: parse after its last ')'
+    fields = stat[stat.rindex(")") + 2:].split()
+    return fields[19]  # field 22 overall; fields[0] here is field 3 (state)
+
+
+def record_supervisor(conn: sqlite3.Connection, run_id: str, pid: int) -> str | None:
+    """Persist the spawned supervisor's verifiable identity: PID plus its
+    /proc start tick read immediately after spawn (#16 reopen)."""
+    tick = proc_start_tick(pid) if pid > 0 else None
+    conn.execute(
+        "UPDATE trial_runs SET supervisor_pid = ?, supervisor_start = ? WHERE run_id = ?",
+        (pid, tick, run_id),
+    )
+    conn.commit()
+    return tick
+
+
+def supervisor_matches(run: sqlite3.Row) -> bool:
+    """True only when the recorded (pid, start tick) still refers to a live
+    process — the process we launched. A NULL recorded tick (legacy row, or
+    the supervisor exited before the read) is unverifiable: never adopt,
+    never signal (#16 reopen)."""
+    pid = run["supervisor_pid"]
+    if pid is None or pid <= 0 or not run["supervisor_start"]:
+        return False
+    return proc_start_tick(pid) == run["supervisor_start"]
+
+
 def mark_running(
     conn: sqlite3.Connection,
     run_id: str,
