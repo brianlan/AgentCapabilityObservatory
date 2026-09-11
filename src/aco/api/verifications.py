@@ -86,8 +86,15 @@ def _conflicting_ids(rows: list[sqlite3.Row]) -> set[str]:
 
 
 def _single_out(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    # stability uses the same computation as the list: the sibling rows of
+    # this trial decide whether this verification sits in a contradictory
+    # same-version set (#15 reopened) — a single response never claims
+    # stable=true for a verdict the list would flag
+    siblings = conn.execute(
+        f"{VERIFICATION_SELECT} WHERE v.trial_id = ?", (row["trial_id"],)
+    ).fetchall()
     attempts = _attempts_by_verification(conn, row["trial_id"]).get(row["id"], [])
-    return verification_out(row, None, attempts)
+    return verification_out(row, _conflicting_ids(siblings), attempts)
 
 
 def create_verification(conn: sqlite3.Connection, trial_id: str, req: VerificationCreate) -> tuple[int, dict]:

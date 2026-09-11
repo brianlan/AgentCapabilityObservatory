@@ -481,6 +481,61 @@ class TestVerificationAPI:
         assert all(r["status"] == "queued" and r["stable"] for r in listed)
 
     @staticmethod
+    def _finish(tmp_path, verification_id, *, status, pass_value=None):
+        """Mirror the runner's terminal write for a queued job."""
+        conn = sqlite3.connect(tmp_path / "aco.db")
+        conn.execute(
+            "UPDATE verifications SET status = ?, pass = ?, finished_at = 'now' WHERE id = ?",
+            (status, pass_value, verification_id))
+        conn.commit()
+        conn.close()
+
+    def test_conflicting_verdicts_reported_by_every_read_path(self, client, tmp_path):
+        """Reopened #15 (third): after a same-version pass/fail, the POST
+        create response, the idempotent replay response, and GET list all
+        report stable=false — no read path may disagree with the
+        authoritative stability judgment for the trial."""
+        self.register_scorer(client)
+        self._make_trial(tmp_path, "t1")
+        seal_directly(tmp_path, "t1")
+        first = self.post_verification(client, "t1", key="a")
+        assert first.status_code == 202, first.text
+        assert first.json()["stable"] is True  # no verdict yet: nothing to conflict
+        self._finish(tmp_path, first.json()["id"], status="succeeded", pass_value=1)
+        second = self.post_verification(client, "t1", key="b")
+        self._finish(tmp_path, second.json()["id"], status="succeeded", pass_value=0)
+
+        # replaying either idempotency key returns the single-verification
+        # response: it must carry the same stable=false the list reports
+        for key in ("a", "b"):
+            replay = self.post_verification(client, "t1", key=key)
+            assert replay.status_code == 200, replay.text
+            assert replay.json()["stable"] is False
+
+        listed = {r["id"]: r for r in client.get("/v1/trials/t1/verifications").json()}
+        assert listed[first.json()["id"]]["stable"] is False
+        assert listed[second.json()["id"]]["stable"] is False
+
+    def test_agreeing_verdicts_and_error_rows_stay_stable(self, client, tmp_path):
+        """Reopened #15 (third): same-version pass/pass is stable, and a
+        scoring-error execution never counts as a contradictory verdict."""
+        self.register_scorer(client)
+        self._make_trial(tmp_path, "t1")
+        seal_directly(tmp_path, "t1")
+        first = self.post_verification(client, "t1", key="a")
+        self._finish(tmp_path, first.json()["id"], status="succeeded", pass_value=1)
+        second = self.post_verification(client, "t1", key="b")
+        self._finish(tmp_path, second.json()["id"], status="succeeded", pass_value=1)
+        errored = self.post_verification(client, "t1", key="c")
+        self._finish(tmp_path, errored.json()["id"], status="error", pass_value=None)
+
+        replay = self.post_verification(client, "t1", key="a")
+        assert replay.status_code == 200, replay.text
+        assert replay.json()["stable"] is True
+        listed = client.get("/v1/trials/t1/verifications").json()
+        assert all(r["stable"] for r in listed)
+
+    @staticmethod
     def _make_trial(tmp_path, trial_id):
         conn = sqlite3.connect(tmp_path / "aco.db")
         conn.execute(
@@ -600,6 +655,25 @@ class TestQuerySemantics:
         assert len(records) == 2  # nothing dropped, nothing selected
         assert by_id[v1]["stable"] is False and by_id[v2]["stable"] is False
         assert by_id[v1]["pass"] is True and by_id[v2]["pass"] is False
+
+    def test_results_bucket_matches_api_stable_flag(self, conn, trial, tmp_path):
+        """Reopened #15 (third): the results coverage bucket and the API
+        stable field are two views of the same stability judgment — a
+        contradictory same-version pair is unstable in both."""
+        from aco.api.verifications import list_verifications
+        from aco.results import collect
+
+        scorer_id = make_scorer(conn, tmp_path)
+        self._succeeded(conn, "t1", scorer_id, "a", 1)
+        self._succeeded(conn, "t1", scorer_id, "b", 0)
+        conn.execute("UPDATE experiments SET requested = ? WHERE id = 'e1'",
+                     (json.dumps({"task": {"name": "task", "version": "v1"}}),))
+        conn.execute("UPDATE trials SET fingerprint = 'fp' WHERE id = 't1'")
+        conn.commit()
+
+        point = collect(conn)["series"][0]["points"][0]
+        assert point["counts"]["unstable"] == 1
+        assert all(r["stable"] is False for r in list_verifications(conn, "t1"))
 
     def test_new_version_regrade_keeps_old_result_readable(self, conn, trial, tmp_path):
         from aco.api.verifications import list_verifications
