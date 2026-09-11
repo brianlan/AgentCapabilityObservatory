@@ -272,7 +272,7 @@ class TestEnvironmentVerification:
     def _assert_pre_agent_anomaly(root, trial_id, run, detail_fragment,
                                   mock_requests_before, mock_requests_after):
         assert run["status"] == "error", run  # terminal, never a sample
-        assert run["exit_kind"] == "harness_failure", run
+        assert run["exit_kind"] == "environment_invalid", run
         assert detail_fragment in (run["exit_detail"] or "")
         events = [phase["event"] for phase in run["phases"]]
         assert "agent_start" not in events  # the agent never ran
@@ -286,7 +286,7 @@ class TestEnvironmentVerification:
                 "SELECT status, seal_trigger FROM sealed_answers WHERE trial_id = ?",
                 (trial_id,)).fetchone()
             assert answer["status"] == "anomaly"
-            assert answer["seal_trigger"] == "target_failure"
+            assert answer["seal_trigger"] == "environment_invalid"
         finally:
             conn.close()
 

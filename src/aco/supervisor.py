@@ -578,19 +578,18 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     if harness == PI_HARNESS:
         parsed_profile = parse_config_content(profile)
         # the declared prompt digest is a controlled condition (#36 reopen):
-        # the instruction the agent will run on must be exactly the bytes the
-        # profile pinned, checked before any container or paid call
-        instruction = task_content.get("prompt", "")
+        # the resolved instruction (the exact bytes the agent will run on)
+        # must match what the profile pinned — checked before any container
+        # or paid call
         requested_prompt = parsed_profile.prompt_digest
         observed_prompt = ("sha256:"
                            + hashlib.sha256(instruction.encode()).hexdigest())
         if requested_prompt != observed_prompt:
             detail = (f"prompt digest mismatch: requested={requested_prompt}"
                       f" observed={observed_prompt}")
-            runs.finish_run(conn, run_id, "error", runs.EXIT_HARNESS_FAILURE, detail)
-            # target_failure: the sealed_answers trigger vocabulary (0012)
-            # has no dedicated environment trigger yet (#57's 0015 adds one)
-            _fail_before_agent_start(conn, run, "target_failure", detail)
+            runs.finish_run(conn, run_id, "error",
+                            runs.EXIT_ENVIRONMENT_INVALID, detail)
+            _fail_before_agent_start(conn, run, "environment_invalid", detail)
             return
         skill_state = resolve_skill_mounts(
             conn, parsed_profile, root)
@@ -622,8 +621,9 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         if observed_image != requested_image:
             detail = (f"environment image digest mismatch:"
                       f" requested={requested_image} observed={observed_image}")
-            runs.finish_run(conn, run_id, "error", runs.EXIT_HARNESS_FAILURE, detail)
-            _fail_before_agent_start(conn, run, "target_failure", detail)
+            runs.finish_run(conn, run_id, "error",
+                            runs.EXIT_ENVIRONMENT_INVALID, detail)
+            _fail_before_agent_start(conn, run, "environment_invalid", detail)
             return
         agent_import_path = "aco.pi_agent:PiAgent"
         # declared resources become enforced environment overrides (#36 reopen)
