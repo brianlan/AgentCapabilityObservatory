@@ -153,7 +153,8 @@ class TestManagerHelpers:
 
     def test_live_supervisor_run_is_left_alone(self, conn):
         insert_trial(conn)
-        run_id = runs.create_run(conn, "t1", {}, supervisor_pid=os.getpid())
+        run_id = runs.create_run(conn, "t1", {}, supervisor_pid=-1)
+        runs.record_supervisor(conn, run_id, os.getpid())  # live pid + verifiable identity
         reap_lost_supervisors(conn)
         assert runs.get_run(conn, run_id)["status"] == "launching"
 

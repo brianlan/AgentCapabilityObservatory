@@ -138,8 +138,11 @@ class TestCancel:
         monkeypatch.setattr(supervisor, "cleanup_container", lambda run_id: cleanups.append(run_id))
         runs.create_run(conn, "t1", {}, supervisor_pid=-1)
         child = subprocess.Popen(["sleep", "30"])
+        run_id = runs.list_runs(conn, "t1")[0]["run_id"]
         try:
-            conn.execute("UPDATE trial_runs SET supervisor_pid = ?, status = 'running'", (child.pid,))
+            # verifiable identity: cancel may only signal the process it launched
+            runs.record_supervisor(conn, run_id, child.pid)
+            conn.execute("UPDATE trial_runs SET status = 'running' WHERE run_id = ?", (run_id,))
             conn.execute("UPDATE trials SET status = 'claimed' WHERE id = 't1'")
             conn.commit()
             resp = client.post("/v1/experiments/e1/cancel")
@@ -199,7 +202,8 @@ class TestRestart:
     def test_attempted_trial_survives_restart_without_rerun(self, conn):
         """Claimed + active run: adopted, never reset, never re-claimed (#16)."""
         make_experiment(conn, n_trials=1)
-        run_id = runs.create_run(conn, "t1", {}, supervisor_pid=os.getpid())  # live pid
+        run_id = runs.create_run(conn, "t1", {}, supervisor_pid=-1)
+        runs.record_supervisor(conn, run_id, os.getpid())  # live pid + verifiable identity
         conn.execute("UPDATE trials SET status = 'claimed' WHERE id = 't1'")
         conn.commit()
         adopted = lifecycle.adopt_live_supervisors(conn)

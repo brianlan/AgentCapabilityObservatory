@@ -10,6 +10,7 @@ import argparse
 import fcntl
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -17,10 +18,26 @@ import urllib.request
 from pathlib import Path
 
 from . import artifacts, db, lifecycle, runs, verification
-from .supervisor import cleanup_container
+from .supervisor import TRIAL_GRACE_SEC, cleanup_container, translate_profile
 
 POLL_INTERVAL_SEC = 1.0
-SUPERVISOR_TIMEOUT_SEC = 300  # generous ceiling; the supervisor enforces its own shorter one
+SUPERVISOR_TIMEOUT_SEC = 300  # fallback ceiling for profiles that cannot be translated
+# headroom above the supervisor's own trial ceiling for cold image pulls,
+# harness and gateway startup (#16 reopen): the manager watchdog must never
+# be the reason a slow-but-healthy preparation dies mid-pull
+PREP_GRACE_SEC = 180
+
+
+def supervisor_watchdog_sec(profile: dict) -> int:
+    """Manager watchdog derived from the effective trial timeout (#16 reopen):
+    the supervisor enforces agent timeout + TRIAL_GRACE itself; the manager
+    waits that out plus the prep allowance. Untranslatable profiles keep the
+    legacy ceiling — the supervisor fails them explicitly on its own."""
+    try:
+        _, agent_timeout_sec = translate_profile(profile)
+    except Exception:  # noqa: BLE001 — any unusable profile falls back
+        return SUPERVISOR_TIMEOUT_SEC
+    return agent_timeout_sec + TRIAL_GRACE_SEC + PREP_GRACE_SEC
 
 
 def mint_token(api_url: str, trial_id: str, token: str) -> str | None:
@@ -72,31 +89,49 @@ def recover_stale_claims(conn) -> None:
     conn.commit()
 
 
+def _terminalize_lost_run(conn, run: sqlite3.Row, trigger: str, detail: str) -> None:
+    """One funnel for every manager-side supervisor loss (#16 reopen):
+    watchdog kill, abnormal exit, lost supervisor, PID-reuse detection.
+    Records the run outcome, cleans only our labelled container, leaves an
+    execution-condition anomaly when no answer exists, and moves the trial
+    through finish_trial — sealed stays sealed (ADR 0003), the Experiment
+    becomes completable, and the trial can never be re-claimed."""
+    runs.add_phase(conn, run["run_id"], "supervisor_lost", pid=run["supervisor_pid"],
+                   trigger=trigger)
+    runs.finish_run(conn, run["run_id"], "error", runs.EXIT_SUPERVISOR_LOST, detail)
+    cleanup_container(run["run_id"])
+    artifacts.mark_anomaly(conn, run["trial_id"], run["run_id"], detail, trigger=trigger)
+    # the outcome follows the answer row, not the supervisor's death: a
+    # seal recovered from disk truth stays officially sealed (ADR 0003)
+    answer = conn.execute(
+        "SELECT status FROM sealed_answers WHERE trial_id = ?", (run["trial_id"],)
+    ).fetchone()
+    outcome = answer["status"] if answer is not None and answer["status"] in ("sealed", "anomaly") else "anomaly"
+    lifecycle.finish_trial(conn, run["trial_id"], trigger, outcome,
+                           run_id=run["run_id"], detail=detail)
+
+
 def reap_lost_supervisors(conn) -> None:
     """Supervisor died without recording an outcome: keep the intent, record
     the loss, clean up only containers carrying our label, and terminal the
     trial as an execution-condition anomaly — never a rerun, never a
-    capability sample."""
+    capability sample.
+
+    Identity-aware (#16 reopen): a run is only considered alive when its
+    recorded (pid, start tick) still matches /proc. A vanished process, a
+    reused PID, or an unverifiable identity all mean our supervisor is gone
+    — the run is terminalized with an explainable anomaly instead of
+    lingering forever; the process at a reused PID is never touched."""
     for run in runs.unfinished_runs(conn):
-        pid = run["supervisor_pid"]
-        if os.path.exists(f"/proc/{pid}"):
+        if runs.supervisor_matches(run):
             continue
-        runs.add_phase(conn, run["run_id"], "supervisor_lost", pid=pid)
-        runs.finish_run(conn, run["run_id"], "error", runs.EXIT_SUPERVISOR_LOST,
-                        f"supervisor pid {pid} disappeared without recording an outcome")
-        cleanup_container(run["run_id"])
-        artifacts.mark_anomaly(conn, run["trial_id"], run["run_id"],
-                               f"supervisor pid {pid} disappeared without recording an outcome",
-                               trigger="supervisor_lost")
-        # the outcome follows the answer row, not the supervisor's death: a
-        # seal recovered from disk truth stays officially sealed (ADR 0003)
-        answer = conn.execute(
-            "SELECT status FROM sealed_answers WHERE trial_id = ?", (run["trial_id"],)
-        ).fetchone()
-        outcome = answer["status"] if answer is not None and answer["status"] in ("sealed", "anomaly") else "anomaly"
-        lifecycle.finish_trial(conn, run["trial_id"], "supervisor_lost", outcome,
-                               run_id=run["run_id"],
-                               detail=f"supervisor pid {pid} lost")
+        pid = run["supervisor_pid"]
+        detail = (f"supervisor pid {pid} disappeared without recording an outcome"
+                  if runs.proc_start_tick(pid) is None
+                  else f"supervisor pid {pid} no longer matches the recorded process identity")
+        runs.add_phase(conn, run["run_id"], "supervisor_unverified",
+                       pid=pid, recorded_start=run["supervisor_start"])
+        _terminalize_lost_run(conn, run, "supervisor_lost", detail)
 
 
 def run_one(conn, root: Path, api_url: str, api_token: str, session_api_url: str) -> bool:
@@ -111,8 +146,16 @@ def run_one(conn, root: Path, api_url: str, api_token: str, session_api_url: str
     ).fetchone()["content"])
     token = mint_token(api_url, trial_id, api_token)
     if token is None:
-        # API unreachable or trial not runnable: unclaim and retry on a later poll
-        conn.execute("UPDATE trials SET status = 'planned' WHERE id = ?", (trial_id,))
+        # API unreachable or trial not runnable: unclaim and retry on a later
+        # poll — but never resurrect a terminal state a concurrent cancel
+        # already won (#16 reopen): only still-claimed trials of still-active
+        # experiments may return to planned
+        conn.execute(
+            "UPDATE trials SET status = 'planned' WHERE id = ? AND status = 'claimed'"
+            " AND experiment_id IN (SELECT id FROM experiments"
+            "                        WHERE status IN ('planned', 'running'))",
+            (trial_id,),
+        )
         conn.commit()
         return False
 
@@ -122,33 +165,47 @@ def run_one(conn, root: Path, api_url: str, api_token: str, session_api_url: str
     run_id = runs.create_run(conn, trial_id, profile, supervisor_pid=-1)
     supervisor_log = (root / "runs" / run_id / "supervisor.log")
     supervisor_log.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "aco.supervisor", "--run-id", run_id, "--data-root", str(root)],
-        env={
-            **os.environ,
-            # supervisors and their agents speak only to the Session surface;
-            # the management surface stays out of the evaluated path (ADR 0001)
-            "ACO_BASE_URL": session_api_url,
-            "ACO_SESSION_TOKEN": token,
-        },
-        stdout=subprocess.DEVNULL,
-        stderr=open(supervisor_log, "w"),
-    )
-    conn.execute("UPDATE trial_runs SET supervisor_pid = ? WHERE run_id = ?", (proc.pid, run_id))
-    conn.commit()
+    log_fh = open(supervisor_log, "w")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "aco.supervisor", "--run-id", run_id, "--data-root", str(root)],
+            env={
+                **os.environ,
+                # supervisors and their agents speak only to the Session surface;
+                # the management surface stays out of the evaluated path (ADR 0001)
+                "ACO_BASE_URL": session_api_url,
+                "ACO_SESSION_TOKEN": token,
+            },
+            stdout=subprocess.DEVNULL,
+            stderr=log_fh,
+        )
+    except Exception as exc:  # noqa: BLE001 — Popen failure must leave a terminal state
+        run = runs.get_run(conn, run_id)
+        _terminalize_lost_run(conn, run, "supervisor_crash",
+                              f"supervisor could not be spawned: {type(exc).__name__}: {exc}")
+        return True
+    finally:
+        # the child owns its dup; the parent handle would leak one fd per trial
+        log_fh.close()
+    runs.record_supervisor(conn, run_id, proc.pid)
 
-    deadline = time.monotonic() + SUPERVISOR_TIMEOUT_SEC
+    deadline = time.monotonic() + supervisor_watchdog_sec(profile)
     while proc.poll() is None and time.monotonic() < deadline:
         time.sleep(0.2)
+    killed = False
     if proc.poll() is None:
         proc.kill()
         proc.wait()
-    if runs.get_run(conn, run_id)["status"] in ("launching", "running"):
-        runs.add_phase(conn, run_id, "supervisor_lost", pid=proc.pid,
-                       exit_code=proc.returncode)
-        runs.finish_run(conn, run_id, "error", runs.EXIT_SUPERVISOR_LOST,
-                        f"supervisor pid {proc.pid} exited without recording an outcome")
-        cleanup_container(run_id)
+        killed = True
+    run = runs.get_run(conn, run_id)
+    if run["status"] in ("launching", "running"):
+        # supervisor exited (or was killed) without recording an outcome:
+        # the same funnel as every other manager-side loss (#16 reopen)
+        detail = (f"supervisor pid {proc.pid} exceeded the manager watchdog and was killed"
+                  if killed else
+                  f"supervisor pid {proc.pid} exited without recording an outcome"
+                  f" (exit code {proc.returncode})")
+        _terminalize_lost_run(conn, run, "supervisor_lost", detail)
     return True
 
 
