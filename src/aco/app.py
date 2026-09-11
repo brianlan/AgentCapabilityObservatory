@@ -66,7 +66,7 @@ def version_digest(kind: str, name: str, version: str, content: dict, assets: li
 def trial_fingerprint(profile: TargetProfile) -> str:
     """Content fingerprint over the normalized TargetProfile (#36): any
     change to a controlled condition — model, thinking, harness/adapter
-    versions, prompt, skills, environment, execution policy, assistance
+    versions, skills, environment, execution policy, assistance
     mode — yields a different fingerprint and a different comparable
     result series."""
     return hashlib.sha256(canonical(profile.model_dump()).encode()).hexdigest()

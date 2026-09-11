@@ -23,6 +23,7 @@ def runner_bundle_digest(bundle_dir):
     return verification_runner.bundle_digest(bundle_dir)
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "tasks" / "synthetic-add"
+FIXTURE_COPY_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc")
 PASS = {"status": "succeeded", "pass": True}
 FAIL = {"status": "succeeded", "pass": False}
 
@@ -31,7 +32,7 @@ FAIL = {"status": "succeeded", "pass": False}
 def bundle(tmp_path) -> Path:
     """A writable copy of the committed synthetic fixture."""
     target = tmp_path / "bundle"
-    shutil.copytree(FIXTURE, target)
+    shutil.copytree(FIXTURE, target, ignore=FIXTURE_COPY_IGNORE)
     for p in target.rglob("*"):
         p.chmod(0o755 if p.is_dir() else 0o644)  # copytree keeps read-only modes
     return target
@@ -219,7 +220,7 @@ def test_hidden_asset_in_image_layers_fails_static(bundle, root, monkeypatch):
 
 def test_missing_verifier_bundle_fails_load(tmp_path):
     broken = tmp_path / "bundle"
-    shutil.copytree(FIXTURE, broken)
+    shutil.copytree(FIXTURE, broken, ignore=FIXTURE_COPY_IGNORE)
     shutil.rmtree(broken / "private/verifier")
     with pytest.raises(AdmissionError, match="missing directory"):
         admission.Bundle.load(broken)

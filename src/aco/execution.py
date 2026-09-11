@@ -17,9 +17,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-from . import artifacts, db, lifecycle, pi_agent, runs, verification
-from .supervisor import (PI_HARNESS, TRIAL_GRACE_SEC, cleanup_container,
-                         translate_profile)
+from . import artifacts, db, lifecycle, runs, verification
+from .supervisor import TRIAL_GRACE_SEC, cleanup_container, translate_profile
 
 POLL_INTERVAL_SEC = 1.0
 SUPERVISOR_TIMEOUT_SEC = 300  # fallback ceiling for profiles that cannot be translated
@@ -165,26 +164,6 @@ def run_one(conn, root: Path, api_url: str, api_token: str, session_api_url: str
     # ever matters.
     run_id = runs.create_run(conn, trial_id, profile, supervisor_pid=-1)
 
-    # pi trials prebuild their pinned image here — before any watchdog or
-    # supervisor exists (#38 reopen): a trial start never builds, installs,
-    # or touches a registry. Failure is terminal (execution anomaly), never
-    # a silent retry loop.
-    try:
-        is_pi = translate_profile(profile)[0] == PI_HARNESS
-    except Exception:  # noqa: BLE001 — the supervisor owns profile rejection paths
-        is_pi = False
-    if is_pi:
-        try:
-            pi_agent.build_image()
-        except Exception as exc:  # noqa: BLE001 — prebuild failure is terminal
-            detail = f"agent image prebuild failed: {exc}"
-            runs.finish_run(conn, run_id, "error", runs.EXIT_ENVIRONMENT_INVALID, detail)
-            artifacts.mark_anomaly(conn, trial_id, run_id, detail,
-                                   trigger="environment_invalid")
-            lifecycle.finish_trial(conn, trial_id, "environment_invalid", "anomaly",
-                                   run_id=run_id, detail=detail)
-            return True
-
     supervisor_log = (root / "runs" / run_id / "supervisor.log")
     supervisor_log.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(supervisor_log, "w")
@@ -268,6 +247,7 @@ def startup_recovery(conn, root: Path) -> None:
     artifacts.recover(conn, root)
     reap_lost_supervisors(conn)
     reconcile_terminal_trials(conn)
+    verification.reconcile_default_verifications(conn)
     lifecycle.adopt_live_supervisors(conn)  # surviving supervisors keep running, never rerun (#16)
     verification.requeue_stuck_running(conn)  # scoring has no side effects; requeue is safe (#16)
     lifecycle.pause_unstarted_on_restart(conn)  # unstarted plans wait for explicit resume (#16)

@@ -17,6 +17,7 @@ import pytest
 from aco import admission, db
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "tasks" / "synthetic-add"
+FIXTURE_COPY_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc")
 
 
 def docker_available() -> bool:
@@ -31,7 +32,7 @@ pytestmark = pytest.mark.skipif(not docker_available(), reason="docker daemon no
 @pytest.fixture()
 def bundle(tmp_path) -> Path:
     target = tmp_path / "bundle"
-    shutil.copytree(FIXTURE, target)
+    shutil.copytree(FIXTURE, target, ignore=FIXTURE_COPY_IGNORE)
     for p in target.rglob("*"):
         p.chmod(0o755 if p.is_dir() else 0o644)
     return target
@@ -59,12 +60,17 @@ def test_full_admission_of_synthetic_fixture(bundle, tmp_path):
     conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT kind, name, version FROM versions ORDER BY kind").fetchall()
     scorer = conn.execute("SELECT id, assets FROM versions WHERE kind = 'scorer'").fetchone()
+    task = conn.execute("SELECT content FROM versions WHERE kind = 'task'").fetchone()
     conn.close()
     assert [tuple(r) for r in rows] == [("scorer", "synthetic-add-verifier", "v1"), ("task", "synthetic-add", "v1")]
 
     # the verifier bundle is imported where the normal scoring path loads it,
     # with a digest matching the registered asset (runtime usability)
     declared = [a["digest"] for a in json.loads(scorer["assets"]) if a["name"] == "bundle"]
+    task_content = json.loads(task["content"])
+    assert task_content["default_scorer"] == {
+        "name": "synthetic-add-verifier", "version": "v1"
+    }
     bundle_dir = root / "verifiers" / scorer["id"]
     assert bundle_dir.is_dir()
     assert admission.runner.bundle_digest(bundle_dir) == declared[0]

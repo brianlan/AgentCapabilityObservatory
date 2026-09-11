@@ -6,6 +6,19 @@ network, and a fresh private output directory. Every execution, error, and
 result appends a verifications row — never an overwrite.
 """
 
-from .runner import bundle_digest, claim_next_queued, execute_verification, requeue_stuck_running, run_pending
+from .runner import (
+    bundle_digest,
+    claim_next_queued,
+    default_verification_progress,
+    enqueue_default_verification,
+    execute_verification,
+    reconcile_default_verifications,
+    requeue_stuck_running,
+    run_pending,
+)
 
-__all__ = ["bundle_digest", "claim_next_queued", "execute_verification", "requeue_stuck_running", "run_pending"]
+__all__ = [
+    "bundle_digest", "claim_next_queued", "default_verification_progress",
+    "enqueue_default_verification", "execute_verification",
+    "reconcile_default_verifications", "requeue_stuck_running", "run_pending",
+]

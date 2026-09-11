@@ -147,7 +147,6 @@ PI_PROFILE_CONTENT = {
     "provider": "ark-agent-plan",
     "provider_api_style": "openai-responses",
     "adapter_version": "0.1.0",
-    "prompt_digest": "sha256:" + "a" * 64,
     "environment": "sha256:" + "b" * 64,
     "credentials": ["ark-agent-plan-main"],
 }
@@ -188,3 +187,25 @@ def test_version_get_returns_registered_content(client, register):
     assert resp.status_code == 200, resp.text
     assert resp.json()["content"]["harness"] == "pi"
     assert client.get("/v1/versions/config/missing/v1").status_code == 404
+
+
+def test_suite_with_different_tasks_reuses_one_target_fingerprint(client, register):
+    """A target describes shared execution conditions, so task instructions
+    do not make one Pi target unusable for a suite."""
+    setup_registry(register, ["task-one", "task-two"], [])
+    register("config", "pi-cfg", "v1", dict(PI_PROFILE_CONTENT,
+                                              environment="sha256:" + "b" * 64))
+    register("suite", "pack", "v1", {
+        "tasks": [{"name": "task-one", "version": "v1"},
+                   {"name": "task-two", "version": "v1"}],
+    })
+    response = client.post("/v1/experiments", json={
+        "suite": {"name": "pack", "version": "v1"},
+        "targets": [{"name": "pi-cfg", "version": "v1"}],
+        "allow_paid_run": True,
+    })
+
+    assert response.status_code == 202, response.text
+    trials = response.json()["trials"]
+    assert [trial["task"]["name"] for trial in trials] == ["task-one", "task-two"]
+    assert len({trial["fingerprint"] for trial in trials}) == 1

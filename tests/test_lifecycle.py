@@ -556,7 +556,14 @@ class TestProgress:
         body = client.get("/v1/experiments/e1").json()
         assert body["progress"] == {"planned": 0, "claimed": 1, "running": 0,
                                     "cancelled": 1, "sealed": 1, "anomaly": 0,
-                                    "attempted": 1}  # t1 cancelled pre-launch: never attempted
+                                    "attempted": 1,
+                                    "verification_required": 0,
+                                    "verification_terminal": 0,
+                                    "verification_pending": 0,
+                                    "verification_succeeded": 0,
+                                    "verification_errors": 0}
+        # t1 cancelled pre-launch: never attempted; this legacy synthetic task
+        # has no default scorer and therefore has no scoring work to wait for
 
 
 class TestEvents:

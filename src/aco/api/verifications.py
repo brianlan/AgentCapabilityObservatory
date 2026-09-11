@@ -97,7 +97,23 @@ def _single_out(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     return verification_out(row, _conflicting_ids(siblings), attempts)
 
 
-def create_verification(conn: sqlite3.Connection, trial_id: str, req: VerificationCreate) -> tuple[int, dict]:
+def create_verification(conn: sqlite3.Connection, trial_id: str, req: VerificationCreate,
+                        *, commit: bool = True, internal: bool = False) -> tuple[int, dict]:
+    """Queue one verification through the public/manual scoring path.
+
+    ``commit=False`` is used by the trusted seal transaction so the initial
+    request and terminal Trial state commit together; the API keeps its
+    existing committing behavior by default. The trusted lifecycle passes
+    ``internal=True`` for its reserved ``initial:`` identity; manual callers
+    may only use ordinary idempotency keys.
+    """
+    if not internal:
+        from ..verification.runner import INITIAL_VERIFICATION_PREFIX
+        if req.idempotency_key.startswith(INITIAL_VERIFICATION_PREFIX):
+            raise AppError(
+                422, "reserved_idempotency_key",
+                "idempotency keys beginning with 'initial:' are reserved for automatic scoring",
+            )
     if conn.execute("SELECT 1 FROM trials WHERE id = ?", (trial_id,)).fetchone() is None:
         raise AppError(404, "not_found", f"trial {trial_id} does not exist")
 
@@ -132,14 +148,21 @@ def create_verification(conn: sqlite3.Connection, trial_id: str, req: Verificati
         raise AppError(409, "idempotency_conflict", "same idempotency key with different payload")
 
     verification_id = uuid.uuid4().hex
+
+    def insert() -> None:
+        conn.execute(
+            "INSERT INTO verifications (id, trial_id, idempotency_key, request_digest,"
+            " scorer_version_id, status, created_at) VALUES (?, ?, ?, ?, ?, 'queued', ?)",
+            (verification_id, trial_id, req.idempotency_key, request_digest,
+             scorer["id"], utcnow()),
+        )
+
     try:
-        with conn:
-            conn.execute(
-                "INSERT INTO verifications (id, trial_id, idempotency_key, request_digest,"
-                " scorer_version_id, status, created_at) VALUES (?, ?, ?, ?, ?, 'queued', ?)",
-                (verification_id, trial_id, req.idempotency_key, request_digest,
-                 scorer["id"], utcnow()),
-            )
+        if commit:
+            with conn:
+                insert()
+        else:
+            insert()
     except sqlite3.IntegrityError:
         # multi-worker race on UNIQUE(trial_id, idempotency_key)
         existing = conn.execute(

@@ -37,7 +37,6 @@ PI_PROFILE = {
     "provider": ARK_PROVIDER,
     "provider_api_style": "openai-responses",
     "adapter_version": "0.1.0",
-    "prompt_digest": "sha256:" + "a" * 64,
     "environment": "sha256:" + "b" * 64,
     "credentials": ["ark-agent-plan-main"],
 }
@@ -86,11 +85,9 @@ class TestValidateProfile:
             resources=ExecutionPolicy(timeout_sec=77))) == 77
 
     def test_declared_conditions_are_required_or_rejected(self):
-        # the declared-is-enforced contract (#36 reopen): the instruction
-        # digest and the image digest are required — a profile without them
-        # could not be verified against what actually runs
-        with pytest.raises(ValueError, match="prompt_digest"):
-            validate_profile(_TargetProfile(prompt_digest=None))
+        # TaskVersion owns the instruction; historical prompt_digest values
+        # are accepted but do not affect target validation or fingerprints.
+        validate_profile(_TargetProfile(prompt_digest=None))
         with pytest.raises(ValueError, match="environment"):
             validate_profile(_TargetProfile(environment=None))
         # and a declared network policy is never enforceable on pi: the

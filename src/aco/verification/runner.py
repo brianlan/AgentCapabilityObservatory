@@ -23,13 +23,126 @@ from pathlib import Path
 
 from .. import artifacts
 from ..db import utcnow
-from ..models import ScorerContent
+from ..models import ScorerContent, VerificationCreate
 
 # ponytail: fixed ceiling for the whole container run; tune when a real
 # verifier needs longer than the deterministic fixture.
 VERIFIER_TIMEOUT_SEC = 60
 
 RESULT_FILE = "result.json"
+INITIAL_VERIFICATION_PREFIX = "initial:"
+
+
+def _default_scorer(conn: sqlite3.Connection, trial_id: str) -> sqlite3.Row | None:
+    """Return the registered default scorer declared by a TaskVersion.
+
+    The reference is part of the immutable task content. A malformed or
+    missing reference is treated like a legacy task with no automatic score;
+    admission-created tasks always carry a validated reference.
+    """
+    row = conn.execute(
+        "SELECT tv.content FROM trials t JOIN versions tv ON tv.id = t.task_version_id"
+        " WHERE t.id = ?", (trial_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        content = json.loads(row["content"])
+        ref = content.get("default_scorer") if isinstance(content, dict) else None
+        if not isinstance(ref, dict) or not isinstance(ref.get("name"), str) \
+                or not isinstance(ref.get("version"), str):
+            return None
+        scorer = conn.execute(
+            "SELECT * FROM versions WHERE kind = 'scorer' AND name = ? AND version = ?",
+            (ref["name"], ref["version"]),
+        ).fetchone()
+        if scorer is None:
+            return None
+        ScorerContent.model_validate(json.loads(scorer["content"]))
+        return scorer
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def enqueue_default_verification(conn: sqlite3.Connection, trial_id: str) -> str | None:
+    """Idempotently queue the first score for a sealed trial.
+
+    The insert deliberately does not commit: callers such as
+    ``lifecycle.finish_trial`` include it in the same transaction as the
+    terminal trial state, closing the seal-to-queue crash window.
+    """
+    sealed = conn.execute(
+        "SELECT status, digest FROM sealed_answers WHERE trial_id = ?", (trial_id,)
+    ).fetchone()
+    trial = conn.execute("SELECT status FROM trials WHERE id = ?", (trial_id,)).fetchone()
+    if (sealed is None or sealed["status"] != "sealed" or not sealed["digest"]
+            or trial is None or trial["status"] != "sealed"):
+        return None
+    scorer = _default_scorer(conn, trial_id)
+    if scorer is None:
+        return None
+    key = f"{INITIAL_VERIFICATION_PREFIX}{scorer['id']}"
+    # Reuse the manual/versioned scoring path. It accepts ``commit=False`` so
+    # this initial request stays atomic with lifecycle.finish_trial.
+    from ..api.verifications import create_verification
+    status, record = create_verification(
+        conn, trial_id,
+        VerificationCreate(verifier={"name": scorer["name"], "version": scorer["version"]},
+                           idempotency_key=key),
+        commit=False,
+        internal=True,
+    )
+    # A 200 means the deterministic initial row already existed; only a new
+    # 202 insert counts as newly queued work for reconciliation.
+    return record["id"] if status == 202 else None
+
+
+def reconcile_default_verifications(conn: sqlite3.Connection) -> int:
+    """Recover queued initial scores after a manager or supervisor crash."""
+    count = 0
+    rows = conn.execute(
+        "SELECT t.id FROM trials t JOIN sealed_answers s ON s.trial_id = t.id"
+        " WHERE t.status = 'sealed' AND s.status = 'sealed'"
+    ).fetchall()
+    for row in rows:
+        if enqueue_default_verification(conn, row["id"]):
+            count += 1
+    conn.commit()
+    return count
+
+
+def default_verification_progress(conn: sqlite3.Connection, experiment_id: str) -> dict[str, int]:
+    """Return required/terminal initial-score counts for one Experiment."""
+    required = terminal = succeeded = errors = 0
+    rows = conn.execute(
+        "SELECT t.id FROM trials t JOIN sealed_answers s ON s.trial_id = t.id"
+        " WHERE t.experiment_id = ? AND t.status = 'sealed' AND s.status = 'sealed'",
+        (experiment_id,),
+    ).fetchall()
+    for row in rows:
+        scorer = _default_scorer(conn, row["id"])
+        if scorer is None:
+            continue
+        required += 1
+        verification = conn.execute(
+            "SELECT status FROM verifications"
+            " WHERE trial_id = ? AND idempotency_key = ? AND scorer_version_id = ?",
+            (row["id"], f"{INITIAL_VERIFICATION_PREFIX}{scorer['id']}", scorer["id"]),
+        ).fetchone()
+        if verification is None or verification["status"] in ("queued", "running"):
+            continue
+        terminal += 1
+        if verification["status"] == "succeeded":
+            succeeded += 1
+        elif verification["status"] == "error":
+            errors += 1
+    return {
+        "verification_required": required,
+        "verification_terminal": terminal,
+        "verification_pending": required - terminal,
+        "verification_succeeded": succeeded,
+        "verification_errors": errors,
+    }
 
 
 def bundle_digest(bundle_dir: Path) -> str:

@@ -25,7 +25,6 @@ PI_PROFILE = {
     "provider_api_style": "openai-responses",
     "adapter_version": "0.1.0",
     "assistance_mode": "none",
-    "prompt_digest": "sha256:" + "0" * 64,
     "environment": "sha256:" + "1" * 64,
     "resources": {"cpus": 2, "memory_mb": 4096, "timeout_sec": 600},
     "skills": [{"name": "pdf", "version": "v2"}, {"name": "search", "version": "v1"}],
@@ -66,7 +65,7 @@ class TestTargetProfileSchema:
             "schema_version": 1, "harness": "fake", "harness_version": None,
             "model": "none", "thinking": None, "provider": None,
             "provider_api_style": None, "adapter_version": None,
-            "assistance_mode": "none", "prompt_digest": None, "environment": None,
+            "assistance_mode": "none", "environment": None,
             "resources": None, "skills": [], "credentials": [],
         }
         assert len(trial["fingerprint"]) == 64
@@ -123,12 +122,9 @@ class TestTargetProfileSchema:
                  expect=(422,))
 
     def test_content_references_must_be_canonical_digests(self, register):
-        # prompt_digest / environment carry exactly sha256:<64 hex> (#36
-        # reopen): free text, tags, or registry refs cannot be verified
-        # against what actually runs
-        for field, bad in (("prompt_digest", "please-behave"),
-                           ("prompt_digest", "registry.local/x@sha256:" + "0" * 64),
-                           ("environment", "aco-pi-agent:0.84.1"),
+        # environment carries exactly sha256:<64 hex> (#36 reopen): free
+        # text or tags cannot be verified against what actually runs
+        for field, bad in (("environment", "aco-pi-agent:0.84.1"),
                            ("environment", "sha256:xyz")):
             resp = register("config", "bad-digest", "v1",
                             dict(PI_PROFILE, **{field: bad}), expect=(422,))
@@ -156,7 +152,6 @@ class TestTargetProfileSchema:
         # a field the run path cannot enforce must reject the experiment —
         # never produce a fingerprint over conditions that will not hold
         cases = (
-            {"prompt_digest": None},
             {"environment": None},
             {"resources": {"network": "offline"}},
         )
@@ -177,7 +172,6 @@ class TestTargetProfileSchema:
         # the legacy path cannot even declare these fields)
         for index, extra in enumerate((
                 {"environment": "sha256:" + "1" * 64},
-                {"prompt_digest": "sha256:" + "0" * 64},
                 {"resources": {"timeout_sec": 60}},
                 {"assistance_mode": "human"})):
             register("config", f"fake-extra-{index}", "v1",
@@ -251,7 +245,6 @@ class TestTrialFingerprint:
         {"provider_api_style": "agent-plan"},
         {"adapter_version": "aco-pi-1"},
         {"assistance_mode": "human"},
-        {"prompt_digest": "sha256:" + "0" * 64},
         {"environment": "sha256:" + "1" * 64},
         {"resources": {"network": "online"}},
         {"resources": {"timeout_sec": 60}},
@@ -260,14 +253,23 @@ class TestTrialFingerprint:
     ], ids=lambda m: next(iter(m)))
     def test_every_controlled_field_change_changes_fingerprint(self, mutation):
         changed = parse_config_content({"harness": "fake", "model": "none"})
-        merged = changed.model_copy(update=mutation)
+        merged = parse_config_content({**changed.model_dump(), **mutation})
         assert trial_fingerprint(merged) != trial_fingerprint(BASE)
 
+    def test_historical_prompt_digest_does_not_change_fingerprint(self):
+        legacy = parse_config_content({
+            "schema_version": 1, "harness": "fake", "model": "none",
+            "prompt_digest": "sha256:" + "0" * 64,
+        })
+        assert trial_fingerprint(legacy) == trial_fingerprint(BASE)
+
     def test_skill_order_changes_fingerprint(self):
-        ab = BASE.model_copy(update={
-            "skills": [{"name": "a", "version": "v1"}, {"name": "b", "version": "v1"}]})
-        ba = BASE.model_copy(update={
-            "skills": [{"name": "b", "version": "v1"}, {"name": "a", "version": "v1"}]})
+        ab = parse_config_content({**BASE.model_dump(),
+                                   "skills": [{"name": "a", "version": "v1"},
+                                               {"name": "b", "version": "v1"}]})
+        ba = parse_config_content({**BASE.model_dump(),
+                                   "skills": [{"name": "b", "version": "v1"},
+                                               {"name": "a", "version": "v1"}]})
         assert trial_fingerprint(ab) != trial_fingerprint(ba)
 
     def test_pre_0011_rows_backfill_deterministically(self, client, register, tmp_path):

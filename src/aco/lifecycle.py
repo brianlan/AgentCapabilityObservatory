@@ -83,6 +83,12 @@ def finish_trial(conn: sqlite3.Connection, trial_id: str, trigger: str, outcome:
     experiment_id = conn.execute(
         "SELECT experiment_id FROM trials WHERE id = ?", (trial_id,)
     ).fetchone()["experiment_id"]
+    if outcome == "sealed":
+        # Keep the terminal state and its first scoring request atomic. A
+        # crash after sealing but before this funnel is repaired by manager
+        # startup reconciliation.
+        from .verification import enqueue_default_verification
+        enqueue_default_verification(conn, trial_id)
     _record_event(conn, experiment_id, trial_id, "trial_finished", reason=trigger,
                   outcome=outcome, run_id=run_id, detail=detail)
     complete_experiment_if_done(conn, experiment_id)
@@ -354,5 +360,6 @@ def progress(conn: sqlite3.Connection, experiment_id: str) -> dict:
         " WHERE t.experiment_id = ?",
         (experiment_id,),
     ).fetchone()[0]
+    from .verification import default_verification_progress
     return {**counts, "sealed": sealed, "anomaly": anomaly,
-            "attempted": attempted}
+            "attempted": attempted, **default_verification_progress(conn, experiment_id)}

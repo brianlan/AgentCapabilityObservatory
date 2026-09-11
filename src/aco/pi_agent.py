@@ -177,7 +177,6 @@ def validate_profile(profile: TargetProfile) -> int:
     this profile declares must actually take effect, and anything the pi
     path cannot enforce is rejected before the paid call —
     - harness_version / adapter_version: pinned and rendered into the image;
-    - prompt_digest: verified against the instruction the agent receives;
     - environment: verified against the built image's observed digest;
     - resources.timeout_sec: the agent timeout in task.toml;
     - resources.cpus / memory_mb: Harbor environment overrides;
@@ -196,10 +195,6 @@ def validate_profile(profile: TargetProfile) -> int:
             f"unsupported credentials {profile.credentials!r};"
             f" exactly [{ARK_CREDENTIAL_REF!r}] is supported"
         )
-    if profile.prompt_digest is None:
-        raise ValueError(
-            "prompt_digest is required: the instruction the agent runs on"
-            " is a controlled condition verified against this digest")
     if profile.environment is None:
         raise ValueError(
             "environment is required: the pinned agent image digest is a"
@@ -389,7 +384,7 @@ class PiAgent(BaseInstalledAgent):
                      f" | base64 -d > {PI_CONFIG_DIR}/models.json"),
         )
 
-        # 3. one fresh session: the task prompt only — no identity text.
+        # 3. one fresh session: the TaskVersion instruction only — no identity text.
         # The key travels as exec env (Harbor redacts sensitive env in logs),
         # never inside the command string. pi's transcript is redirected to a
         # file and fetched separately: harbor's exec raises on non-zero exit
@@ -481,21 +476,20 @@ def image_digest(image_ref: str) -> str:
 def build_image() -> str:
     """Pre-build the pinned trial image; return its immutable content digest.
 
-    Runs OUTSIDE the trial hot path (#38 reopen): the execution manager calls
-    this before spawning any supervisor, and `aco build-agent-image` exposes
-    it to operators. A trial start only inspects the result — no docker
-    build, no npm, no registry access there. docker's layer cache makes an
-    unchanged rebuild a no-op, and there is deliberately no tag-exists
-    short-circuit: a stale image must never survive a Dockerfile change
-    (e.g. the WORKDIR fix, #38). --network host is build-time only (npm
+    Runs OUTSIDE the trial hot path (#38 reopen): `aco build-agent-image`
+    exposes this operation to operators. A trial start only inspects the
+    result — no docker build, no npm, no registry access there. docker's layer
+    cache makes an unchanged rebuild a no-op, and there is deliberately no
+    tag-exists short-circuit: a stale image must never survive a Dockerfile
+    change (e.g. the WORKDIR fix, #38). --network host is build-time only (npm
     registry reachability on hosts with an unreachable daemon proxy); the
     trial runtime itself stays restricted (#38).
     """
     import subprocess
     import tempfile
 
-    # the manager's poll loop is single-threaded: a hung build must expire
-    # (terminal environment_invalid) instead of stalling every trial
+    # A hung operator-side build must expire rather than leave the build
+    # process blocked indefinitely.
     timeout = float(os.environ.get("ACO_AGENT_IMAGE_BUILD_TIMEOUT", "1800"))
     with tempfile.TemporaryDirectory(prefix="aco-pi-image-") as temp:
         (Path(temp) / "Dockerfile").write_text(render_dockerfile())

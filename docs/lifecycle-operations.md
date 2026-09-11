@@ -31,6 +31,14 @@ When every trial of an experiment is terminal, the experiment auto-completes.
 A cancelled experiment stays cancelled forever; `resume` only releases a
 restart-pause, never an explicit cancel.
 
+For a sealed answer whose immutable TaskVersion declares `default_scorer`,
+the same trusted transaction queues one `initial:<scorer-version-id>`
+verification. The execution manager runs it through the normal independent
+verifier path. Legacy or synthetic tasks without that declaration have no
+required initial verification and remain compatible with the lifecycle. The
+`initial:` idempotency namespace is reserved for this trusted path; manual
+verification requests use ordinary keys.
+
 ## Timeout unification
 
 Harbor's own agent timeout and the ACO outer deadline land on the same
@@ -80,21 +88,29 @@ On every manager start, in order:
 4. **Terminal reconciliation**: a crash between sealing and the state write
    leaves a terminal answer on a non-terminal trial; startup moves each such
    trial through the same funnel (never re-collects, never creates a run).
-5. **Adoption**: unfinished runs with a live supervisor pid are recorded as
+5. **Initial scoring reconciliation**: sealed trials with a declared default
+   scorer but no initial verification are queued idempotently. This repeats
+   the seal transaction's enqueue step and closes a manager/supervisor crash
+   window. Anomaly, cancelled, and unverifiable answers are skipped.
+6. **Adoption**: unfinished runs with a live supervisor pid are recorded as
    `adopted` events; the supervisor keeps running and records its own
    outcome. No restart, no second attempt.
-6. **Stuck scoring**: verifications left `running` by a manager crash return
+7. **Stuck scoring**: verifications left `running` by a manager crash return
    to `queued` (scoring calls no model; requeueing is not an agent rerun).
-7. **Pause**: every experiment that still has planned trials is set to
+8. **Pause**: every experiment that still has planned trials is set to
    `paused` — unstarted plans wait for an explicit `resume`.
 
 ## Manual recovery flow
 
 1. Restart the API and the execution manager against the same data root.
 2. Inspect `GET /v1/experiments/{id}` — `progress` shows plan, execution,
-   cancellation, and anomaly counts; `attempted` counts every trial that
-   ever produced a launch intent (a run row), so a trial cancelled before
-   launch was never attempted.
+   cancellation, anomaly, and initial-scoring counts
+   (`verification_required`, `verification_terminal`,
+   `verification_pending`, `verification_succeeded`, and
+   `verification_errors`); `attempted` counts every trial that ever produced
+   a launch intent (a run row), so a trial cancelled before launch was never
+   attempted. `aco run --wait` waits for `verification_pending` to reach zero
+   while preserving legacy tasks with no required scorer.
 3. Decide explicitly per experiment:
    - continue: `POST /v1/experiments/{id}/resume`;
    - stop: `POST /v1/experiments/{id}/cancel`.

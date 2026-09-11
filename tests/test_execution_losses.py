@@ -7,6 +7,7 @@ the same finish_trial funnel. Real supervisor identity uses live helper
 processes; full manager E2E coverage lives in tests/e2e/test_execution.py.
 """
 
+import json
 import os
 import subprocess
 import time
@@ -52,6 +53,39 @@ def make_experiment(conn, n_trials=1) -> str:
     return "e1"
 
 
+def make_pi_experiment(conn, n_trials=2) -> str:
+    """Two Pi trials sharing one prebuilt target profile."""
+    profile = {
+        "schema_version": 1,
+        "harness": "pi",
+        "harness_version": "0.84.1",
+        "model": "glm-5.3-flash",
+        "thinking": "max",
+        "provider": "ark-agent-plan",
+        "provider_api_style": "openai-responses",
+        "adapter_version": "0.1.0",
+        "environment": "sha256:" + "a" * 64,
+        "credentials": ["ark-agent-plan-main"],
+    }
+    conn.execute(
+        "INSERT INTO versions (id, kind, name, version, content, created_at)"
+        " VALUES ('v-task', 'task', 'task', 'v1', '{}', 'now'),"
+        " ('v-cfg', 'config', 'cfg', 'v1', ?, 'now')",
+        (json.dumps(profile),),
+    )
+    conn.execute(
+        "INSERT INTO experiments (id, status, requested, created_at)"
+        " VALUES ('e1', 'planned', '{}', 'now')"
+    )
+    for i in range(1, n_trials + 1):
+        conn.execute(
+            "INSERT INTO trials (id, experiment_id, task_version_id, config_version_id,"
+            f" repetition, plan_order, requested) VALUES ('t{i}', 'e1', 'v-task', 'v-cfg', {i}, {i}, '{{}}')"
+        )
+    conn.commit()
+    return "e1"
+
+
 class FakeProc:
     """Stands in for the supervisor subprocess: poll/kill/wait are recorded."""
 
@@ -77,17 +111,19 @@ class FakeProc:
 def manager_env(monkeypatch):
     """Fake Popen + no-op container cleanup + instant token mint."""
     procs = []
+    commands = []
 
     def fake_popen(cmd, **kwargs):
         proc = FakeProc()
         procs.append(proc)
+        commands.append(cmd)
         return proc
 
     monkeypatch.setattr("aco.execution.subprocess.Popen", fake_popen)
     cleaned = []
     monkeypatch.setattr("aco.execution.cleanup_container", lambda run_id: cleaned.append(run_id))
     monkeypatch.setattr("aco.execution.mint_token", lambda *a, **k: "tok")
-    return {"procs": procs, "cleaned": cleaned}
+    return {"procs": procs, "commands": commands, "cleaned": cleaned}
 
 
 class TestWatchdogTerminalStates:
@@ -118,6 +154,30 @@ class TestWatchdogTerminalStates:
         # restart: the anomaly trial is never re-claimed (no implicit rerun)
         recover_stale_claims(conn)
         assert claim_next_planned(conn) is None
+
+    def test_two_pi_trials_share_prebuilt_image_without_build_or_registry_access(
+            self, conn, tmp_path, manager_env, monkeypatch):
+        """The manager launches both trials without invoking the Pi builder.
+
+        A real supervisor is outside this unit test; its command is the only
+        subprocess the manager should start, so any docker/npm/registry work
+        in the manager hot path is observable here.
+        """
+        make_pi_experiment(conn)
+        builds = []
+        monkeypatch.setattr("aco.pi_agent.build_image",
+                            lambda: builds.append(True) or "sha256:" + "a" * 64)
+        monkeypatch.setattr("aco.execution.supervisor_watchdog_sec", lambda profile: 0.0)
+
+        for _ in range(2):
+            assert run_one(conn, tmp_path, "http://api", "tok", "http://session") is True
+
+        assert builds == []
+        assert len(manager_env["procs"]) == 2
+        assert all(
+            not any(token in arg for token in ("docker", "npm", "registry"))
+            for command in manager_env["commands"] for arg in command
+        )
 
     def test_abnormal_exit_terminals_through_the_same_funnel(self, conn, tmp_path,
                                                              manager_env, monkeypatch):

@@ -280,6 +280,17 @@ def test_wait_json_terminal_output_is_single_document(api, state, tmp_path, caps
     assert doc["id"] == exp_id  # idempotency replay targeted the same batch
 
 
+def test_wait_requires_terminal_trial_state_before_scoring():
+    from aco.cli import finished
+
+    experiment = {
+        "progress": {"sealed": 1, "anomaly": 0, "cancelled": 0,
+                     "verification_pending": 0},
+        "trials": [{"status": "running"}],
+    }
+    assert finished(experiment) is False
+
+
 def test_output_never_contains_credentials(api, state, capsys):
     secret = "super-secret-token-value"
     assert main(["status", "no-such-experiment", "--api-url", api,
@@ -319,7 +330,6 @@ PI_CONFIG = {
     "provider": "ark-agent-plan",
     "provider_api_style": "openai-responses",
     "adapter_version": "0.1.0",
-    "prompt_digest": "sha256:" + "a" * 64,
     "environment": "sha256:" + "b" * 64,
     "credentials": ["ark-agent-plan-main"],
 }

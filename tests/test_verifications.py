@@ -13,8 +13,8 @@ import uuid
 
 import pytest
 
-from aco import artifacts, db, runs
-from aco.app import version_digest as app_version_digest
+from aco import artifacts, db, lifecycle, runs
+from aco.app import AppError, version_digest as app_version_digest
 from aco.models import AssetRef
 from aco.verification import runner
 
@@ -359,6 +359,93 @@ class TestBundleDigest:
         assert runner.bundle_digest(bundle) != first
 
 
+class TestAutomaticInitialVerification:
+    """A sealed TaskVersion's explicit scorer reference creates one initial
+    verification and lets the normal runner produce the stored verdict."""
+
+    @staticmethod
+    def declare_default_scorer(conn, scorer_name="scorer", scorer_version="v1"):
+        content = {"default_scorer": {"name": scorer_name, "version": scorer_version}}
+        conn.execute("UPDATE versions SET content = ? WHERE id = 'v-task'",
+                     (json.dumps(content),))
+        conn.commit()
+
+    def test_sealing_queues_and_runs_one_initial_verification(
+            self, conn, trial, tmp_path, fake_docker):
+        scorer_id = make_scorer(conn, tmp_path)
+        self.declare_default_scorer(conn)
+        seal_directly(tmp_path, trial)
+        lifecycle.finish_trial(conn, trial, "submit", "sealed")
+
+        progress = lifecycle.progress(conn, "e1")
+        assert progress["verification_required"] == 1
+        assert progress["verification_pending"] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM verifications WHERE trial_id = ?", (trial,)
+        ).fetchone()[0] == 1
+        queued = conn.execute(
+            "SELECT id, idempotency_key, scorer_version_id, status FROM verifications"
+        ).fetchone()
+        assert queued["idempotency_key"] == f"initial:{scorer_id}"
+        assert queued["scorer_version_id"] == scorer_id
+        assert queued["status"] == "queued"
+
+        assert runner.run_pending(conn, tmp_path) is True
+        verdict = conn.execute(
+            "SELECT status, pass, error_kind FROM verifications WHERE id = ?",
+            (queued["id"],),
+        ).fetchone()
+        assert verdict["status"] == "succeeded"
+        assert verdict["pass"] == 1 and verdict["error_kind"] is None
+        progress = lifecycle.progress(conn, "e1")
+        assert progress["verification_terminal"] == 1
+        assert progress["verification_pending"] == 0
+        assert progress["verification_succeeded"] == 1
+
+    def test_startup_reconciliation_closes_seal_to_queue_crash_window(
+            self, conn, trial, tmp_path):
+        scorer_id = make_scorer(conn, tmp_path)
+        self.declare_default_scorer(conn)
+        seal_directly(tmp_path, trial)
+        conn.execute("UPDATE trials SET status = 'sealed' WHERE id = ?", (trial,))
+        conn.commit()
+
+        assert runner.reconcile_default_verifications(conn) == 1
+        assert runner.reconcile_default_verifications(conn) == 0
+        assert conn.execute("SELECT COUNT(*) FROM verifications").fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT idempotency_key FROM verifications"
+        ).fetchone()[0] == f"initial:{scorer_id}"
+
+    def test_anomalous_answer_is_never_queued(self, conn, trial, tmp_path):
+        make_scorer(conn, tmp_path)
+        self.declare_default_scorer(conn)
+        seal_directly(tmp_path, trial)
+        conn.execute("UPDATE sealed_answers SET status = 'anomaly' WHERE trial_id = ?", (trial,))
+        conn.execute("UPDATE trials SET status = 'anomaly' WHERE id = ?", (trial,))
+        conn.commit()
+
+        assert runner.enqueue_default_verification(conn, trial) is None
+        assert conn.execute("SELECT COUNT(*) FROM verifications").fetchone()[0] == 0
+
+    def test_legacy_wrong_scorer_collision_never_satisfies_default(self, conn, trial, tmp_path):
+        default_id = make_scorer(conn, tmp_path, name="default")
+        other_id = make_scorer(conn, tmp_path, name="other")
+        self.declare_default_scorer(conn, "default")
+        seal_directly(tmp_path, trial)
+        conn.execute("UPDATE trials SET status = 'sealed' WHERE id = ?", (trial,))
+        queue_verification(conn, trial, other_id,
+                           key=f"{runner.INITIAL_VERIFICATION_PREFIX}{default_id}")
+
+        progress = lifecycle.progress(conn, "e1")
+        assert progress["verification_required"] == 1
+        assert progress["verification_terminal"] == 0
+        assert progress["verification_pending"] == 1
+        with pytest.raises(AppError):
+            runner.enqueue_default_verification(conn, trial)
+        assert conn.execute("SELECT COUNT(*) FROM verifications").fetchone()[0] == 1
+
+
 class TestVerificationAPI:
     """POST/GET contract via the FastAPI app (no manager, no docker)."""
 
@@ -414,6 +501,20 @@ class TestVerificationAPI:
         resp = self.post_verification(client, "t1")
         assert resp.status_code == 422
         assert resp.json()["error"]["code"] == "not_verifiable"
+
+    def test_initial_idempotency_namespace_is_reserved(self, client, tmp_path):
+        scorer = self.register_scorer(client)
+        self._make_trial(tmp_path, "t1")
+        seal_directly(tmp_path, "t1")
+
+        resp = self.post_verification(client, "t1",
+                                       key=f"initial:{scorer['id']}")
+
+        assert resp.status_code == 422
+        assert resp.json()["error"]["code"] == "reserved_idempotency_key"
+        conn = sqlite3.connect(tmp_path / "aco.db")
+        assert conn.execute("SELECT COUNT(*) FROM verifications").fetchone()[0] == 0
+        conn.close()
 
     @pytest.mark.parametrize("image", [
         "python:3.12",                       # mutable tag, no digest

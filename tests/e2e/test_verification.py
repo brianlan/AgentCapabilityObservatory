@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from aco import artifacts
+from aco import artifacts, lifecycle
 from aco.verification import runner as verification_runner
 from test_execution import HEALTH_TIMEOUT, pre_migrate
 
@@ -130,10 +130,11 @@ def make_sealed(root: Path, content: bytes | None) -> tuple[str, str]:
     conn.execute(
         "INSERT INTO versions (id, kind, name, version, content, created_at) VALUES"
         f" ('v-task-{suffix}', 'task', 'task-{suffix}', 'v1', '{{}}', 'now'),"
-        f" ('v-cfg-{suffix}', 'config', 'cfg-{suffix}', 'v1', '{{}}', 'now')"
+        f" ('v-cfg-{suffix}', 'config', 'cfg-{suffix}', 'v1', '{{\"harness\": \"fake\", \"model\": \"none\"}}', 'now')"
     )
     conn.execute(
-        f"INSERT INTO experiments (id, status, requested, created_at) VALUES ('e-{suffix}', 'planned', '{{}}', 'now')"
+        f"INSERT INTO experiments (id, status, requested, created_at) VALUES"
+        f" ('e-{suffix}', 'planned', '{{\"task\": {{\"name\": \"task-{suffix}\", \"version\": \"v1\"}}}}', 'now')"
     )
     trial_id = f"t-{suffix}"
     conn.execute(
@@ -227,6 +228,52 @@ def wait_for_verifications(base: str, trial_id: str, count: int, timeout: float 
 
 
 class TestIndependentVerification:
+    def test_sealed_task_default_scorer_is_queued_and_reported(self, stack):
+        """Experiment progress waits for the explicit initial scorer and the
+        result API can consume its independent verdict."""
+        base, root = stack["base"], stack["root"]
+        scorer_id = register_scorer(base, root, "run.py", {"expected": EXPECTED})
+        trial_id, _ = make_sealed(root, EXPECTED.encode())
+        scorer = scorer_ref(root, scorer_id)
+        conn = sqlite3.connect(root / "aco.db")
+        conn.row_factory = sqlite3.Row
+        try:
+            task_id = conn.execute(
+                "SELECT task_version_id FROM trials WHERE id = ?", (trial_id,)
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE versions SET content = ? WHERE id = ?",
+                (json.dumps({"default_scorer": scorer}), task_id),
+            )
+            # The seed helper leaves the trial non-runnable; put it through
+            # the same terminal funnel a real supervisor uses.
+            conn.execute("UPDATE trials SET status = 'running' WHERE id = ?", (trial_id,))
+            conn.commit()
+            lifecycle.finish_trial(conn, trial_id, "submit", "sealed")
+            experiment_id = conn.execute(
+                "SELECT experiment_id FROM trials WHERE id = ?", (trial_id,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        records = wait_for_verifications(base, trial_id, 1)
+        assert len(records) == 1
+        assert records[0]["verifier"] == scorer
+        assert records[0]["status"] == "succeeded"
+        assert records[0]["pass"] is True
+
+        status, experiment = http("GET", base + f"/v1/experiments/{experiment_id}")
+        assert status == 200
+        assert experiment["progress"]["verification_required"] == 1
+        assert experiment["progress"]["verification_terminal"] == 1
+        assert experiment["progress"]["verification_pending"] == 0
+
+        status, result = http(
+            "GET", base + f'/v1/results?scorer={scorer["name"]}@{scorer["version"]}'
+        )
+        assert status == 200
+        assert result["series"] and result["series"][0]["points"][0]["main_score"] == 1.0
+
     def test_correct_answer_scores_pass_with_isolation_evidence(self, stack):
         base, root = stack["base"], stack["root"]
         scorer_id = register_scorer(base, root, "run.py", {"expected": EXPECTED})

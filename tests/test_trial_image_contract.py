@@ -1,14 +1,13 @@
 """Trial image contract tests (#38 reopen).
 
-The pinned pi image is built OUTSIDE the trial hot path: the execution
-manager (or an operator via `aco build-agent-image`) prebuilds it, trial
-start only resolves its immutable digest, the task runs digest-pinned, and
+The pinned pi image is built OUTSIDE the trial hot path by `aco
+build-agent-image`; trial start only resolves its immutable digest, the task
+runs digest-pinned, and
 an automated (CI) environment can never reach the real provider endpoint —
 regardless of allow_paid_run or credential presence.
 """
 
 import asyncio
-import hashlib
 import json
 import sqlite3
 import subprocess
@@ -20,7 +19,6 @@ from aco.supervisor import PI_HARNESS, build_task_dir, execute_run
 
 
 PROMPT = "write the answer file"
-PROMPT_DIGEST = "sha256:" + hashlib.sha256(PROMPT.encode()).hexdigest()
 IMAGE_DIGEST = "sha256:" + "a" * 64
 
 PI_PROFILE = {
@@ -33,7 +31,6 @@ PI_PROFILE = {
     "provider_api_style": "openai-responses",
     "adapter_version": pi_agent.ADAPTER_VERSION,
     "credentials": ["ark-agent-plan-main"],
-    "prompt_digest": PROMPT_DIGEST,
     "environment": IMAGE_DIGEST,
 }
 
@@ -177,6 +174,22 @@ def test_task_toml_pins_the_verified_digest(tmp_path, monkeypatch):
     assert not (task_dir / "environment" / "Dockerfile").exists()
 
 
+def test_gateway_ca_bundle_is_mounted_when_configured(tmp_path, monkeypatch):
+    from aco.supervisor import build_task_dir, gateway_config
+
+    ca_bundle = tmp_path / "operator-ca.pem"
+    ca_bundle.write_text("test ca")
+    monkeypatch.setenv("ACO_GATEWAY_CA_BUNDLE", str(ca_bundle))
+    monkeypatch.setenv("ACO_BASE_URL", "http://127.0.0.1:8100")
+    task_dir = build_task_dir(
+        tmp_path / "run", PROMPT, 30, "run-ca", harness=PI_HARNESS,
+        gateway=gateway_config(tmp_path, "run-ca"), image_digest_ref=IMAGE_DIGEST,
+    )
+    compose = (task_dir / "offline.yaml").read_text()
+    assert f'{ca_bundle}:/etc/aco/gateway-ca.pem:ro' in compose
+    assert 'ACO_GATEWAY_CA_BUNDLE: "/etc/aco/gateway-ca.pem"' in compose
+
+
 def test_build_agent_image_cli_prints_digest(monkeypatch, capsys):
     """`aco build-agent-image` prebuilds outside any trial and prints the
     immutable digest (#38 reopen)."""
@@ -186,3 +199,22 @@ def test_build_agent_image_cli_prints_digest(monkeypatch, capsys):
     args = build_parser().parse_args(["build-agent-image"])
     assert args.func(args) == 0
     assert capsys.readouterr().out.strip() == IMAGE_DIGEST
+
+
+def test_trial_cleanup_preserves_shared_prebuilt_image(monkeypatch):
+    """Harbor cleanup removes this run's containers only, never the image."""
+    from aco import supervisor
+
+    commands = []
+
+    def fake_command(*args, **kwargs):
+        commands.append(args)
+        if args[:3] == ("docker", "ps", "-aq"):
+            return subprocess.CompletedProcess(args, 0, stdout="container\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(supervisor, "command", fake_command)
+    supervisor.cleanup_container("run-1")
+
+    assert ("docker", "rm", "-f", "container") in commands
+    assert not any(command[:3] == ("docker", "image", "rm") for command in commands)

@@ -626,7 +626,11 @@ def _register_candidate(conn, bundle: Bundle, data_root: Path,
            # the instruction's single source: a path inside the registered
            # immutable public environment asset (#20 reopen)
            "instruction": {"asset": environments.INSTRUCTION_ASSET,
-                           "path": bundle.instruction_path}}
+                           "path": bundle.instruction_path},
+           # The scorer is part of this immutable TaskVersion. Runtime
+           # scheduling therefore has an explicit reference and never guesses
+           # from a scorer name convention.
+           "default_scorer": {"name": scorer_name, "version": scorer_version}}
     task_assets = [AssetRef(name="verifier_bundle", digest=verifier_bundle_digest),
                    AssetRef(name="environment", digest=environment_digest)]
     # the version id is deterministic (content-addressed): identical bundles

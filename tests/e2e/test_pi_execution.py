@@ -41,9 +41,6 @@ PI_PROFILE = {
 }
 DUMMY_KEY = "e2e-dummy-key"
 PROMPT = "write the answer file"
-# the declared prompt digest is verified against the instruction the agent
-# actually receives (#36 reopen)
-PROMPT_DIGEST = "sha256:" + hashlib.sha256(PROMPT.encode()).hexdigest()
 
 
 def pi_profile(image_digest: str) -> dict:
@@ -51,8 +48,7 @@ def pi_profile(image_digest: str) -> dict:
     built image, verified by the supervisor before any paid call. Declared
     resources are enforced as Harbor environment overrides on every run
     (#36 reopen), so the full chain exercises the enforcement path."""
-    return {**PI_PROFILE, "prompt_digest": PROMPT_DIGEST,
-            "environment": image_digest,
+    return {**PI_PROFILE, "environment": image_digest,
             "resources": {"cpus": 1, "memory_mb": 256}}
 
 SKILL_MD = (
@@ -168,16 +164,22 @@ class TestPiExecution:
         base = pi_stack["base"]
         trial_id = create_trial(
             base, PROMPT, pi_profile(pi_stack["image_digest"]), allow_paid_run=True)
-        run = wait_for_run(base, trial_id, timeout=900)  # first run builds the image
+        run = wait_for_run(base, trial_id, timeout=900)
 
         assert run["status"] == "finished", run
         assert run["exit_kind"] == "normal"
+        assert run["image"] == pi_stack["image_digest"]
+        image = subprocess.run(
+            ["docker", "image", "inspect", pi_stack["image_digest"]],
+            capture_output=True, text=True, timeout=20,
+        )
+        assert image.returncode == 0  # the shared prebuild survives cleanup
         events = [phase["event"] for phase in run["phases"]]
         assert "agent_start" in events and "agent_end" in events
 
         # declared conditions reached the generated Harbor config: the agent
         # timeout is pinned in task.toml, the instruction bytes on disk are
-        # exactly what the profile's prompt digest pins, and cpus/memory_mb
+        # exactly what the TaskVersion's instruction asset contains, and cpus/memory_mb
         # were applied as EnvironmentConfig overrides on this real run
         # (#36 reopen, reviewer request)
         task_dir = pi_stack["root"] / "runs" / run["run_id"] / "task"
@@ -205,6 +207,60 @@ class TestPiExecution:
             assert request["model"] == "glm-5.3-flash"
         dump = db_dump(str(pi_stack["root"] / "aco.db"))
         assert DUMMY_KEY not in dump
+
+    def test_suite_runs_two_task_versions_on_one_target(self, pi_stack):
+        """Task instructions belong to TaskVersions; one Pi profile can run
+        different tasks in one expanded suite without changing its identity."""
+        base = pi_stack["base"]
+        import uuid as uuid_mod
+        suffix = uuid_mod.uuid4().hex[:8]
+        from aco import artifacts as aco_artifacts
+
+        contract = aco_artifacts.ArtifactContract(required_outputs=("/workspace/answer.txt",))
+        task_content = {
+            "contract": {"required_outputs": ["/workspace/answer.txt"]},
+            "contract_digest": aco_artifacts.contract_digest(contract),
+        }
+        task_refs = []
+        for name, instruction in ((f"suite-one-{suffix}", "write answer one"),
+                                  (f"suite-two-{suffix}", "write answer two")):
+            status, body = http(
+                "POST", base + "/v1/versions",
+                {"kind": "task", "name": name, "version": "v1",
+                 "content": {**task_content, "prompt": instruction}},
+            )
+            assert status in (200, 201), body
+            task_refs.append({"name": name, "version": "v1"})
+        config_name = f"suite-pi-{suffix}"
+        status, body = http(
+            "POST", base + "/v1/versions",
+            {"kind": "config", "name": config_name, "version": "v1",
+             "content": pi_profile(pi_stack["image_digest"])},
+        )
+        assert status in (200, 201), body
+        status, body = http(
+            "POST", base + "/v1/versions",
+            {"kind": "suite", "name": f"suite-{suffix}", "version": "v1",
+             "content": {"tasks": task_refs}},
+        )
+        assert status in (200, 201), body
+        status, experiment = http("POST", base + "/v1/experiments", {
+            "suite": {"name": f"suite-{suffix}", "version": "v1"},
+            "targets": [{"name": config_name, "version": "v1"}],
+            "allow_paid_run": True,
+        })
+        assert status == 202, experiment
+        trials = experiment["trials"]
+        assert len(trials) == 2
+        assert [trial["task"]["name"] for trial in trials] == [
+            task_refs[0]["name"], task_refs[1]["name"]
+        ]
+        assert len({trial["fingerprint"] for trial in trials}) == 1
+
+        for trial in trials:
+            run = wait_for_run(base, trial["id"], timeout=300)
+            assert run["status"] == "finished", run
+            assert run["image"] == pi_stack["image_digest"]
 
     def test_declared_skill_is_verified_and_loaded(self, pi_stack):
         """An opt-in SkillVersion is mounted read-only, verified against the
@@ -364,9 +420,9 @@ class TestPiExecution:
 
 
 class TestEnvironmentVerification:
-    """The declared prompt/environment digests are verified against what
-    actually runs, before any container or paid call (#36 reopen): a mismatch
-    is a terminal pre-agent execution anomaly, never a capability sample."""
+    """The declared environment digest is verified against what actually
+    runs, before any container or paid call (#36 reopen): a mismatch is a
+    terminal pre-agent execution anomaly, never a capability sample."""
 
     @staticmethod
     def _assert_pre_agent_anomaly(root, trial_id, run, detail_fragment,
@@ -405,24 +461,21 @@ class TestEnvironmentVerification:
                                        "environment image digest mismatch",
                                        before, len(pi_stack["mock"].requests))
 
-    def test_prompt_digest_mismatch_fails_before_agent_start(self, pi_stack):
+    def test_historical_prompt_digest_does_not_block_execution(self, pi_stack):
         base = pi_stack["base"]
         profile = {**pi_profile(pi_stack["image_digest"]),
                    "prompt_digest": "sha256:" + "8" * 64}
         before = len(pi_stack["mock"].requests)
         trial_id = create_trial(base, PROMPT, profile, allow_paid_run=True)
         run = wait_for_run(base, trial_id, timeout=300)
-        # the prompt check precedes the image build: no image evidence either
-        assert "image_digest" not in [p["event"] for p in run["phases"]]
-        self._assert_pre_agent_anomaly(pi_stack["root"], trial_id, run,
-                                       "prompt digest mismatch",
-                                       before, len(pi_stack["mock"].requests))
+        assert run["status"] == "finished", run
+        assert run["exit_kind"] == "normal"
+        assert "image_digest" in [p["event"] for p in run["phases"]]
+        assert len(pi_stack["mock"].requests) > before
 
-    def test_asset_instruction_verifies_against_prompt_digest(self, pi_stack):
-        """An asset-resolved instruction (#20 reopen) — a task with no
-        `prompt` key — is verified against the profile's prompt digest:
-        matching bytes run, a wrong digest fails before any container or
-        paid call (#36 reopen)."""
+    def test_asset_instruction_is_materialized_from_the_task(self, pi_stack):
+        """An asset-resolved instruction (#20 reopen) is materialized from
+        the TaskVersion's immutable environment asset."""
         import uuid as uuid_mod
         from aco import artifacts as aco_artifacts
         from aco import environments as aco_env
@@ -463,26 +516,6 @@ class TestEnvironmentVerification:
         # source — and exactly what the pinned digest names
         task_dir = pi_stack["root"] / "runs" / run["run_id"] / "task"
         assert (task_dir / "instruction.md").read_text() == PROMPT
-
-        # the same task under a profile pinning a different digest is a
-        # pre-agent anomaly, never a sample
-        bad = {**profile, "prompt_digest": "sha256:" + "7" * 64}
-        status, body = http("POST", base + "/v1/versions",
-                            {"kind": "config", "name": f"cfg-bad-{suffix}", "version": "v1",
-                             "content": bad})
-        assert status in (200, 201), body
-        before = len(pi_stack["mock"].requests)
-        status, body = http("POST", base + "/v1/experiments", {
-            "task": {"name": f"task-{suffix}", "version": "v1"},
-            "targets": [{"name": f"cfg-bad-{suffix}", "version": "v1"}],
-            "allow_paid_run": True})
-        assert status == 202, body
-        bad_trial = body["trials"][0]["id"]
-        bad_run = wait_for_run(base, bad_trial, timeout=300)
-        self._assert_pre_agent_anomaly(pi_stack["root"], bad_trial, bad_run,
-                                       "prompt digest mismatch",
-                                       before, len(pi_stack["mock"].requests))
-
 
 class TestPiCredentialMissing:
     def test_fails_explicitly_before_any_model_call(self, tmp_path_factory):

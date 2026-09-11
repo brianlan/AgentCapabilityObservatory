@@ -153,7 +153,7 @@ def _validate_fake_profile(parsed: TargetProfile) -> None:
     # without ever taking effect — reject, never silently ignore
     for field in ("provider", "thinking", "skills", "credentials",
                   "harness_version", "adapter_version", "provider_api_style",
-                  "prompt_digest", "environment"):
+                  "environment"):
         if getattr(parsed, field):
             raise UnsupportedTarget(
                 f"fake target does not support {field}={getattr(parsed, field)!r};"
@@ -272,7 +272,7 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
                    gateway: dict | None = None,
                    environment_dir: Path | None = None,
                    image_digest_ref: str | None = None) -> Path:
-    """Minimal Harbor task dir: registry prompt as instruction, pinned image,
+    """Minimal Harbor task dir: TaskVersion instruction, pinned image,
     compose override with our identification label.
 
     When the task version declares a registered environment asset, its
@@ -321,6 +321,15 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
             f"      ACO_GATEWAY_PROVIDER_UPSTREAM: \"{gateway['provider_upstream']}\"\n"
             f"      ACO_GATEWAY_SESSION_UPSTREAM: \"{gateway['session_upstream']}\"\n"
         )
+        ca_bundle = os.environ.get("ACO_GATEWAY_CA_BUNDLE", "").strip()
+        gateway_ca_env = (
+            '      ACO_GATEWAY_CA_BUNDLE: "/etc/aco/gateway-ca.pem"\n'
+            if ca_bundle else ""
+        )
+        gateway_ca_volume = (
+            f'      - "{ca_bundle}:/etc/aco/gateway-ca.pem:ro"\n'
+            if ca_bundle else ""
+        )
         subnet, ip = gateway["subnet"], gateway["ip"]
         compose = task_dir / "offline.yaml"
         # declared skills mount read-only into the evaluated container only (#39);
@@ -340,8 +349,10 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
             "    volumes:\n"
             f"      - \"{gateway['module']}:/aco/gateway.py:ro\"\n"
             f"      - \"{gateway['evidence_dir']}:/evidence\"\n"
-            "    environment:\n"
+            + gateway_ca_volume
+            + "    environment:\n"
             + gateway_env +
+            gateway_ca_env +
             "    extra_hosts:\n"
             f"      - \"{HOST_ROUTE_HOST}:host-gateway\"\n"
             "    networks:\n"
@@ -591,20 +602,6 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
             runs.finish_run(conn, run_id, "error", runs.EXIT_ENVIRONMENT_INVALID, detail)
             _fail_before_agent_start(conn, run, "environment_invalid", detail)
             return
-        # the declared prompt digest is a controlled condition (#36 reopen):
-        # the resolved instruction (the exact bytes the agent will run on)
-        # must match what the profile pinned — checked before any container
-        # or paid call
-        requested_prompt = parsed_profile.prompt_digest
-        observed_prompt = ("sha256:"
-                           + hashlib.sha256(instruction.encode()).hexdigest())
-        if requested_prompt != observed_prompt:
-            detail = (f"prompt digest mismatch: requested={requested_prompt}"
-                      f" observed={observed_prompt}")
-            runs.finish_run(conn, run_id, "error",
-                            runs.EXIT_ENVIRONMENT_INVALID, detail)
-            _fail_before_agent_start(conn, run, "environment_invalid", detail)
-            return
         skill_state = resolve_skill_mounts(
             conn, parsed_profile, root)
         runs.add_phase(conn, run_id, "skills", skills=skill_state,
@@ -624,16 +621,16 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         # the container sees (#39)
         skill_mounts = [{"name": s["name"], "host_dir": s["host_dir"]}
                         for s in skill_state]
-        # the image is prebuilt by the execution manager (or the operator,
-        # `aco build-agent-image`) before the supervisor starts (#38 reopen):
-        # trial start only resolves its immutable digest — no docker build,
-        # no npm install, no registry access in the hot path
+        # The operator prebuilds the image with `aco build-agent-image` before
+        # the supervisor starts (#38 reopen). Trial start only resolves its
+        # immutable digest — no docker build, npm install, or registry access
+        # in the hot path.
         try:
             observed_image = await asyncio.to_thread(
                 pi_agent.image_digest, pi_agent.PI_IMAGE_TAG)
         except Exception as exc:  # noqa: BLE001 — a missing prebuild is terminal
             detail = (f"agent image not prebuilt: {exc}"
-                      " — run `aco build-agent-image` or start the execution manager first")
+                      " — run `aco build-agent-image` before starting the Trial")
             runs.finish_run(conn, run_id, "error", runs.EXIT_ENVIRONMENT_INVALID, detail)
             _fail_before_agent_start(conn, run, "environment_invalid", detail)
             return
@@ -650,6 +647,10 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
                             runs.EXIT_ENVIRONMENT_INVALID, detail)
             _fail_before_agent_start(conn, run, "environment_invalid", detail)
             return
+        # The digest is the image Harbor will execute. Keep the runtime
+        # observation aligned with the actual agent image, rather than the
+        # fake base image used by the gateway service.
+        image_ref = observed_image
         agent_import_path = "aco.pi_agent:PiAgent"
         # declared resources become enforced environment overrides (#36 reopen)
         if parsed_profile.resources is not None:

@@ -57,13 +57,24 @@ def emit(args, payload: dict) -> None:
 
 def progress_line(experiment: dict) -> str:
     p = experiment["progress"]
+    scoring = f" 评分 {p.get('verification_terminal', 0)}/{p.get('verification_required', 0)}"
+    if p.get("verification_errors", 0):
+        scoring += f"（错误 {p['verification_errors']}）"
     return (f"计划 {p['planned']} 运行 {p['attempted']} 封存 {p['sealed']} "
-            f"异常 {p['anomaly']} 取消 {p['cancelled']} / 共 {len(experiment['trials'])}")
+            f"异常 {p['anomaly']} 取消 {p['cancelled']}{scoring} / 共 {len(experiment['trials'])}")
 
 
 def finished(experiment: dict) -> bool:
     p = experiment["progress"]
-    return p["sealed"] + p["anomaly"] + p["cancelled"] >= len(experiment["trials"])
+    # Answer rows can be sealed briefly before the trusted lifecycle writes
+    # the terminal Trial state. Wait for the Trial state itself, then wait for
+    # any required initial verification; otherwise --wait can return during
+    # that seal-to-finalize window and miss the scorer.
+    trials_finished = all(
+        trial["status"] in ("sealed", "anomaly", "cancelled")
+        for trial in experiment["trials"]
+    )
+    return trials_finished and p.get("verification_pending", 0) == 0
 
 
 def cmd_register(args) -> int:

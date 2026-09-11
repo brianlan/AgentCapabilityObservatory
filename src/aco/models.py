@@ -55,8 +55,8 @@ class ExecutionPolicy(BaseModel):
     network: Literal["offline", "online"] | None = None
 
 
-# canonical content digest reference: prompt_digest / environment carry
-# exactly this form (#36 reopen) — never free text
+# canonical content digest reference: environment carries exactly this form
+# (#36 reopen) — never free text
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -79,7 +79,11 @@ class TargetProfile(BaseModel):
     provider_api_style: str | None = None
     adapter_version: str | None = None
     assistance_mode: Literal["none", "human"] = "none"
-    prompt_digest: str | None = None  # content-addressed prompt reference
+    # Historical config rows may still carry this field.  It is accepted for
+    # read compatibility, but excluded from normalized profiles/fingerprints:
+    # TaskVersion owns the task instruction digest, while a target describes
+    # the harness/provider/model conditions shared by a suite.
+    prompt_digest: str | None = Field(default=None, exclude=True)
     environment: str | None = None  # agent environment image digest
     resources: ExecutionPolicy | None = None
     skills: list[SkillVersionRef] = Field(default_factory=list)  # ordered
