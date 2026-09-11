@@ -216,11 +216,11 @@ def test_management_surface_rejects_other_credentials(client, register, session_
             assert resp.status_code == 401, f"{method.upper()} {req_path}: {resp.status_code}"
 
 
-def test_healthz_stays_open_for_liveness(client):
+def test_healthz_stays_open_for_liveness(client, tmp_path):
     from fastapi.testclient import TestClient
 
     from aco.app import create_management_app
-    bare = TestClient(create_management_app(data_root=None, token="test-management-token"))
+    bare = TestClient(create_management_app(data_root=str(tmp_path), token="test-management-token"))
     assert bare.get("/healthz").status_code == 200  # no Authorization header sent
     assert bare.get("/v1/experiments/nope").status_code == 401
 

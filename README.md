@@ -33,7 +33,7 @@ ACO_MANAGEMENT_TOKEN=<管理凭证> /ssd4/envs/aco_py312/bin/python -m uvicorn a
 # 打开 http://127.0.0.1:8000/openapi.json 查看运行时生成的 OpenAPI
 ```
 
-- 数据根目录：默认 `./data`，可用环境变量 `ACO_DATA_ROOT` 覆盖；SQLite 数据库位于 `<data-root>/aco.db`，是唯一元数据权威。
+- 数据根目录：必须显式配置——启动 ASGI 面前设置环境变量 `ACO_DATA_ROOT`（或直接传 `data_root` 参数），缺失时拒绝启动；导入 `aco.*` 模块不会有任何文件系统副作用。SQLite 数据库位于 `<data-root>/aco.db`，是唯一元数据权威。
 - Migration：`src/aco/migrations/` 内有序 SQL 文件 + `schema_version` 表，重复执行是 no-op。
 - 端点：`POST /v1/versions`（登记不可变版本，内容寻址 digest，重复登记幂等，同标识不同内容返回 `409`）、`POST /v1/experiments`（返回 `202` 与原子展开的 Trial 计划）、`GET /v1/experiments/{id}`、`GET /v1/trials/{id}`。管理面所有路由（含 dashboard）都要求 `Authorization: Bearer $ACO_MANAGEMENT_TOKEN`，缺失或错误返回 `401`；未设置该环境变量时管理面拒绝启动。
 - Experiment 创建幂等（#35，服务端权威）：`POST /v1/experiments` 支持携带 `Idempotency-Key` 头。同一管理主体（bearer token 的 sha256 指纹，明文永不入库）用相同 key 与相同规范请求体重试，返回原 Experiment（`200`）；相同 key 但请求体不同返回 `409 idempotency_conflict`。幂等键与计划在同一 SQLite 事务中登记，失败不残留 key 或半个计划。不携带该头时每次调用都创建新 Experiment——API 不会把无 key 请求伪装成幂等。
