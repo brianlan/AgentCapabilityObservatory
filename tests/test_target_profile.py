@@ -135,11 +135,12 @@ class TestTargetProfileSchema:
 
     def test_execution_policy_values_are_positive_and_bounded(self, register):
         from aco.models import ExecutionPolicy, parse_config_content
-        # accepted range works
-        parse_config_content(dict(PI_PROFILE, resources={"cpus": 0.5, "memory_mb": 128,
+        # accepted range works (whole cpus only: Harbor's override_cpus is
+        # an int, so fractions would be unenforceable)
+        parse_config_content(dict(PI_PROFILE, resources={"cpus": 1, "memory_mb": 128,
                                                          "timeout_sec": 1}))
-        # zero, negative, and over-cap values all fail the schema
-        for bad in ({"cpus": 0}, {"cpus": -1}, {"cpus": 65},
+        # zero, negative, fractional, and over-cap values all fail the schema
+        for bad in ({"cpus": 0}, {"cpus": -1}, {"cpus": 0.5}, {"cpus": 65},
                     {"memory_mb": 0}, {"memory_mb": -100}, {"memory_mb": 65537},
                     {"timeout_sec": 0}, {"timeout_sec": 86401}):
             with pytest.raises(ValueError):

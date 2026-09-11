@@ -47,7 +47,9 @@ class ExecutionPolicy(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    cpus: float | None = Field(default=None, gt=0, le=64)
+    # cpus is an integer: Harbor's EnvironmentConfig.override_cpus is an int,
+    # so a fractional declaration could never be enforced (#36 reopen)
+    cpus: int | None = Field(default=None, gt=0, le=64)
     memory_mb: int | None = Field(default=None, gt=0, le=65536)
     timeout_sec: int | None = Field(default=None, gt=0, le=86400)
     network: Literal["offline", "online"] | None = None
