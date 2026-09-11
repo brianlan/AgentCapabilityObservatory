@@ -193,12 +193,16 @@ def _stop_run(conn: sqlite3.Connection, run: sqlite3.Row) -> None:
     """
     trial_id = run["trial_id"]
     pid = run["supervisor_pid"]
-    # never signal placeholders: pid -1/0 would broadcast to a whole process group
-    if pid is not None and pid > 0:
+    # only signal a process the recorded identity still vouches for (#16
+    # reopen): a reused PID must never receive our SIGTERM
+    if runs.supervisor_matches(run):
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass  # already gone
+    else:
+        runs.add_phase(conn, run["run_id"], "supervisor_identity_unverified",
+                       pid=pid, recorded_start=run["supervisor_start"])
     from .supervisor import cleanup_container
     cleanup_container(run["run_id"])
     sealed = conn.execute(
@@ -274,12 +278,15 @@ def pause_unstarted_on_restart(conn: sqlite3.Connection) -> int:
 def adopt_live_supervisors(conn: sqlite3.Connection) -> int:
     """Manager-startup: record adoption of supervisors that survived the
     restart and keep running. They record their own outcomes; the manager
-    neither restarts them nor treats them as lost."""
+    neither restarts them nor treats them as lost. Identity-aware (#16
+    reopen): only a run whose recorded (pid, start tick) still matches
+    /proc is adopted — a reused PID is never adopted (recovery terminalizes
+    it instead)."""
     adopted = 0
     for run in runs.unfinished_runs(conn):
-        pid = run["supervisor_pid"]
-        if pid is None or pid <= 0 or not os.path.exists(f"/proc/{pid}"):
+        if not runs.supervisor_matches(run):
             continue
+        pid = run["supervisor_pid"]
         adopted += 1
         trial = conn.execute(
             "SELECT experiment_id FROM trials WHERE id = ?", (run["trial_id"],)
