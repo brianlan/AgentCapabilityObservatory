@@ -494,12 +494,20 @@ def build_image() -> str:
     import subprocess
     import tempfile
 
+    # the manager's poll loop is single-threaded: a hung build must expire
+    # (terminal environment_invalid) instead of stalling every trial
+    timeout = float(os.environ.get("ACO_AGENT_IMAGE_BUILD_TIMEOUT", "1800"))
     with tempfile.TemporaryDirectory(prefix="aco-pi-image-") as temp:
         (Path(temp) / "Dockerfile").write_text(render_dockerfile())
-        build = subprocess.run(
-            ["docker", "build", "--network", "host", "-t", PI_IMAGE_TAG, temp],
-            capture_output=True, text=True, timeout=1800,
-        )
+        try:
+            build = subprocess.run(
+                ["docker", "build", "--network", "host", "-t", PI_IMAGE_TAG, temp],
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"agent image build exceeded {timeout:.0f}s — check registry/"
+                "npm reachability or run `aco build-agent-image` manually") from None
     if build.returncode != 0:
         raise RuntimeError(f"pinned pi image build failed: {build.stderr[-800:]}")
     return image_digest(PI_IMAGE_TAG)

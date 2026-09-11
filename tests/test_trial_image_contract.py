@@ -86,9 +86,11 @@ def test_trial_start_never_builds_the_agent_image(tmp_path, conn, monkeypatch):
     prebuild is a terminal execution anomaly, not a build attempt."""
     register_pi_trial(conn)
     run = start_run(conn)
-    # this test exercises the prebuild contract, not the CI gate: CI
-    # environments (GitHub Actions sets CI=true) must not shortcut it
-    monkeypatch.delenv("CI", raising=False)
+    # this test exercises the prebuild contract, not the CI gate: point the
+    # endpoint at an explicit mock (the PR's own rule for automated
+    # environments) so the missing-prebuild path is what fails, with CI=true
+    # left in place exactly as GitHub Actions provides it (reviewer fix)
+    monkeypatch.setenv(pi_agent.ARK_BASE_URL_ENV, "http://127.0.0.1:9/ark")
 
     def forbidden_build(*_args, **_kwargs):
         raise AssertionError("trial start must never build the agent image")

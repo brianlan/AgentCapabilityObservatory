@@ -414,11 +414,13 @@ def _make_certs(base):
 
 
 class _TlsStub:
-    """HTTPS recording stub: one SSE-flavored POST answer."""
+    """HTTPS recording stub: one SSE-flavored POST answer; `status`
+    overridable for error-relay tests."""
 
     def __init__(self, key, crt):
         import ssl
         self.requests = []
+        self.status = 200
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -429,9 +431,14 @@ class _TlsStub:
                 length = int(self.headers.get("Content-Length") or 0)
                 self.rfile.read(length)
                 outer.requests.append((self.path, self.headers.get("Host")))
-                body = b'data: {"type": "response.output_text.delta"}\n\n'
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
+                if outer.status == 200:
+                    body = b'data: {"type": "response.output_text.delta"}\n\n'
+                    content_type = "text/event-stream"
+                else:
+                    body = b'{"error": {"code": "rate_limit"}}'
+                    content_type = "application/json"
+                self.send_response(outer.status)
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -494,6 +501,17 @@ def test_https_upstream_dials_tls_and_streams(tls_stack):
     assert host == f"127.0.0.1:{tls_stack['stub'].port}"
     entries = _evidence_lines(tls_stack["evidence"])
     assert entries[-1]["status"] == 200
+
+
+def test_https_upstream_relays_provider_error_over_tls(tls_stack):
+    """A provider error over the verified-TLS path relays the upstream
+    status unchanged and is recorded in evidence (the reopen's 429/5xx
+    over-TLS coverage; the record precedes the response, so no race)."""
+    tls_stack["stub"].status = 429
+    status, body = get(tls_stack["base"], "/api/v3/responses", auth="Bearer paid-key")
+    assert status == 429
+    entries = _evidence_lines(tls_stack["evidence"])
+    assert entries[-1]["status"] == 429
 
 
 def test_https_upstream_untrusted_cert_fails_closed(tmp_path, monkeypatch):
