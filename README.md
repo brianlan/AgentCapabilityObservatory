@@ -113,7 +113,7 @@ aco resume <experiment-id>
 
 - 连接配置：`--api-url` / 环境变量 `ACO_API_URL`（默认 `http://127.0.0.1:8000`）；`--token` / 环境变量 `ACO_MANAGEMENT_TOKEN` 以 bearer 头发送（服务端校验，缺失返回 `401`），任何输出与错误信息都不包含凭证。
 - 脚本使用：任意命令加 `--json` 得到稳定 JSON（stdout 仅含 JSON，创建前估算输出走 stderr）；API/HTTP 错误返回非零退出码（Ctrl-C 中断 `--wait` 返回 `130`）。
-- 幂等键：`--idempotency-key` 同时发送给服务端与本地 ledger（`ACO_CLI_STATE`，默认 `~/.config/aco/cli.json`）。服务端是幂等权威（#35）：相同 key 重试返回既有批次（即使本地 ledger 丢失）；相同 key 但参数不同返回 `409`。本地 ledger 只是便利缓存，同键重复 `run` 命中缓存时直接查询既有批次。
+- 幂等键：`--idempotency-key` 同时发送给服务端与本地 ledger（`ACO_CLI_STATE`，默认 `~/.config/aco/cli.json`）。服务端是幂等权威（#35）：`aco run` 始终向服务端提交完整当前请求，相同 key 重试返回既有批次（即使本地 ledger 丢失）；相同 key 但参数不同返回 `409`。本地 ledger 只在创建后记录 key → Experiment id，供人查阅，不参与请求决策。
 
 ## 结果查询、趋势与题目 × 配置矩阵（#19）
 

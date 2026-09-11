@@ -87,9 +87,12 @@ def test_run_with_suite_and_idempotency_key_replays(api, state, tmp_path, capsys
     assert "计划样本数: ≥ 1" in first
     exp_id = first.split("Experiment ")[1].split("（")[0]
 
+    # same key, same body, ledger present: the CLI always POSTs and the
+    # server replays the original experiment (#35 reopen)
     assert main([*common, "--idempotency-key", "key-1"]) == 0
     second = capsys.readouterr().out
-    assert f"已存在（幂等键 key-1）：Experiment {exp_id}" in second
+    assert second.split("Experiment ")[1].split("（")[0] == exp_id
+    assert json.loads(state.read_text())["key-1"] == exp_id
 
     # a different key creates a distinct experiment
     assert main([*common, "--idempotency-key", "key-2"]) == 0
@@ -98,8 +101,10 @@ def test_run_with_suite_and_idempotency_key_replays(api, state, tmp_path, capsys
 
 
 def test_run_replays_from_server_after_state_file_loss(api, state, tmp_path, capsys):
-    """#35: the server owns idempotency — losing the local ledger must not
-    duplicate the batch, and the same key with a different body must conflict."""
+    """#35 reopen: the server owns idempotency — the CLI never short-circuits
+    on the local ledger. A lost/corrupt/stale ledger still replays via the
+    server, and the same key with a different body conflicts even while the
+    ledger holds the original id."""
     write(tmp_path, "task.json", {"prompt": "T", "tests": []})
     write(tmp_path, "config.json", {"harness": "fake", "model": "fake-model"})
     assert main(["register", "task", "sl-task", "v1", str(tmp_path / "task.json"), "--api-url", api]) == 0
@@ -111,19 +116,28 @@ def test_run_replays_from_server_after_state_file_loss(api, state, tmp_path, cap
     first = capsys.readouterr().out
     exp_id = first.split("Experiment ")[1].split("（")[0]
 
-    state.unlink()  # ledger gone: the server is now the only idempotency authority
+    state.unlink()  # ledger lost: the server alone decides the replay
     assert main(common) == 0
-    second = capsys.readouterr().out
-    assert f"Experiment {exp_id}" in second
-    assert second.split("Experiment ")[1].split("（")[0] == exp_id
+    assert capsys.readouterr().out.split("Experiment ")[1].split("（")[0] == exp_id
 
-    # same key, different request: the server answers 409, the CLI exits 1.
-    # (the replay above re-saved the ledger; drop it again so the cache does
-    # not short-circuit before the server ever sees the key)
-    state.unlink()
+    state.write_text("{corrupt json")  # ledger corrupt: same POST path
+    assert main(common) == 0
+    assert capsys.readouterr().out.split("Experiment ")[1].split("（")[0] == exp_id
+
+    state.write_text(json.dumps({"lost": "nonexistent-experiment"}))  # stale
+    assert main(common) == 0
+    assert capsys.readouterr().out.split("Experiment ")[1].split("（")[0] == exp_id
+
+    # ledger present with the ORIGINAL id, different body: the server still
+    # answers 409 — the shortcut that used to hide this is gone
     conflict = ["run", "--task", "sl-task@v1", "--target", "sl-cfg@v1",
                 "--repetitions", "2", "--api-url", api, "--idempotency-key", "lost"]
     assert main(conflict) == 1
+    assert "idempotency_conflict" in capsys.readouterr().err
+    # a paid-flag change is a different canonical request under the same key
+    conflict2 = ["run", "--task", "sl-task@v1", "--target", "sl-cfg@v1",
+                 "--allow-paid-run", "--api-url", api, "--idempotency-key", "lost"]
+    assert main(conflict2) == 1
     assert "idempotency_conflict" in capsys.readouterr().err
 
 
