@@ -16,11 +16,13 @@ import pytest
 
 from mock_ark import MockArk
 from test_execution import (
+    HEALTH_TIMEOUT,
     MGMT_TOKEN,
     REPO_ROOT,
     create_trial,
     free_port,
     http,
+    pre_migrate,
     wait_for_run,
 )
 
@@ -72,6 +74,7 @@ def start_stack(root, mgmt_port, session_port, extra_env):
     logs = root / "stack-logs"
     logs.mkdir(parents=True, exist_ok=True)
     server_env = {**env, "ACO_DATA_ROOT": str(root)}
+    pre_migrate(server_env)
     procs = [
         subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "aco.app:management_app", "--port", str(mgmt_port),
@@ -85,9 +88,9 @@ def start_stack(root, mgmt_port, session_port, extra_env):
         subprocess.Popen(
             [sys.executable, "-m", "aco.execution", "--data-root", str(root),
              "--api-url", mgmt, "--api-token", MGMT_TOKEN, "--session-api-url", session_base],
-            env=env, stdout=subprocess.DEVNULL, stderr=open(logs / "manager.log", "w")),
+            env=server_env, stdout=subprocess.DEVNULL, stderr=open(logs / "manager.log", "w")),
     ]
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + HEALTH_TIMEOUT
     while time.monotonic() < deadline:
         try:
             if (http("GET", mgmt + "/healthz")[0] == 200
@@ -98,7 +101,7 @@ def start_stack(root, mgmt_port, session_port, extra_env):
             time.sleep(0.2)
     for proc in procs:
         proc.kill()
-    raise RuntimeError("API did not become healthy")
+    raise RuntimeError(f"API did not become healthy after {HEALTH_TIMEOUT:.0f}s")
 
 
 def stop_stack(stack):
