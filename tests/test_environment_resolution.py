@@ -81,7 +81,7 @@ def test_publish_is_idempotent_and_verifies(tmp_path):
     src = tmp_path / "env-src"
     (src / "workspace").mkdir(parents=True)
     (src / "workspace" / "README.md").write_text(README)
-    digest = __import__("aco.verification.runner", fromlist=["runner"]).bundle_digest(src)
+    digest = runner.bundle_digest(src)
     first = environments.publish(tmp_path, src, digest)
     assert first == environments.store_root(tmp_path) / digest
     assert environments.publish(tmp_path, src, digest) == first  # no-op re-import

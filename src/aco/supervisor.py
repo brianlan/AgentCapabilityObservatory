@@ -319,9 +319,7 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
         f'schema_version = "1.4"\n[environment]\ndocker_image = "{image}"\n'
         f'network_mode = "public"\n[agent]\ntimeout_sec = {agent_timeout_sec}\n'
     )
-    (task_dir / "environment" / "Dockerfile").write_text(
-        f"FROM {IMAGE}\n"
-        + ("COPY workspace/ /workspace/\n" if environment_dir is not None else ""))
+    (task_dir / "environment" / "Dockerfile").write_text(f"FROM {IMAGE}\n")
     compose = task_dir / "offline.yaml"
     compose.write_text(
         "services:\n"
