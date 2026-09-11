@@ -21,11 +21,12 @@ POLL_INTERVAL = 2.0
 
 
 def state_file() -> Path:
-    """Convenience cache for --idempotency-key replays (key -> experiment id).
+    """Display-only convenience cache (key -> experiment id).
 
-    The SERVER owns idempotency (#35); this ledger only short-circuits the
-    POST when it still holds the id. If the file is lost, the retry still
-    replays correctly because the same key is sent to the API again."""
+    The SERVER owns idempotency (#35 reopen): every ``aco run`` POSTs the
+    full current request and the server decides replay or 409 conflict.
+    This ledger is written after a create purely so a human can look up
+    the experiment id; it is never consulted before the POST."""
     return Path(os.environ.get("ACO_CLI_STATE", "~/.config/aco/cli.json")).expanduser()
 
 
@@ -121,19 +122,6 @@ def require_paid_run_consent(client: Client, targets: list[dict], allow_paid_run
 
 def cmd_run(args) -> int:
     client = Client(args.api_url, token=args.token)
-
-    if args.idempotency_key:
-        previous = load_state().get(args.idempotency_key)
-        if previous:
-            _, experiment = client.get(f"/v1/experiments/{previous}")
-            if args.wait:
-                return wait_loop(client, experiment, args)
-            if args.json:
-                emit(args, experiment)
-            else:
-                print(f"已存在（幂等键 {args.idempotency_key}）：Experiment {previous}")
-                print(progress_line(experiment))
-            return 0
 
     targets = [ref(t) for t in args.target]
     require_paid_run_consent(client, targets, args.allow_paid_run)
