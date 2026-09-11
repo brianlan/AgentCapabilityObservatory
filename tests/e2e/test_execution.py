@@ -7,6 +7,7 @@ Docker daemon is reachable.
 
 import hashlib
 import json
+import os
 import shutil
 import socket
 import sqlite3
@@ -22,12 +23,29 @@ REPO_ROOT = subprocess.run(
     ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True
 ).stdout.strip()
 MGMT_TOKEN = "e2e-management-token"
+# ponytail: matches the #48 loaded-CI budget; tunable for slow runners via env.
+HEALTH_TIMEOUT = float(os.environ.get("ACO_E2E_HEALTH_TIMEOUT", "90"))
 MGMT_AUTH = {"Authorization": f"Bearer {MGMT_TOKEN}"}
 ENV = {
     **dict(__import__("os").environ),
     "PYTHONPATH": f"{REPO_ROOT}/src",
     "ACO_MANAGEMENT_TOKEN": MGMT_TOKEN,
 }
+
+
+def pre_migrate(env):
+    """Migrate the data root once before spawning the API subprocesses.
+
+    Both uvicorn processes (and the manager, via aco.app's import side effects)
+    run db.migrate() on the same fresh data root at import time; concurrent
+    migrations race on the schema_version insert and one process dies with
+    `UNIQUE constraint failed` before /healthz can ever answer (#59).
+    """
+    subprocess.run(
+        [sys.executable, "-c",
+         "from aco.app import create_management_app; create_management_app()"],
+        env=env, check=True,
+    )
 
 
 def docker_available() -> bool:
@@ -70,6 +88,7 @@ def stack(tmp_path_factory):
     mgmt = f"http://127.0.0.1:{mgmt_port}"
     session_base = f"http://127.0.0.1:{session_port}"
     server_env = {**ENV, "ACO_DATA_ROOT": str(root)}
+    pre_migrate(server_env)
     server = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "aco.app:management_app", "--port", str(mgmt_port),
          "--log-level", "warning"],
@@ -83,11 +102,11 @@ def stack(tmp_path_factory):
     manager = subprocess.Popen(
         [sys.executable, "-m", "aco.execution", "--data-root", str(root),
          "--api-url", mgmt, "--api-token", MGMT_TOKEN, "--session-api-url", session_base],
-        env=ENV,
+        env=server_env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + HEALTH_TIMEOUT
     while time.monotonic() < deadline:
         try:
             if (http("GET", mgmt + "/healthz")[0] == 200
@@ -99,7 +118,7 @@ def stack(tmp_path_factory):
         server.kill()
         session_server.kill()
         manager.kill()
-        raise RuntimeError("API did not become healthy")
+        raise RuntimeError(f"API did not become healthy after {HEALTH_TIMEOUT:.0f}s")
     yield {"root": root, "base": mgmt, "session_base": session_base,
            "server": server, "manager": manager}
     server.terminate()

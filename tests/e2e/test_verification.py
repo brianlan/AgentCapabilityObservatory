@@ -21,6 +21,7 @@ import pytest
 
 from aco import artifacts
 from aco.verification import runner as verification_runner
+from test_execution import HEALTH_TIMEOUT, pre_migrate
 
 FIXTURES = Path(__file__).parent.parent / "fixtures" / "verifier"
 SCHEMA = "aco.verification-result/v1"
@@ -76,6 +77,7 @@ def stack(tmp_path_factory):
     env = {**dict(__import__("os").environ), "PYTHONPATH": f"{_repo_root()}/src",
            "ACO_MANAGEMENT_TOKEN": MGMT_TOKEN}
     server_env = {**env, "ACO_DATA_ROOT": str(root)}
+    pre_migrate(server_env)
     server = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "aco.app:management_app", "--port", str(mgmt_port),
          "--log-level", "warning"],
@@ -89,10 +91,10 @@ def stack(tmp_path_factory):
     manager = subprocess.Popen(
         [sys.executable, "-m", "aco.execution", "--data-root", str(root),
          "--api-url", base, "--api-token", MGMT_TOKEN, "--session-api-url", session_base],
-        env=env,
+        env=server_env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + HEALTH_TIMEOUT
     while time.monotonic() < deadline:
         try:
             if (http("GET", base + "/healthz")[0] == 200
@@ -104,7 +106,7 @@ def stack(tmp_path_factory):
         server.kill()
         session_server.kill()
         manager.kill()
-        raise RuntimeError("API did not become healthy")
+        raise RuntimeError(f"API did not become healthy after {HEALTH_TIMEOUT:.0f}s")
     yield {"root": root, "base": base}
     server.terminate()
     session_server.terminate()
