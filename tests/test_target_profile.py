@@ -42,7 +42,8 @@ def register_pi_skills(register):
     for name, version in (("pdf", "v2"), ("search", "v1")):
         register("skill", name, version, {
             "schema_version": 1, "entry": "SKILL.md",
-            "bundle": {"digest": "0" * 64, "bytes": 1, "files": 1}})
+            "bundle": {"digest": "0" * 64, "bytes": 1, "files": 1}},
+            assets=[{"name": "bundle", "digest": "0" * 64}])
 
 
 def create_trial(client, config_name="t1", version="v1", allow_paid_run=False):

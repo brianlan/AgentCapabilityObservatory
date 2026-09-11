@@ -145,6 +145,12 @@ def register_version(conn: sqlite3.Connection, reg: VersionRegistration) -> tupl
             ScorerContent.model_validate(reg.content)
         except ValueError as exc:
             raise AppError(422, "invalid_content", f"scorer content invalid: {exc}") from exc
+    elif reg.kind == "skill":
+        # one strict schema for every skill registration entry: the generic
+        # Registry API cannot register a skill the import path could never
+        # produce (#39 reopen). Lazy import — skills imports this module.
+        from .skills import validate_skill_registration
+        validate_skill_registration(reg)
 
     digest = version_digest(reg.kind, reg.name, reg.version, reg.content, reg.assets)
     row = fetch_version(conn, reg.kind, reg.name, reg.version)

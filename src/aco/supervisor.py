@@ -243,7 +243,14 @@ def resolve_skill_mounts(conn: sqlite3.Connection, parsed: TargetProfile,
         if row is None:
             state.append({**entry, "observed": "version_not_found"})
             continue
-        entry["requested"] = json.loads(row["content"])["bundle"]["digest"]
+        try:
+            requested = json.loads(row["content"])["bundle"]["digest"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            # malformed registry row (misregistration): the execution anomaly
+            # it is, never a supervisor crash (#39 reopen)
+            state.append({**entry, "observed": "malformed_content"})
+            continue
+        entry["requested"] = requested
         host_dir = root / "skills" / row["id"]
         if not host_dir.is_dir():
             state.append({**entry, "observed": "bundle_missing"})

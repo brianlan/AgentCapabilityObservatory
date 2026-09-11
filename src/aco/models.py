@@ -3,7 +3,7 @@
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class VersionRef(BaseModel):
@@ -91,6 +91,17 @@ class TargetProfile(BaseModel):
         if value is not None and not _DIGEST_RE.match(value):
             raise ValueError("content references must be canonical digests sha256:<64 hex>")
         return value
+
+    @model_validator(mode="after")
+    def _unique_skill_names(self) -> "TargetProfile":
+        # duplicate names would alias the same /opt/aco-skills/<name> mount,
+        # so the loaded set could never equal the declared ordered set (#39 reopen)
+        names = [s.name for s in self.skills]
+        if len(names) != len(set(names)):
+            raise ValueError(
+                "duplicate skill name in skills: each declared skill must map "
+                "to a unique mount path")
+        return self
 
 
 def parse_config_content(content: dict) -> TargetProfile:

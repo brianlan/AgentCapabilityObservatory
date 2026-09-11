@@ -116,12 +116,11 @@ def test_v1_config_requires_registered_skill_version(client, register):
 
 
 def test_v1_config_resolves_declared_skills(client, register):
-    register("skill", "a-skill", "v1", {
-        "schema_version": 1, "entry": "SKILL.md",
-        "bundle": {"digest": "a" * 64, "bytes": 1, "files": 1}})
-    register("skill", "b-skill", "v1", {
-        "schema_version": 1, "entry": "SKILL.md",
-        "bundle": {"digest": "b" * 64, "bytes": 1, "files": 1}})
+    for name, digest in (("a-skill", "a" * 64), ("b-skill", "b" * 64)):
+        register("skill", name, "v1",
+                 {"schema_version": 1, "entry": "SKILL.md",
+                  "bundle": {"digest": digest, "bytes": 1, "files": 1}},
+                 assets=[{"name": "bundle", "digest": digest}])
     register("config", "pi-ordered", "v1", make_profile(
         [{"name": "b-skill", "version": "v1"}, {"name": "a-skill", "version": "v1"}]))
 
@@ -133,7 +132,8 @@ def test_skill_order_and_content_change_fingerprint(client, register, tmp_path, 
     conn.row_factory = sqlite3.Row
     register("skill", "demo", "v1", {
         "schema_version": 1, "entry": "SKILL.md",
-        "bundle": {"digest": "d" * 64, "bytes": 10, "files": 1}})
+        "bundle": {"digest": "d" * 64, "bytes": 10, "files": 1}},
+        assets=[{"name": "bundle", "digest": "d" * 64}])
     profile_a = parse_config_content(make_profile([{"name": "demo", "version": "v1"}]))
     profile_b = parse_config_content(make_profile([]))
     profile_c = parse_config_content(make_profile(
@@ -141,3 +141,73 @@ def test_skill_order_and_content_change_fingerprint(client, register, tmp_path, 
     from aco.app import trial_fingerprint
     assert trial_fingerprint(profile_a) != trial_fingerprint(profile_b)
     assert trial_fingerprint(profile_a) != trial_fingerprint(profile_c)
+
+
+# --- reopened scope (#39): one strict schema on every registration entry ---
+
+_SKILL_C = {"schema_version": 1, "entry": "SKILL.md",
+            "bundle": {"digest": "a" * 64, "bytes": 1, "files": 1}}
+
+
+def test_api_rejects_malformed_skill_registration(client, register):
+    """The generic Registry API cannot register a skill the import path
+    could never produce; malformed content/assets get 422 (#39 reopen)."""
+    cases = [
+        ("missing entry", {"schema_version": 1,
+                           "bundle": {"digest": "a" * 64, "bytes": 1, "files": 1}}),
+        ("wrong entry", {"schema_version": 1, "entry": "OTHER.md",
+                         "bundle": {"digest": "a" * 64, "bytes": 1, "files": 1}}),
+        ("missing bundle", {"schema_version": 1, "entry": "SKILL.md"}),
+        ("extra content field", {**_SKILL_C, "notes": "x"}),
+        ("digest not hex", {**_SKILL_C, "bundle": {"digest": "zz", "bytes": 1, "files": 1}}),
+        ("bytes not positive", {**_SKILL_C, "bundle": {"digest": "a" * 64, "bytes": 0, "files": 1}}),
+        ("files missing", {**_SKILL_C, "bundle": {"digest": "a" * 64, "bytes": 1}}),
+    ]
+    for label, content in cases:
+        resp = client.post("/v1/versions", json={
+            "kind": "skill", "name": "demo", "version": "v1", "content": content})
+        assert resp.status_code == 422, label
+    for label, assets in [
+        ("assets missing", []),
+        ("assets digest mismatch", [{"name": "bundle", "digest": "b" * 64}]),
+        ("two assets", [{"name": "bundle", "digest": "a" * 64}] * 2),
+        ("asset wrong name", [{"name": "other", "digest": "a" * 64}]),
+    ]:
+        resp = client.post("/v1/versions", json={
+            "kind": "skill", "name": "demo", "version": "v1",
+            "content": _SKILL_C, "assets": assets})
+        assert resp.status_code == 422, label
+    for label, name, version in [
+        ("invalid name", "Bad Name", "v1"), ("invalid version", "demo", "v 1")]:
+        resp = client.post("/v1/versions", json={
+            "kind": "skill", "name": name, "version": version,
+            "content": _SKILL_C, "assets": [{"name": "bundle", "digest": "a" * 64}]})
+        assert resp.status_code == 422, label
+    # control: the conforming shape registers, and re-POST is idempotent
+    register("skill", "demo", "v1", _SKILL_C,
+             assets=[{"name": "bundle", "digest": "a" * 64}], expect=(201,))
+    register("skill", "demo", "v1", _SKILL_C,
+             assets=[{"name": "bundle", "digest": "a" * 64}], expect=(200,))
+
+
+def test_config_rejects_duplicate_skill_names(client, register):
+    """Same-name duplicates — same version or different versions — fail at
+    config registration: one declared skill = one unique mount path."""
+    register("skill", "dup", "v1", _SKILL_C,
+             assets=[{"name": "bundle", "digest": "a" * 64}])
+    register("skill", "dup", "v2", {**_SKILL_C, "bundle": {"digest": "b" * 64, "bytes": 2, "files": 1}},
+             assets=[{"name": "bundle", "digest": "b" * 64}])
+    register("skill", "other", "v1", {**_SKILL_C, "bundle": {"digest": "c" * 64, "bytes": 3, "files": 1}},
+             assets=[{"name": "bundle", "digest": "c" * 64}])
+    for label, refs in [
+        ("same version twice", [{"name": "dup", "version": "v1"},
+                                {"name": "dup", "version": "v1"}]),
+        ("different versions", [{"name": "dup", "version": "v1"},
+                                {"name": "dup", "version": "v2"}])]:
+        resp = client.post("/v1/versions", json={
+            "kind": "config", "name": "pi-dup", "version": "v1",
+            "content": make_profile(refs)})
+        assert resp.status_code == 422, label
+    # distinct names, order preserved: still legal
+    register("config", "pi-ok", "v1", make_profile(
+        [{"name": "dup", "version": "v2"}, {"name": "other", "version": "v1"}]))

@@ -239,6 +239,27 @@ class TestSkillMaterialization:
         assert state[0]["verified"] is False
         assert state[0]["observed"] == "bundle_missing"
 
+    def test_malformed_content_fails_closed(self, tmp_path, conn):
+        """A skill row with malformed content (misregistration the #39
+        reopen API guard now rejects upstream) becomes the pre-agent
+        execution anomaly it is — not a supervisor KeyError crash."""
+        import json as _json
+        from aco.models import parse_config_content
+        from aco.supervisor import resolve_skill_mounts
+        conn.execute(
+            "INSERT INTO versions (id, kind, name, version, content, assets,"
+            " created_at) VALUES (?, 'skill', 'demo', 'v1', ?, '[]',"
+            " '2026-01-01T00:00:00Z')",
+            ("deadbeef", _json.dumps({"schema_version": 1})))
+        conn.commit()
+        parsed = parse_config_content(self._profile(
+            [{"name": "demo", "version": "v1"}]))
+        state = resolve_skill_mounts(conn, parsed, tmp_path)
+        assert state[0]["verified"] is False
+        assert state[0]["observed"] == "malformed_content"
+        assert state[0]["requested"] is None
+        assert "host_dir" not in state[0]
+
     def test_build_task_dir_mounts_declared_skills_readonly(self, tmp_path, monkeypatch):
         from aco.supervisor import build_task_dir, gateway_config, pi_agent
         monkeypatch.setenv("ARK_AGENT_PLAN_BASE_URL", "https://ark.example.com/api/v3")
