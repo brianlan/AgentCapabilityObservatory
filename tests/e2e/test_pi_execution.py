@@ -133,9 +133,8 @@ def pi_stack(tmp_path_factory):
     # build the pinned image once and read its content digest: the profile's
     # declared environment must be the digest of the image that will run
     # (#36 reopen) — this also warms the docker cache for the module
-    from aco.pi_agent import ensure_image
-    from aco.supervisor import image_digest
-    built_digest = image_digest(ensure_image())
+    from aco.pi_agent import build_image
+    built_digest = build_image()
     stack = start_stack(root, free_port(), free_port(), {
         "ACO_DATA_ROOT": str(root),
         "ARK_AGENT_PLAN_API_KEY": DUMMY_KEY,
@@ -405,9 +404,8 @@ class TestPiCredentialMissing:
         mock = MockArk()
         root = tmp_path_factory.mktemp("aco-pi-e2e-nokey")
         # this stack has no pi_stack fixture: pin the image digest locally
-        from aco.pi_agent import ensure_image
-        from aco.supervisor import image_digest
-        built_digest = image_digest(ensure_image())
+        from aco.pi_agent import build_image
+        built_digest = build_image()
         stack = start_stack(root, free_port(), free_port(), {
             "ACO_DATA_ROOT": str(root),
             # ARK_AGENT_PLAN_API_KEY deliberately absent

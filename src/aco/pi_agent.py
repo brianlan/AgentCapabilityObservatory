@@ -103,6 +103,14 @@ def ark_base_url() -> str:
     return os.environ.get(ARK_BASE_URL_ENV, ARK_DEFAULT_BASE_URL).rstrip("/")
 
 
+def is_real_ark_endpoint() -> bool:
+    """True when the effective provider upstream is the real Ark host — the
+    billing path, regardless of credential presence (#38 reopen)."""
+    from urllib.parse import urlsplit
+
+    return urlsplit(ark_base_url()).hostname == urlsplit(ARK_DEFAULT_BASE_URL).hostname
+
+
 def provider_base_url() -> str:
     """The base URL rendered into pi's config: the per-trial gateway when the
     supervisor provides one (#38), the profile endpoint otherwise (unit
@@ -111,7 +119,10 @@ def provider_base_url() -> str:
 
 
 def render_dockerfile() -> str:
-    """The pinned trial image: node at a digest, pi at an exact version.
+    """The pinned trial image: node at a digest, pi at an exact version,
+    python3 for the declared task environment (first-batch tasks run their
+    checks with python — provided at build time, never at run time, #38
+    reopen).
 
     WORKDIR /workspace: the artifact contract seals /workspace (#14) and the
     agent's deliverables land there — the dir must exist before the agent
@@ -119,6 +130,8 @@ def render_dockerfile() -> str:
     the same)."""
     return (
         f"FROM {NODE_IMAGE}\n"
+        "RUN apt-get update && apt-get install -y --no-install-recommends python3 \\\n"
+        "    && rm -rf /var/lib/apt/lists/*\n"
         f"RUN npm install -g --ignore-scripts {PI_PACKAGE}@{PI_VERSION}\n"
         "WORKDIR /workspace"
     )
@@ -449,17 +462,34 @@ class PiAgent(BaseInstalledAgent):
             conn.close()
 
 
-def ensure_image() -> str:
-    """Idempotent local build of the pinned trial image.
+def image_digest(image_ref: str) -> str:
+    """The image's immutable content digest (docker inspect .Id, the config
+    digest `sha256:<64 hex>`) — the observed half of the environment
+    verification (#36 reopen) and the digest the trial pins (#38 reopen).
+    Raises RuntimeError when the image does not exist locally."""
+    import subprocess
 
-    Builds unconditionally: docker's layer cache makes an unchanged build a
-    no-op, and a tag-exists short-circuit would keep serving a stale image
-    after any Dockerfile change (e.g. the WORKDIR fix, #38).
+    result = subprocess.run(
+        ["docker", "image", "inspect", "--format", "{{.Id}}", image_ref],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"image inspect failed for {image_ref}: {result.stderr[-400:]}")
+    return result.stdout.strip()
 
-    --network host: on hosts where the docker daemon injects an
-    unreachable-into-container proxy, the default build network cannot reach
-    the npm registry; host networking sidesteps that. Build-time only — the
-    trial network itself is restricted by the egress sidecar (#38).
+
+def build_image() -> str:
+    """Pre-build the pinned trial image; return its immutable content digest.
+
+    Runs OUTSIDE the trial hot path (#38 reopen): the execution manager calls
+    this before spawning any supervisor, and `aco build-agent-image` exposes
+    it to operators. A trial start only inspects the result — no docker
+    build, no npm, no registry access there. docker's layer cache makes an
+    unchanged rebuild a no-op, and there is deliberately no tag-exists
+    short-circuit: a stale image must never survive a Dockerfile change
+    (e.g. the WORKDIR fix, #38). --network host is build-time only (npm
+    registry reachability on hosts with an unreachable daemon proxy); the
+    trial runtime itself stays restricted (#38).
     """
     import subprocess
     import tempfile
@@ -472,7 +502,7 @@ def ensure_image() -> str:
         )
     if build.returncode != 0:
         raise RuntimeError(f"pinned pi image build failed: {build.stderr[-800:]}")
-    return PI_IMAGE_TAG
+    return image_digest(PI_IMAGE_TAG)
 
 
 def _open_db() -> sqlite3.Connection:

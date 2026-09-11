@@ -270,7 +270,8 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
                    skill_mounts: list[dict] | None = None,
                    allowed_hosts: list[str] | None = None,
                    gateway: dict | None = None,
-                   environment_dir: Path | None = None) -> Path:
+                   environment_dir: Path | None = None,
+                   image_digest_ref: str | None = None) -> Path:
     """Minimal Harbor task dir: registry prompt as instruction, pinned image,
     compose override with our identification label.
 
@@ -301,13 +302,16 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
         workspace_mount = f'      - "{materialized}:/workspace"\n'
     image = pi_agent.PI_IMAGE_TAG if harness == PI_HARNESS else IMAGE
     if harness == PI_HARNESS:
+        # digest-pinned: the task runs exactly the image whose content digest
+        # was verified against the profile's declared environment (#38 reopen)
+        if image_digest_ref:
+            image = image_digest_ref
         hosts = ", ".join(f'"{h}"' for h in (allowed_hosts or [gateway_ip(run_id)]))
         (task_dir / "task.toml").write_text(
             f'schema_version = "1.4"\n[environment]\ndocker_image = "{image}"\n'
             f'network_mode = "allowlist"\nallowed_hosts = [{hosts}]\n'
             f'[agent]\ntimeout_sec = {agent_timeout_sec}\n'
         )
-        (task_dir / "environment" / "Dockerfile").write_text(pi_agent.render_dockerfile())
         provider = urllib.parse.urlsplit(gateway["provider_upstream"])
         # pi renders baseUrl = gateway IP + provider path; the gateway
         # forwards the full path to the fixed upstream. Static IP: no DNS on
@@ -373,13 +377,6 @@ def build_task_dir(work_dir: Path, instruction: str, agent_timeout_sec: int, run
         f"      {RUN_LABEL}: {run_id}\n"
     )
     return task_dir
-
-
-def image_digest(image_ref: str) -> str:
-    """The image's content digest (`docker inspect` RepoDigests/Id), the
-    observed half of the environment verification (#36 reopen)."""
-    result = command("docker", "image", "inspect", "--format", "{{.Id}}", image_ref)
-    return result.stdout.strip()
 
 
 def discover_container(run_id: str) -> str:
@@ -584,6 +581,16 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     env_overrides: dict = {}
     if harness == PI_HARNESS:
         parsed_profile = parse_config_content(profile)
+        # CI hard-reject (#38 reopen): an automated environment never reaches
+        # the real provider — not with allow_paid_run, not with a credential
+        # present. The endpoint is the billing path; this fires before any
+        # container or model call.
+        if os.environ.get("CI") and pi_agent.is_real_ark_endpoint():
+            detail = ("real provider endpoint is hard-rejected in CI;"
+                      " automated environments use explicit mock endpoints only")
+            runs.finish_run(conn, run_id, "error", runs.EXIT_ENVIRONMENT_INVALID, detail)
+            _fail_before_agent_start(conn, run, "environment_invalid", detail)
+            return
         # the declared prompt digest is a controlled condition (#36 reopen):
         # the resolved instruction (the exact bytes the agent will run on)
         # must match what the profile pinned — checked before any container
@@ -617,11 +624,22 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         # the container sees (#39)
         skill_mounts = [{"name": s["name"], "host_dir": s["host_dir"]}
                         for s in skill_state]
-        image_ref = await asyncio.to_thread(pi_agent.ensure_image)
+        # the image is prebuilt by the execution manager (or the operator,
+        # `aco build-agent-image`) before the supervisor starts (#38 reopen):
+        # trial start only resolves its immutable digest — no docker build,
+        # no npm install, no registry access in the hot path
+        try:
+            observed_image = await asyncio.to_thread(
+                pi_agent.image_digest, pi_agent.PI_IMAGE_TAG)
+        except Exception as exc:  # noqa: BLE001 — a missing prebuild is terminal
+            detail = (f"agent image not prebuilt: {exc}"
+                      " — run `aco build-agent-image` or start the execution manager first")
+            runs.finish_run(conn, run_id, "error", runs.EXIT_ENVIRONMENT_INVALID, detail)
+            _fail_before_agent_start(conn, run, "environment_invalid", detail)
+            return
         # the declared environment digest is verified against the image that
         # will actually run (#36 reopen): a rebuilt image with different
         # bytes must never pass as the same controlled condition
-        observed_image = await asyncio.to_thread(image_digest, image_ref)
         requested_image = parsed_profile.environment
         runs.add_phase(conn, run_id, "image_digest", requested=requested_image,
                        observed=observed_image)
@@ -682,7 +700,8 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     task_dir = build_task_dir(work_dir, instruction, agent_timeout_sec,
                               run_id, harness=harness, skill_mounts=skill_mounts,
                               allowed_hosts=allowed_hosts, gateway=gateway,
-                              environment_dir=env_dir)
+                              environment_dir=env_dir,
+                              image_digest_ref=observed_image if harness == PI_HARNESS else None)
     trials_dir = work_dir / "trials"
     container_id = None
     agent_started_at: dict | None = None

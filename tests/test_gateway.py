@@ -5,6 +5,7 @@ close, upstream timeout)."""
 import json
 import socket
 import struct
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -377,6 +378,141 @@ def test_client_disconnect_mid_stream_still_records(tmp_path, monkeypatch):
 
         status, body = get(base, "/v1/session/task", auth="Bearer t")
         assert status == 200 and body == '{"ok": true}'
+    finally:
+        server.shutdown()
+        stub.close()
+
+
+# --- upstream scheme correctness: TLS upstreams verified, unknown rejected
+# (#38 reopen) — the default Ark upstream is https and must never be
+# forwarded as plaintext HTTP ---
+
+def test_connection_selection_by_scheme():
+    from urllib.parse import urlsplit
+    assert type(gateway_module._Gateway._connection_for(
+        urlsplit("https://ark.example.com/api/v3"))).__name__ == "HTTPSConnection"
+    assert type(gateway_module._Gateway._connection_for(
+        urlsplit("http://127.0.0.1:9"))).__name__ == "HTTPConnection"
+    assert gateway_module._Gateway._connection_for(urlsplit("ftp://host/x")) is None
+
+
+def _make_certs(base):
+    """Self-signed CA + server cert for 127.0.0.1; returns (ca, key, crt)."""
+    ca_key, ca_crt = base / "ca.key", base / "ca.crt"
+    key, csr, crt = base / "srv.key", base / "srv.csr", base / "srv.crt"
+    ext = base / "ext.cnf"
+    ext.write_text("subjectAltName=IP:127.0.0.1\n")
+    def run(*args):
+        subprocess.run(args, check=True, capture_output=True)
+    run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", ca_key, "-out", ca_crt, "-subj", "/CN=test-ca", "-days", "2")
+    run("openssl", "req", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", key, "-out", csr, "-subj", "/CN=127.0.0.1", "-days", "2")
+    run("openssl", "x509", "-req", "-in", csr, "-CA", ca_crt, "-CAkey", ca_key,
+        "-CAcreateserial", "-out", crt, "-days", "2", "-extfile", ext)
+    return ca_crt, key, crt
+
+
+class _TlsStub:
+    """HTTPS recording stub: one SSE-flavored POST answer."""
+
+    def __init__(self, key, crt):
+        import ssl
+        self.requests = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _answer(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                outer.requests.append((self.path, self.headers.get("Host")))
+                body = b'data: {"type": "response.output_text.delta"}\n\n'
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST = _answer
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(crt, key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.server = server
+
+    @property
+    def port(self):
+        return self.server.server_port
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture()
+def tls_stack(tmp_path, monkeypatch):
+    ca, key, crt = _make_certs(tmp_path)
+    stub = _TlsStub(key, crt)
+    evidence = tmp_path / "gateway-tls.jsonl"
+    monkeypatch.setenv("ACO_GATEWAY_CA_BUNDLE", str(ca))
+    base, server = _spin_gateway(
+        monkeypatch, evidence, f"https://127.0.0.1:{stub.port}", f"https://127.0.0.1:{stub.port}")
+    yield {"base": base, "stub": stub, "evidence": evidence, "ca": ca,
+           "server": server}
+    server.shutdown()
+    stub.close()
+
+
+def test_https_upstream_dials_tls_and_streams(tls_stack):
+    """An https upstream is dialed as verified TLS (CA bundle) and the
+    streaming response relays back intact; SNI/Host follow the upstream
+    netloc (#38 reopen)."""
+    status, body = get(tls_stack["base"], "/api/v3/responses", auth="Bearer paid-key")
+    assert status == 200
+    assert body.startswith("data: ")
+    path, host = tls_stack["stub"].requests[-1]
+    assert path == "/api/v3/responses"
+    assert host == f"127.0.0.1:{tls_stack['stub'].port}"
+    entries = [json.loads(line) for line in tls_stack["evidence"].read_text().splitlines()]
+    assert entries[-1]["status"] == 200
+
+
+def test_https_upstream_untrusted_cert_fails_closed(tmp_path, monkeypatch):
+    """Without a trust anchor for the upstream cert, the gateway fails
+    closed — no plaintext fallback, the refusal is recorded (#38 reopen)."""
+    ca, key, crt = _make_certs(tmp_path)
+    stub = _TlsStub(key, crt)
+    evidence = tmp_path / "gateway-untrusted.jsonl"
+    monkeypatch.delenv("ACO_GATEWAY_CA_BUNDLE", raising=False)
+    base, server = _spin_gateway(
+        monkeypatch, evidence, f"https://127.0.0.1:{stub.port}", "http://127.0.0.1:9")
+    try:
+        status, _body = get(base, "/api/v3/responses", auth="Bearer paid-key")
+        assert status == 502
+        entries = [json.loads(line) for line in evidence.read_text().splitlines()]
+        assert entries[-1]["status"] == 0  # TLS verification refused the connection
+        assert stub.requests == []  # nothing reached the upstream
+    finally:
+        server.shutdown()
+        stub.close()
+
+
+def test_unknown_upstream_scheme_rejected(tmp_path, monkeypatch):
+    """A non-http(s) upstream fails closed with evidence (#38 reopen)."""
+    stub = _Stub()
+    evidence = tmp_path / "gateway-scheme.jsonl"
+    base, server = _spin_gateway(
+        monkeypatch, evidence, "ftp://127.0.0.1:9/api/v3", stub.base)
+    try:
+        status, body = get(base, "/api/v3/responses", auth="Bearer paid-key")
+        assert status == 502 and "unsupported upstream scheme" in body
+        entries = [json.loads(line) for line in evidence.read_text().splitlines()]
+        assert entries[-1]["error"] == "unsupported_upstream_scheme"
     finally:
         server.shutdown()
         stub.close()

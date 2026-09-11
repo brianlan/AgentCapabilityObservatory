@@ -12,6 +12,7 @@ response bodies, and never the Authorization header.
 import http.client
 import json
 import os
+import ssl
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,6 +22,9 @@ SESSION_PREFIX = "/v1/session/"
 EVIDENCE_FILE = os.environ.get("ACO_GATEWAY_EVIDENCE", "")
 # per-upstream connect/read timeout; module constant so tests can shrink it
 UPSTREAM_TIMEOUT_SEC = 120
+# optional CA bundle for upstream TLS verification (private/mocked upstreams);
+# unset means the default system trust store (real Ark uses a public CA)
+CA_BUNDLE = os.environ.get("ACO_GATEWAY_CA_BUNDLE", "")
 
 PROVIDER_UPSTREAM = urlsplit(os.environ.get("ACO_GATEWAY_PROVIDER_UPSTREAM", ""))
 SESSION_UPSTREAM = urlsplit(os.environ.get("ACO_GATEWAY_SESSION_UPSTREAM", ""))
@@ -55,6 +59,22 @@ class _Gateway(BaseHTTPRequestHandler):
             return PROVIDER_UPSTREAM
         return None
 
+    @staticmethod
+    def _connection_for(upstream):
+        """Scheme-correct upstream connection (#38 reopen): https dials TLS
+        with certificate verification; http stays plaintext for local mocks;
+        anything else fails closed. SNI and Host follow netloc automatically."""
+        if upstream.scheme == "https":
+            if CA_BUNDLE:
+                context = ssl.create_default_context(cafile=CA_BUNDLE)
+            else:
+                context = ssl.create_default_context()
+            return http.client.HTTPSConnection(upstream.netloc, timeout=UPSTREAM_TIMEOUT_SEC,
+                                               context=context)
+        if upstream.scheme == "http":
+            return http.client.HTTPConnection(upstream.netloc, timeout=UPSTREAM_TIMEOUT_SEC)
+        return None
+
     def do_POST(self):
         self._relay()
 
@@ -78,8 +98,14 @@ class _Gateway(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in ("host", "connection", "transfer-encoding")}
+        connection = self._connection_for(upstream)
+        if connection is None:
+            # unknown upstream scheme: fail closed, leave secret-free evidence (#38 reopen)
+            _record({"route": upstream.netloc, "method": self.command,
+                     "path": self.path, "status": 502, "error": "unsupported_upstream_scheme"})
+            self.send_error(502, "unsupported upstream scheme")
+            return
         try:
-            connection = http.client.HTTPConnection(upstream.netloc, timeout=UPSTREAM_TIMEOUT_SEC)
             connection.request(self.command, self.path,
                                body=self.rfile.read(length) if length else None,
                                headers=headers)
