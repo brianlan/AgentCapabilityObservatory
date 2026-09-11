@@ -27,6 +27,12 @@ verification runner's container invocation):
   nop          the unmodified initial workspace fails 0/3
   cheats       every declared wrong answer must fail
   rescore      the same sealed answer scores identically on repeat
+  registration the verifier bundle and the public environment are imported
+               into the data root's content-addressed stores and the task
+               and scorer versions are registered
+  rebuild      instruction and initial workspace reconstructed from the
+               registered TaskVersion alone (store, never the author tree)
+               seal and pass through the official entries
 
 Promotion to Core is never automatic: `promote --to core` requires an
 all-passed report and an explicit --reviewed-by human name.
@@ -43,11 +49,12 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from .. import artifacts, db
+from .. import artifacts, db, environments
 from ..app import AppError, register_version, version_digest
 from ..models import AssetRef, ScorerContent, VersionRegistration
 from ..verification import runner
@@ -85,6 +92,7 @@ class Bundle:
     manifest: dict
     verifier: ScorerContent
     wrong_cases: list[str]
+    instruction_path: str
 
     @classmethod
     def load(cls, path: Path) -> "Bundle":
@@ -112,11 +120,30 @@ class Bundle:
             raise AdmissionError(f"verifier contract invalid: {exc}") from exc
         wrong = path / WRONG_DIR
         cases = sorted(p.name for p in wrong.iterdir() if p.is_dir()) if wrong.is_dir() else []
-        bundle = cls(path=path, manifest=manifest, verifier=verifier, wrong_cases=cases)
         for rel in (PUBLIC_ENV, VERIFIER_DIR, REFERENCE_DIR):
-            bundle.required_dir(rel)  # fail fast on a malformed layout
+            if not (path / rel).is_dir():
+                raise AdmissionError(f"bundle layout missing directory: {rel}/")
+        bundle = cls(path=path, manifest=manifest, verifier=verifier, wrong_cases=cases,
+                     instruction_path=cls._load_instruction_path(manifest, path / PUBLIC_ENV))
         bundle.contract  # fail fast on a missing/invalid artifact contract
         return bundle
+
+    @staticmethod
+    def _load_instruction_path(manifest: dict, public_env: Path) -> str:
+        """The instruction's single declared source inside the public
+        environment (#20 reopen): a bundle-relative path, registered as a
+        content-addressed reference and served from the immutable asset."""
+        rel = manifest.get("instruction")
+        if not isinstance(rel, str) or not rel:
+            raise AdmissionError('manifest field "instruction" must be a path inside public/environment/')
+        if rel.startswith("/") or ".." in Path(rel).parts:
+            raise AdmissionError(f'instruction path escapes public/environment/: {rel!r}')
+        file_path = public_env / rel
+        if not file_path.is_file():
+            raise AdmissionError(f"instruction file missing from public/environment/: {rel}")
+        if not file_path.read_text().strip():
+            raise AdmissionError(f"instruction file is empty: {rel}")
+        return rel
 
     def required_dir(self, rel: str) -> Path:
         target = self.path / rel
@@ -405,6 +432,63 @@ def rescore_gate(bundle: Bundle, root: Path, scope: str) -> dict:
     return {"ok": True, "detail": f"same sealed answer scored identically twice (pass={verdicts[0]['pass']})"}
 
 
+def rebuild_gate(conn, data_root: Path, registered: dict | None, scope: str) -> dict:
+    """Rebuild from the registered TaskVersion alone (#20 reopen).
+
+    The author's source tree is not consulted: the instruction and the
+    initial workspace come out of the content-addressed store through the
+    same resolution the supervisor and the Session API use, and the rebuilt
+    workspace goes through the official sealing and scoring entries with the
+    stored verifier bundle. The oracle gate (3/3 on the author tree) proves
+    the task is solvable; this gate proves the registered bytes rebuild the
+    same starting point through the real execution path — an unworked
+    initial workspace must not pass."""
+    if not registered:
+        return {"ok": False, "detail": "skipped: registration failed"}
+    task_row = conn.execute("SELECT content, assets FROM versions WHERE id = ?",
+                            (registered["version_id"],)).fetchone()
+    scorer_row = conn.execute("SELECT content FROM versions WHERE id = ?",
+                              (registered["scorer_id"],)).fetchone()
+    try:
+        content = json.loads(task_row["content"])
+        instruction, env_dir = environments.resolve_instruction(
+            content, json.loads(task_row["assets"]), data_root)
+        if not instruction.strip():
+            return {"ok": False, "detail": "reconstructed instruction is empty"}
+        contract = artifacts.resolve_task_contract(content)
+        scorer = ScorerContent.model_validate(json.loads(scorer_row["content"]))
+    except (environments.EnvironmentInvalid, artifacts.SealError, ValueError,
+            KeyError) as exc:
+        return {"ok": False, "detail": f"registered version unusable: {exc}"}
+    verifier_dir = data_root / "verifiers" / registered["scorer_id"]
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp) / "workspace"
+        try:
+            shutil.copytree(env_dir / "workspace", workspace)
+        except OSError as exc:
+            return {"ok": False, "detail": f"registered environment has no workspace/: {exc}"}
+        try:
+            answer_dir = prepare_answer(content["image"], workspace, data_root,
+                                        _workspace_label(scope, "rebuild", 1), contract)
+        except artifacts.SealError as exc:
+            # the unmodified registered workspace cannot even produce a
+            # complete answer: the materialization itself is proven, and the
+            # task certainly cannot be passed without work (nop rule)
+            return {"ok": True,
+                    "detail": "instruction and workspace rebuilt from the registered"
+                              f" TaskVersion alone; initial workspace cannot seal: {exc}"}
+        verdict = score_answer(answer_dir, verifier_dir, scorer, data_root,
+                               _workspace_label(scope, "rebuild", 1))
+    if verdict == {"status": "succeeded", "pass": True}:
+        return {"ok": False,
+                "detail": "unmodified registered workspace passed — verifier accepts a no-op"}
+    if verdict["status"] != "succeeded":
+        return {"ok": False, "detail": f"rebuild scoring error: {verdict}"}
+    return {"ok": True,
+            "detail": "instruction and workspace rebuilt from the registered TaskVersion"
+                      " alone; unmodified workspace failed scoring as required"}
+
+
 def _markdown_report(report: dict) -> str:
     lines = [f"# Admission report — {report['task']['name']}@{report['task']['version']}", ""]
     if not report["all_passed"]:
@@ -468,6 +552,9 @@ def run_admission(bundle_path: Path, data_root: Path) -> dict:
     else:
         gates["registration"] = {"ok": False, "detail": "skipped: earlier gates failed"}
 
+    # last gate, against the registered bytes only (#20 reopen)
+    gates["rebuild"] = rebuild_gate(runner_conn, data_root, registered, scope)
+
     all_passed = all(g["ok"] for g in gates.values())
 
     task_registration_digest = registered["version_id"] if registered else None
@@ -476,7 +563,9 @@ def run_admission(bundle_path: Path, data_root: Path) -> dict:
         "generated_at": utcnow(),
         "all_passed": all_passed,
         "task": {"name": bundle.manifest["name"], "version": bundle.manifest["version"],
-                 "provenance": bundle.provenance()},
+                 "provenance": bundle.provenance(),
+                 "instruction": {"asset": environments.INSTRUCTION_ASSET,
+                                 "path": bundle.instruction_path}},
         "digests": {"verifier_bundle": verifier_bundle_digest,
                     "environment": environment_digest,
                     "artifact_contract": contract_digest,
@@ -507,16 +596,19 @@ def _rollback_candidate(conn, created_rows: list[str], staging: Path) -> None:
 
 def _register_candidate(conn, bundle: Bundle, data_root: Path,
                         verifier_bundle_digest: str, environment_digest: str) -> dict:
-    """Stage the trusted verifier bundle into the runtime data root and
+    """Publish the agent-visible public environment into the content-addressed
+    store, stage the trusted verifier bundle into the runtime data root, and
     register the task and scorer versions through the normal registry.
 
     The DB keeps only versions, digests, provenance, and a report reference;
-    the executable bundle goes to verifiers/<scorer_id> — exactly where
-    verification.runner loads it. The bundle is staged in a private
-    directory and published with one atomic rename only after a fully
-    successful registration, so a failed attempt never removes a directory
-    another admission may already be using. Any failure leaves no apparently
-    usable candidate: staging and exactly the version rows this attempt
+    the executable verifier bundle goes to verifiers/<scorer_id> and the
+    public environment bytes to environments/<environment_digest> — exactly
+    where verification.runner and the supervisor's materialization load them
+    (#20 reopen). Both are staged in private directories and published with
+    one atomic rename only after digest verification; an already-present
+    content-addressed directory with matching bytes makes the publish a
+    no-op (idempotent re-import). Any failure leaves no apparently usable
+    candidate: staging directories and exactly the version rows this attempt
     inserted (status 201) are removed; rows returned idempotently (200) are
     never touched.
     """
@@ -530,7 +622,11 @@ def _register_candidate(conn, bundle: Bundle, data_root: Path,
         | {"admission": "stable-candidate", "admission_report_dir": "admission/",
            # the contract travels with its digest so the supervisor can verify
            # it byte-for-byte before any agent starts (#14 reopen)
-           "contract_digest": artifacts.contract_digest(bundle.contract)}
+           "contract_digest": artifacts.contract_digest(bundle.contract),
+           # the instruction's single source: a path inside the registered
+           # immutable public environment asset (#20 reopen)
+           "instruction": {"asset": environments.INSTRUCTION_ASSET,
+                           "path": bundle.instruction_path}}
     task_assets = [AssetRef(name="verifier_bundle", digest=verifier_bundle_digest),
                    AssetRef(name="environment", digest=environment_digest)]
     # the version id is deterministic (content-addressed): identical bundles
@@ -542,6 +638,9 @@ def _register_candidate(conn, bundle: Bundle, data_root: Path,
     dest = data_root / "verifiers" / scorer_id
     lock_path = data_root / "verifiers" / f".{scorer_id}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # the public environment bytes must exist before any version row can
+    # point at them; publish is atomic, digest-verified, and idempotent
+    environments.publish(data_root, bundle.public_env, environment_digest)
     with open(lock_path, "a") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:

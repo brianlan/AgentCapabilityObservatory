@@ -263,3 +263,81 @@ def test_capability_expires_when_trial_finishes(client, register, session_client
         resp = getattr(session_client, method)(path, headers=auth(token), **kwargs)
         assert resp.status_code == 401, f"{method.upper()} {path}: {resp.status_code}"
         assert resp.json()["error"]["code"] == "session_expired"
+
+
+def _trial_token_for_existing(client, task_name, config_name):
+    """Mint a session capability for already-registered versions (no
+    re-registration: same name@version with different content conflicts)."""
+    experiment = client.post("/v1/experiments", json={
+        "task": {"name": task_name, "version": "v1"},
+        "targets": [{"name": config_name, "version": "v1"}],
+    }).json()
+    trial_id = experiment["trials"][0]["id"]
+    resp = client.post(f"/v1/trials/{trial_id}/session-token")
+    assert resp.status_code == 201, resp.text
+    return trial_id, resp.json()["token"]
+
+
+def test_instruction_served_from_registered_environment_asset(client, register,
+                                                              session_client, tmp_path):
+    """When the task version declares an instruction asset, the Session API
+    serves the instruction from the registered immutable public asset, not
+    from a prompt field (#20 reopen)."""
+    from aco import environments
+    from aco.verification import runner
+
+    env_dir = tmp_path / "env-src"
+    (env_dir / "workspace").mkdir(parents=True)
+    (env_dir / "workspace" / "README.md").write_text("FAKE:submit\nfrom the registered asset\n")
+    digest = runner.bundle_digest(env_dir)
+    environments.publish(tmp_path, env_dir, digest)
+
+    register("task", "asset-task", "v1",
+             {"instruction": {"asset": "environment", "path": "workspace/README.md"}},
+             assets=[{"name": "environment", "digest": digest}])
+    register("config", "asset-cfg", "v1", {"harness": "fake", "model": "none"})
+    _, token = _trial_token_for_existing(client, "asset-task", "asset-cfg")
+
+    body = session_client.get("/v1/session/task", headers=auth(token))
+    assert body.status_code == 200, body.text
+    assert body.json()["instruction"] == "FAKE:submit\nfrom the registered asset\n"
+
+
+def test_broken_instruction_source_is_refused_not_emptied(client, register,
+                                                          session_client):
+    """A version with neither an instruction asset nor a prompt has no usable
+    instruction source: the Session API refuses — it never serves an empty
+    prompt (#20 reopen)."""
+    register("task", "broken-task", "v1", {"expected_answer": "4"})
+    register("config", "broken-cfg", "v1", {"harness": "fake", "model": "none"})
+    _, token = _trial_token_for_existing(client, "broken-task", "broken-cfg")
+
+    resp = session_client.get("/v1/session/task", headers=auth(token))
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "task_environment_invalid"
+
+
+def test_tampered_environment_asset_is_refused(client, register, session_client,
+                                               tmp_path):
+    """A store entry that no longer matches the registered digest is
+    refused at session time — the agent never receives unverified bytes
+    (#20 reopen)."""
+    from aco import environments
+    from aco.verification import runner
+
+    env_dir = tmp_path / "env-src"
+    (env_dir / "workspace").mkdir(parents=True)
+    (env_dir / "workspace" / "README.md").write_text("FAKE:submit\noriginal\n")
+    digest = runner.bundle_digest(env_dir)
+    environments.publish(tmp_path, env_dir, digest)
+    (environments.store_root(tmp_path) / digest / "workspace" / "README.md").write_text("tampered")
+
+    register("task", "tampered-task", "v1",
+             {"instruction": {"asset": "environment", "path": "workspace/README.md"}},
+             assets=[{"name": "environment", "digest": digest}])
+    register("config", "tampered-cfg", "v1", {"harness": "fake", "model": "none"})
+    _, token = _trial_token_for_existing(client, "tampered-task", "tampered-cfg")
+
+    resp = session_client.get("/v1/session/task", headers=auth(token))
+    assert resp.status_code == 500
+    assert resp.json()["error"]["code"] == "task_environment_invalid"
