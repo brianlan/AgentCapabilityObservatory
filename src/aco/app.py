@@ -373,10 +373,24 @@ def _add_error_handlers(app: FastAPI) -> None:
         return error_response(exc.status_code, "http_error", str(exc.detail))
 
 
+def _data_root(data_root: str | None) -> Path:
+    """Resolve the data root; explicit configuration only (#62).
+
+    There is no CWD-relative default: importing aco.* must never write to
+    the working directory, and two servers must never silently disagree
+    about where the database lives."""
+    resolved = data_root or os.environ.get("ACO_DATA_ROOT", "").strip()
+    if not resolved:
+        raise RuntimeError(
+            "ACO_DATA_ROOT is not set and no data_root was passed — "
+            "set ACO_DATA_ROOT (or pass data_root) to start an ACO surface")
+    return Path(resolved).expanduser()
+
+
 def create_management_app(data_root: str | None = None, token: str | None = None) -> FastAPI:
     """Authenticated management surface (ADR 0001): never exposed to evaluated
     containers. Every route except /healthz requires the management bearer."""
-    root = Path(data_root or os.environ.get("ACO_DATA_ROOT", "data")).expanduser()
+    root = _data_root(data_root)
     root.mkdir(parents=True, exist_ok=True)
     conn = db.connect(root / "aco.db")
     db.migrate(conn)
@@ -513,7 +527,7 @@ def create_management_app(data_root: str | None = None, token: str | None = None
 def create_session_app(data_root: str | None = None) -> FastAPI:
     """Untrusted-agent-facing Session surface (ADR 0001): exactly the three
     trial-scoped operations, each bound to one trial by a bearer token."""
-    root = Path(data_root or os.environ.get("ACO_DATA_ROOT", "data")).expanduser()
+    root = _data_root(data_root)
     root.mkdir(parents=True, exist_ok=True)
     conn = db.connect(root / "aco.db")
     db.migrate(conn)
@@ -531,5 +545,17 @@ def create_session_app(data_root: str | None = None) -> FastAPI:
     return app
 
 
-management_app = create_management_app()
-session_app = create_session_app()
+def __getattr__(name: str):
+    """Lazy ASGI surfaces (#62): `aco.app:management_app` / `:session_app`
+    are created — and the data root migrated — only when something actually
+    asks for them (uvicorn at serve time, or a direct attribute access).
+    Plain `import aco.app` (tests, supervisor's fetch_version, cli) has no
+    filesystem side effects. One app per process: the first access caches."""
+    if name == "management_app":
+        app = create_management_app()
+    elif name == "session_app":
+        app = create_session_app()
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = app
+    return app

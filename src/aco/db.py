@@ -33,16 +33,29 @@ def migrate(conn: sqlite3.Connection) -> None:
         version = int(path.name.split("_", 1)[0])
         if version in applied:
             continue
+        # The schema_version INSERT runs BEFORE the migration SQL inside
+        # BEGIN IMMEDIATE, so the UNIQUE(version) constraint is the
+        # serialization point of concurrent first-start migrations (#62):
+        # the loser blocks on the write lock (busy_timeout), then its INSERT
+        # fails with IntegrityError and it skips — the migration SQL itself
+        # never re-runs on an already-migrated database.
         # ponytail: single atomic script per migration; split files only if a
         # migration ever needs to be split.
         script = (
-            f"BEGIN;\n{path.read_text()}\n"
-            f"INSERT INTO schema_version (version, applied_at) VALUES ({version!r}, '{utcnow()}');\nCOMMIT;"
+            f"BEGIN IMMEDIATE;\n"
+            f"INSERT INTO schema_version (version, applied_at) VALUES ({version!r}, '{utcnow()}');\n"
+            f"{path.read_text()}\n"
+            f"COMMIT;"
         )
         # a table-rebuild migration (0013) must run with FK enforcement off;
         # PRAGMAs are no-ops inside a transaction, so they wrap the script
         conn.execute("PRAGMA foreign_keys=OFF")
         try:
-            conn.executescript(script)
+            try:
+                conn.executescript(script)
+            except sqlite3.IntegrityError:
+                # another process applied this version first (#62)
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
         finally:
             conn.execute("PRAGMA foreign_keys=ON")
