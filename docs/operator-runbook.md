@@ -40,8 +40,6 @@ cat > pi-target.json <<JSON
   "credentials": ["ark-agent-plan-main"]
 }
 JSON
-$ACO_PYTHON -m aco.cli register config pi-reusable v1 pi-target.json \
-  --api-url "$ACO_API_URL" --token "$ACO_MANAGEMENT_TOKEN"
 ```
 
 Start these three processes in separate terminals, all using the same data
@@ -67,6 +65,17 @@ ACO_DATA_ROOT="$ACO_DATA_ROOT" ACO_MANAGEMENT_TOKEN="$ACO_MANAGEMENT_TOKEN" \
   PYTHONPATH="$PYTHONPATH" $ACO_PYTHON -m aco.execution \
     --data-root "$ACO_DATA_ROOT" --api-url "$ACO_API_URL" \
     --session-api-url "$ACO_SESSION_URL"
+```
+
+Wait for Management to answer its health check, then register the reusable
+target. The manager may already be running; it polls for newly registered
+versions.
+
+```bash
+until curl -fsS "$ACO_API_URL/healthz" >/dev/null; do sleep 1; done
+curl -fsS "$ACO_API_URL/healthz" | jq
+$ACO_PYTHON -m aco.cli register config pi-reusable v1 pi-target.json \
+  --api-url "$ACO_API_URL" --token "$ACO_MANAGEMENT_TOKEN"
 ```
 
 For automated or local smoke use, start the repository's `MockArk` fixture (or
