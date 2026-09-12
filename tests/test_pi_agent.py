@@ -16,6 +16,8 @@ import pytest
 
 from aco import db
 from aco.pi_agent import (
+    ADAPTER_VERSION,
+    ARK_DEFAULT_BASE_URL,
     ARK_CREDENTIAL_ENV,
     ARK_MODEL,
     ARK_PROVIDER,
@@ -36,7 +38,7 @@ PI_PROFILE = {
     "thinking": "max",
     "provider": ARK_PROVIDER,
     "provider_api_style": "openai-responses",
-    "adapter_version": "0.1.0",
+    "adapter_version": ADAPTER_VERSION,
     "environment": "sha256:" + "b" * 64,
     "credentials": ["ark-agent-plan-main"],
 }
@@ -50,6 +52,12 @@ def _pi_profile(**overrides) -> dict:
 
 
 class TestRenderModelsJson:
+    def test_real_agent_plan_endpoint_is_pinned(self, monkeypatch):
+        monkeypatch.delenv("ARK_AGENT_PLAN_BASE_URL", raising=False)
+        from aco.pi_agent import ark_base_url
+        assert ARK_DEFAULT_BASE_URL == "https://ark.cn-beijing.volces.com/api/plan/v3"
+        assert ark_base_url() == ARK_DEFAULT_BASE_URL
+
     def test_renders_full_metadata_with_env_key_reference(self):
         config = render_models_json(_TargetProfile(), "http://mock:1")
         provider = config["providers"][ARK_PROVIDER]

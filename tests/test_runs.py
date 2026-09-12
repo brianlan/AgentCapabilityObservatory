@@ -169,7 +169,7 @@ class TestSkillMaterialization:
             "schema_version": 1, "harness": "pi", "harness_version": "0.84.1",
             "model": "glm-5.3-flash", "thinking": "max",
             "provider": "ark-agent-plan", "provider_api_style": "openai-responses",
-            "adapter_version": "0.1.0", "credentials": ["ark-agent-plan-main"],
+            "adapter_version": "0.1.1", "credentials": ["ark-agent-plan-main"],
             "skills": skills,
         }
 

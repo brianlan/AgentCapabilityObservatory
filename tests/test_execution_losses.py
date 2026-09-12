@@ -63,7 +63,7 @@ def make_pi_experiment(conn, n_trials=2) -> str:
         "thinking": "max",
         "provider": "ark-agent-plan",
         "provider_api_style": "openai-responses",
-        "adapter_version": "0.1.0",
+        "adapter_version": "0.1.1",
         "environment": "sha256:" + "a" * 64,
         "credentials": ["ark-agent-plan-main"],
     }

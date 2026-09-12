@@ -36,7 +36,7 @@ PI_PROFILE = {
     "thinking": "max",
     "provider": "ark-agent-plan",
     "provider_api_style": "openai-responses",
-    "adapter_version": "0.1.0",
+    "adapter_version": "0.1.1",
     "credentials": ["ark-agent-plan-main"],
 }
 DUMMY_KEY = "e2e-dummy-key"

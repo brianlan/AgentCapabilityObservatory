@@ -23,7 +23,7 @@ PI_PROFILE = {
     "thinking": "max",
     "provider": "ark-agent-plan",
     "provider_api_style": "openai-responses",
-    "adapter_version": "0.1.0",
+    "adapter_version": "0.1.1",
     "assistance_mode": "none",
     "environment": "sha256:" + "1" * 64,
     "resources": {"cpus": 2, "memory_mb": 4096, "timeout_sec": 600},

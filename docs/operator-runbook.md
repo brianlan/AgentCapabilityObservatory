@@ -34,7 +34,7 @@ cat > pi-target.json <<JSON
   "thinking": "max",
   "provider": "ark-agent-plan",
   "provider_api_style": "openai-responses",
-  "adapter_version": "0.1.0",
+  "adapter_version": "0.1.1",
   "assistance_mode": "none",
   "environment": "${PI_IMAGE_DIGEST}",
   "credentials": ["ark-agent-plan-main"]

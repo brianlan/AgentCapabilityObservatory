@@ -35,7 +35,7 @@ from .models import TargetProfile
 
 PI_PACKAGE = "@earendil-works/pi-coding-agent"
 PI_VERSION = "0.84.1"
-ADAPTER_VERSION = "0.1.0"
+ADAPTER_VERSION = "0.1.1"
 PI_IMAGE_TAG = f"aco-pi-agent:{PI_VERSION}"
 # pinned base for the trial image: node ships the runtime pi needs; the pi
 # package itself is installed at image build and verified at agent setup
@@ -51,7 +51,7 @@ ARK_PROVIDER = "ark-agent-plan"
 ARK_CREDENTIAL_REF = "ark-agent-plan-main"
 ARK_CREDENTIAL_ENV = "ARK_AGENT_PLAN_API_KEY"
 ARK_BASE_URL_ENV = "ARK_AGENT_PLAN_BASE_URL"
-ARK_DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
+ARK_DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
 ARK_MODEL = "glm-5.3-flash"
 # Pi's canonical levels -> provider reasoning effort; null = unsupported
 ARK_THINKING_LEVEL_MAP = {
