@@ -45,16 +45,20 @@ $ACO_PYTHON -m aco.cli register config pi-reusable v1 pi-target.json \
 ```
 
 Start these three processes in separate terminals, all using the same data
-root. The manager is the only process that needs the provider credential.
+root. The manager is the only process that needs the provider credential. The
+Session API is trial-scoped but must bind to a Docker-reachable interface for
+the gateway; keep this surface behind firewall/access controls and off
+untrusted external networks. Management stays on `127.0.0.1`.
 
 ```bash
 # management API
 ACO_DATA_ROOT="$ACO_DATA_ROOT" ACO_MANAGEMENT_TOKEN="$ACO_MANAGEMENT_TOKEN" \
-  PYTHONPATH="$PYTHONPATH" $ACO_PYTHON -m uvicorn aco.app:management_app --port 8000
+  PYTHONPATH="$PYTHONPATH" $ACO_PYTHON -m uvicorn aco.app:management_app \
+    --host 127.0.0.1 --port 8000
 
 # restricted Session API
 ACO_DATA_ROOT="$ACO_DATA_ROOT" PYTHONPATH="$PYTHONPATH" \
-  $ACO_PYTHON -m uvicorn aco.app:session_app --port 8001
+  $ACO_PYTHON -m uvicorn aco.app:session_app --host 0.0.0.0 --port 8001
 
 # execution manager
 ACO_DATA_ROOT="$ACO_DATA_ROOT" ACO_MANAGEMENT_TOKEN="$ACO_MANAGEMENT_TOKEN" \
