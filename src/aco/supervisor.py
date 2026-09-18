@@ -9,12 +9,14 @@ scoring).
 
 import argparse
 import asyncio
+from collections import Counter, deque
 import hashlib
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import urllib.parse
 from pathlib import Path
 
@@ -35,6 +37,7 @@ DEFAULT_AGENT_TIMEOUT_SEC = 20
 TRIAL_GRACE_SEC = 90
 SUBMIT_POLL_SEC = 0.5
 PI_TRACE_MAX_BYTES = 2 * 1024 * 1024
+PI_TRACE_SIDE_BYTES = 900 * 1024
 
 # the host-side route the gateway (infrastructure, not the evaluated
 # container) may use to reach host services such as the session listener (#38)
@@ -226,37 +229,139 @@ def command(*args, check=True):
 
 def _capture_pi_trace(container_id: str | None, root: Path, run_id: str,
                       conn: sqlite3.Connection, phase: str) -> None:
-    """Copy the bounded Pi JSONL trace before Harbor removes its container.
+    """Preserve useful Pi events before Harbor removes its container.
 
     The trace is diagnostic only; the sealed workspace remains the official
-    answer. Capture is idempotent because timeout and agent-end can race.
+    answer. Capture is idempotent because timeout and agent-end can race,
+    and strictly best-effort: nothing here may ever raise — a hook
+    exception would skip the seal that follows in the same hook body
+    (diagnostics must not change the official outcome). Only the exception
+    class name is ever recorded, never its message or any trace content
+    (both may embed secret material).
     """
     if not container_id:
         return
     trace_dir = root / "pi-traces" / run_id
     trace_path = trace_dir / "transcript.jsonl"
-    if trace_path.exists():
-        return
-    trace_dir.mkdir(parents=True, exist_ok=True)
-    raw_path = trace_dir / ".transcript.raw"
-    result = command("docker", "cp", f"{container_id}:/tmp/aco-pi.jsonl",
-                     str(raw_path), check=False)
-    if result.returncode != 0 or not raw_path.is_file():
-        runs.add_phase(conn, run_id, "pi_trace_capture_failed", phase=phase,
-                       detail=(result.stderr or "docker cp failed")[-500:])
-        return
-    data = raw_path.read_bytes()
-    raw_path.unlink(missing_ok=True)
-    for name in ("ARK_AGENT_PLAN_API_KEY", "ACO_SESSION_TOKEN"):
-        secret = os.environ.get(name)
-        if secret and len(secret) >= 8:
-            data = data.replace(secret.encode(), b"[REDACTED]")
-    truncated = len(data) > PI_TRACE_MAX_BYTES
-    trace_path.write_bytes(data[:PI_TRACE_MAX_BYTES])
-    runs.add_phase(conn, run_id, "pi_trace_captured", phase=phase,
-                   path=str(trace_path), bytes=trace_path.stat().st_size,
-                   truncated=truncated,
-                   sha256=hashlib.sha256(trace_path.read_bytes()).hexdigest())
+    # per-invocation temps: when the AGENT_END hook and the outer-deadline
+    # timeout race, both threads may capture; shared temp names would let
+    # two docker cp / writes interleave into one malformed file. The
+    # publish is an atomic rename, so the last writer still leaves a
+    # complete, private file.
+    tag = f"{os.getpid()}.{threading.get_ident()}"
+    raw_path = trace_dir / f".transcript.raw.{tag}"
+    tmp_path = trace_dir / f".transcript.tmp.{tag}"
+    try:
+        try:
+            if trace_path.exists():
+                return
+            # the dir must be private BEFORE the raw (unredacted) transcript
+            # lands in it: 0700 keeps the bytes unreachable no matter what
+            # mode docker cp gave the file. Unconditional: also fixes dirs
+            # created by older code with default perms.
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            trace_dir.chmod(0o700)
+            result = command("docker", "cp", f"{container_id}:/tmp/aco-pi.jsonl",
+                             str(raw_path), check=False)
+            if result.returncode != 0 or not raw_path.is_file():
+                raise OSError("Pi transcript unavailable in agent container")
+            raw_path.chmod(0o600)
+            summary = _compact_pi_trace(raw_path, tmp_path)
+            os.replace(tmp_path, trace_path)
+            runs.add_phase(conn, run_id, "pi_trace_captured", phase=phase,
+                           path=str(trace_path), bytes=trace_path.stat().st_size,
+                           truncated=summary["omitted_events"] > 0,
+                           sha256=hashlib.sha256(trace_path.read_bytes()).hexdigest())
+        except Exception as exc:  # noqa: BLE001 — trace capture is diagnostics only
+            tmp_path.unlink(missing_ok=True)
+            runs.add_phase(conn, run_id, "pi_trace_capture_failed", phase=phase,
+                           detail=type(exc).__name__)
+    except Exception:  # noqa: BLE001 — even the failure record must not break the seal
+        pass
+    finally:
+        try:
+            raw_path.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001 — cleanup is best-effort
+            pass
+
+
+def _compact_pi_trace(raw_path: Path, out_path: Path) -> dict:
+    """Discard high-volume deltas; keep complete early/late events and counts.
+
+    The output is written to out_path as whole, valid JSONL: head (first
+    events), a gap marker only when middle events were evicted, tail (last
+    events), then the summary line. Once an event does not fit the head,
+    every later event goes to the tail — the head never regains events,
+    so chronology never reverses. The caller publishes with an atomic
+    rename.
+    """
+    head, tail = [], deque()
+    head_bytes = tail_bytes = 0
+    head_open = True
+    counts: Counter[str] = Counter()
+    malformed = 0
+    evicted = 0
+    final_stop = None
+    secrets = [value.encode() for name in ("ARK_AGENT_PLAN_API_KEY", "ACO_SESSION_TOKEN")
+               if (value := os.environ.get(name)) and len(value) >= 8]
+    with raw_path.open("rb") as source:
+        for raw in source:
+            try:
+                event = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                event = None  # an in-flight timeout may end with a partial line
+            kind = event.get("type") if isinstance(event, dict) else None
+            if not isinstance(kind, str):
+                malformed += 1
+                continue
+            for secret in secrets:
+                kind = kind.replace(secret.decode(), "[REDACTED]")
+            if len(kind) > 64:
+                # adversarial type names must not bloat the summary line
+                kind = kind[:64]
+            # cardinality cap: unbounded distinct kinds would also bloat it
+            if kind in counts or len(counts) < 32:
+                counts[kind] += 1
+            else:
+                counts["other"] += 1
+            if kind == "message_end":
+                message = event.get("message")
+                if isinstance(message, dict) and message.get("role") == "assistant":
+                    final_stop = message.get("stopReason")
+                    if isinstance(final_stop, str):
+                        for secret in secrets:
+                            final_stop = final_stop.replace(secret.decode(), "[REDACTED]")
+                        final_stop = final_stop[:128]
+                    else:
+                        final_stop = None
+            if kind == "message_update":
+                continue
+            for secret in secrets:
+                raw = raw.replace(secret, b"[REDACTED]")
+            if len(raw) > 64 * 1024:
+                # An oversized tool payload is not safe to persist unbounded.
+                raw = (json.dumps({"type": kind, "oversized": True}) + "\n").encode()
+            if not raw.endswith(b"\n"):
+                raw += b"\n"
+            if head_open and head_bytes + len(raw) <= PI_TRACE_SIDE_BYTES:
+                head.append(raw)
+                head_bytes += len(raw)
+            else:
+                head_open = False
+                tail.append(raw)
+                tail_bytes += len(raw)
+                while tail_bytes > PI_TRACE_SIDE_BYTES:
+                    tail_bytes -= len(tail.popleft())
+                    evicted += 1
+    omitted = sum(counts.values()) - len(head) - len(tail)
+    summary = {"type": "aco_trace_summary", "event_counts": dict(counts),
+               "last_assistant_stop_reason": final_stop,
+               "malformed_lines": malformed, "omitted_events": omitted}
+    out_path.write_bytes(b"".join(head) +
+                         (b'{"type":"aco_trace_gap"}\n' if evicted else b"") +
+                         b"".join(tail) + (json.dumps(summary) + "\n").encode())
+    out_path.chmod(0o600)
+    return summary
 
 
 def resolve_skill_mounts(conn: sqlite3.Connection, parsed: TargetProfile,
