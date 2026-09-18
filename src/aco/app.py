@@ -6,6 +6,8 @@ lifecycle, session-token minting, dashboard) and the untrusted-agent-facing
 Session surface (three trial-scoped operations, `aco.api.session`).
 """
 
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -411,9 +413,20 @@ def create_management_app(data_root: str | None = None, token: str | None = None
             return await call_next(request)
         auth = request.headers.get("authorization", "")
         supplied = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else ""
+        dashboard = request.url.path == "/dashboard" or request.url.path.startswith("/dashboard/")
+        if dashboard and auth.startswith("Basic "):
+            try:
+                username, supplied = base64.b64decode(auth[6:], validate=True).decode().split(":", 1)
+                if username != "aco":
+                    supplied = ""
+            except (binascii.Error, UnicodeError, ValueError):
+                supplied = ""
         # constant-time compare: this is the trust boundary for the whole surface
         if not secrets.compare_digest(supplied, token):
-            return error_response(401, "unauthorized", "valid management token required")
+            response = error_response(401, "unauthorized", "valid management token required")
+            if dashboard:
+                response.headers["WWW-Authenticate"] = 'Basic realm="ACO Dashboard"'
+            return response
         # principal identity for server-side idempotency (#35): sha256 of the
         # supplied bearer — the plaintext never lands in the database
         request.state.principal = hashlib.sha256(supplied.encode()).hexdigest()

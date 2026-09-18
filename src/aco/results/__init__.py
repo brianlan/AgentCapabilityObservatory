@@ -26,7 +26,9 @@ Comparability rules (from the long-run comparison decision):
 Raw vs unified views: the raw view shows what each scorer version said (one
 series per observed scorer version — a re-evaluated trial appears under both
 graders); the unified view reports only the explicitly chosen grader
-version, ignoring rows from any other scorer version.
+version, ignoring rows from any other scorer version. The default view uses
+each TaskVersion's pinned default scorer, so a multi-task suite can have one
+capability score without mixing arbitrary regrades.
 
 Verdict resolution per (trial, scorer version), append-only aware:
 
@@ -58,7 +60,7 @@ from ..app import AppError, ensure_fingerprint
 TRIAL_FACTS_SELECT = (
     "SELECT t.id AS trial_id, t.experiment_id, t.status AS trial_status,"
     " t.opened_at, t.fingerprint, cv.content AS config_content,"
-    " tv.name AS task_name, tv.version AS task_version,"
+    " tv.name AS task_name, tv.version AS task_version, tv.content AS task_content,"
     " cv.name AS config_name, cv.version AS config_version,"
     " e.created_at AS batch_created_at, e.requested AS exp_requested"
     " FROM trials t"
@@ -225,11 +227,14 @@ def collect(conn: sqlite3.Connection, *, task_set: str | None = None, config: st
             scorer: str | None = None, view: str = "raw",
             batch: str | None = None) -> dict:
     """Filter and aggregate all results into per-batch series points."""
-    if view not in ("raw", "unified"):
+    if view not in ("raw", "unified", "default"):
         raise AppError(422, "invalid_selection", f"unknown view: {view!r}")
     if view == "unified" and not scorer:
         raise AppError(422, "invalid_selection",
                        "the unified re-evaluation view requires an explicit scorer 'name@version'")
+    if view == "default" and scorer:
+        raise AppError(422, "invalid_selection",
+                       "the task-default view uses each task's pinned default scorer")
 
     anomalies = {row["trial_id"] for row in conn.execute(
         "SELECT trial_id FROM sealed_answers WHERE status = 'anomaly'")}
@@ -256,6 +261,9 @@ def collect(conn: sqlite3.Connection, *, task_set: str | None = None, config: st
             config_content=trial["config_content"])
         trial["anomaly"] = trial["trial_id"] in anomalies
         trial["published_at"] = published.get(trial["trial_id"])
+        default = json.loads(trial["task_content"]).get("default_scorer")
+        trial["default_scorer"] = (f'{default["name"]}@{default["version"]}'
+                                   if default else None)
         if batch and trial["experiment_id"] != batch:
             continue
         ts = _task_set_of(json.loads(trial["exp_requested"]))
@@ -276,7 +284,12 @@ def collect(conn: sqlite3.Connection, *, task_set: str | None = None, config: st
         for eid, group_trials in batches.items():
             observed = {state["scorer"] for t in group_trials
                         for state in verdicts_by_trial.get(t["trial_id"], [])}
-            if view == "unified":
+            if view == "default":
+                # Each task pins its own verifier. A suite's capability score
+                # combines those pinned verdicts, never arbitrary regrades.
+                scorers_here = ["task-defaults"] if all(
+                    t["default_scorer"] for t in group_trials) else []
+            elif view == "unified":
                 scorers_here = [scorer]
             elif scorer:
                 scorers_here = sorted(observed & {scorer})
@@ -286,12 +299,13 @@ def collect(conn: sqlite3.Connection, *, task_set: str | None = None, config: st
                 items = []
                 has_rows = False
                 for t in group_trials:
-                    state = verdict_by_trial_scorer.get((t["trial_id"], scr))
+                    selected = t["default_scorer"] if view == "default" else scr
+                    state = verdict_by_trial_scorer.get((t["trial_id"], selected))
                     if state is not None:
                         has_rows = True
                         state = dict(state)
                     else:
-                        state = _empty_state(scr, t["trial_id"])
+                        state = _empty_state(selected, t["trial_id"])
                     items.append(t | {"state": state | {"bucket": _classify(t, state)}})
                 if not has_rows and scr is not None:
                     continue  # no scoring rows for this grader version in this batch
@@ -358,5 +372,8 @@ def _matrix(series: list[dict]) -> dict | None:
     return {
         "scorer": next(iter(scorers)),
         "cells": dict(rows),
-        "note": "pooled over batches under one grader version; bounds are missing bounds, not confidence intervals",
+        "note": ("pooled over batches under each task's pinned default scorer"
+                 if next(iter(scorers)) == "task-defaults" else
+                 "pooled over batches under one grader version")
+                + "; bounds are missing bounds, not confidence intervals",
     }

@@ -26,7 +26,18 @@ ACO_MANAGEMENT_TOKEN=<管理凭证> /ssd4/envs/aco_py312/bin/python -m uvicorn a
 
 - 数据根目录：必须显式配置——启动 ASGI 面前设置环境变量 `ACO_DATA_ROOT`（或直接传 `data_root` 参数），缺失时拒绝启动；导入 `aco.*` 模块不会有任何文件系统副作用。SQLite 数据库位于 `<data-root>/aco.db`，是唯一元数据权威。
 - Migration：`src/aco/migrations/` 内有序 SQL 文件 + `schema_version` 表，重复执行是 no-op。
-- 端点：`POST /v1/versions`（登记不可变版本，内容寻址 digest，重复登记幂等，同标识不同内容返回 `409`）、`POST /v1/experiments`（返回 `202` 与原子展开的 Trial 计划）、`GET /v1/experiments/{id}`、`GET /v1/trials/{id}`。管理面所有路由（含 dashboard）都要求 `Authorization: Bearer $ACO_MANAGEMENT_TOKEN`，缺失或错误返回 `401`；未设置该环境变量时管理面拒绝启动。
+- 端点：`POST /v1/versions`（登记不可变版本，内容寻址 digest，重复登记幂等，同标识不同内容返回 `409`）、`POST /v1/experiments`（返回 `202` 与原子展开的 Trial 计划）、`GET /v1/experiments/{id}`、`GET /v1/trials/{id}`。管理 API 要求 `Authorization: Bearer $ACO_MANAGEMENT_TOKEN`，缺失或错误返回 `401`；未设置该环境变量时管理面拒绝启动。
+- 浏览器打开 `/dashboard` 会弹出 HTTP Basic 登录框：用户名 `aco`，密码为同一管理令牌；此方式仅用于本机或受 TLS 保护的管理连接，管理 API 仍只接受 Bearer。
+
+### 从局域网的另一台 PC 查看 Dashboard
+
+管理面保持监听在服务器的 `127.0.0.1:8000`。在有权 SSH 登录服务器的 PC 上运行（Windows PowerShell、macOS 或 Linux 的 OpenSSH 均可）：
+
+```bash
+ssh -o ExitOnForwardFailure=yes -N -L 127.0.0.1:8000:127.0.0.1:8000 rlan@<服务器局域网 IP>
+```
+
+保持该终端打开，然后在**那台 PC**的浏览器访问 `http://127.0.0.1:8000/dashboard`。用户名为 `aco`，密码为服务器当前的 `ACO_MANAGEMENT_TOKEN`；结束时按 Ctrl-C 关闭转发。如果 PC 的 8000 端口已占用，把 `-L` 左侧的 `8000` 改成 `18000`，并访问 `http://127.0.0.1:18000/dashboard`。SSH 连接需能到达服务器的 22 端口；不必把管理 API 改为监听局域网，也不必向局域网开放 8000 端口。
 - Experiment 创建幂等（#35，服务端权威）：`POST /v1/experiments` 支持携带 `Idempotency-Key` 头。同一管理主体（bearer token 的 sha256 指纹，明文永不入库）用相同 key 与相同规范请求体重试，返回原 Experiment（`200`）；相同 key 但请求体不同返回 `409 idempotency_conflict`。幂等键与计划在同一 SQLite 事务中登记，失败不残留 key 或半个计划。不携带该头时每次调用都创建新 Experiment——API 不会把无 key 请求伪装成幂等。
 - 凭证只允许逻辑引用（config 的 `credentials` 名称列表），任何凭证值都不会入库；Trial 的 `runtime_observation` 在未观测前保持 `null`。
 
@@ -119,6 +130,7 @@ aco resume <experiment-id>
 - **缺失界限**：任一计划样本无有效判定时不标主分，输出固定权重下界（确认通过/计划）与"未知全通过"上界；界限是缺失界限，不是置信区间。
 - **分线**：题组版本、target 配置、评分口径（scorer 版本）任一不同即不同序列，允许叠加、不自动混合；同题跨序列比较需显式过滤。
 - **raw 与 unified**：raw 视图按实际产生判定的 scorer 版本分线（重评过的试验在两个 grader 下各出现一次）；unified 视图必须显式指定 `scorer`，只统计该重评口径。判定解析按每 (trial, scorer 版本) 进行：该组合下所有成功判定一致时取最新追加记录为当前判定（`created_at` + 插入顺序）；成功判定相互矛盾时标记 `unstable`，保留全部证据、单独计数（`counts.unstable`）并从正式能力分中排除——不会按"最新赢"静默取舍，重复执行到通过也无法消除该标记。不自动挑选"最高分"。
+- **task defaults**：`view=default` 按每道 TaskVersion 钉死的 `default_scorer` 取判定，使不同题使用不同 verifier 的 suite 能形成一条总分曲线和题目矩阵；未声明默认评分器的旧任务不进入此视图。额外重评不会改变此视图的口径。
 - **时间轴**：每批次点以作答批次创建时间为横轴并给出实际起止范围；部分批次明确标"否（部分结果）"。
 - **矩阵与下钻**：单 grader 口径下给出题目 × 配置矩阵（跨批次合并计数 + 缺失界限），趋势点/矩阵格/计数表链接到批次与试验详情页。
 - **延迟/令牌/费用**：仅当 verifier submetrics 上报时按名称展示均值与样本数（来源：verifier submetrics），未上报显示缺失——不填零、不混入能力分。

@@ -11,7 +11,8 @@
     <label>评分 <input name="scorer" value="{{ filters.scorer or '' }}" placeholder="name@version"></label>
     <label>视图
       <select name="view">
-        <option value="raw" {% if filters.view != 'unified' %}selected{% endif %}>raw（按评分版本分线）</option>
+        <option value="default" {% if filters.view == 'default' %}selected{% endif %}>task defaults（各题固定评分器）</option>
+        <option value="raw" {% if filters.view == 'raw' %}selected{% endif %}>raw（按评分版本分线）</option>
         <option value="unified" {% if filters.view == 'unified' %}selected{% endif %}>unified（统一重评口径）</option>
       </select>
     </label>

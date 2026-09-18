@@ -251,7 +251,12 @@ def test_dashboard_gated_by_management_token(client, conn, root):
 
     from aco.app import create_management_app
     bare = TestClient(create_management_app(data_root=str(root), token=MGMT_TOKEN))
-    assert bare.get("/dashboard").status_code == 401
+    missing = bare.get("/dashboard")
+    assert missing.status_code == 401
+    assert missing.headers["www-authenticate"] == 'Basic realm="ACO Dashboard"'
+    assert bare.get("/dashboard", auth=("aco", MGMT_TOKEN)).status_code == 200
+    assert bare.get("/dashboard", auth=("other", MGMT_TOKEN)).status_code == 401
+    assert bare.get("/v1/results", auth=("aco", MGMT_TOKEN)).status_code == 401
 
 
 def test_semantic_labels_and_keyboard_access(client, conn):

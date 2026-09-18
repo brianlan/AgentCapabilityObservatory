@@ -236,6 +236,31 @@ def test_raw_view_shows_regrade_under_both_graders_unified_picks_one(tmp_path):
     assert client.get("/v1/results", params={"view": "unified"}).status_code == 422
 
 
+def test_task_defaults_aggregate_suite_with_distinct_pinned_scorers(tmp_path):
+    client = make_client(tmp_path)
+    ids = register_versions(client, configs=["cfg-a"], scorers=["first", "second"])
+    for task, scorer in (("t1", "first"), ("t2", "second")):
+        response = client.post("/v1/versions", json={
+            "kind": "task", "name": task, "version": "v1",
+            "content": TASK_CONTENT | {"default_scorer": {"name": scorer, "version": "v1"}},
+        })
+        assert response.status_code == 201
+    register_versions(client, suites=[("pack", ["t1", "t2"])])
+    exp = make_experiment(client, suite="pack", repetitions=2)
+    for i, trial in enumerate(exp["trials"]):
+        selected = "first" if trial["task"]["name"] == "t1" else "second"
+        add_verification(tmp_path, trial["id"], ids[f"scorer:{selected}"], pass_=i != 2)
+    # A later regrade under a different scorer must not change the baseline.
+    add_verification(tmp_path, exp["trials"][0]["id"], ids["scorer:second"], pass_=0)
+    data = results(client, view="default")
+    point = single_series(data)["points"][0]
+    assert (point["planned"], point["pass"], point["main_score"]) == (4, 3, 0.75)
+    assert data["matrix"]["cells"]["t1@v1"]["cfg-a@v1"]["pass"] == 2
+    assert data["matrix"]["cells"]["t2@v1"]["cfg-a@v1"]["pass"] == 1
+    assert "0.75" in client.get("/dashboard/results", params={"view": "default"}).text
+    assert client.get("/v1/results", params={"view": "default", "scorer": "first@v1"}).status_code == 422
+
+
 def test_contradictory_same_version_verdicts_are_unstable(tmp_path):
     """Same sealed answer + scorer version with contradictory successful
     verdicts: the pair is marked unstable, kept in the denominator with its
