@@ -21,6 +21,8 @@ from aco.pi_agent import (
     ARK_CREDENTIAL_ENV,
     ARK_MODEL,
     ARK_PROVIDER,
+    DOUBAO_ADAPTER_VERSION,
+    DOUBAO_MODEL,
     PI_VERSION,
     PiAgent,
     parse_transcript,
@@ -78,6 +80,21 @@ class TestRenderModelsJson:
             render_models_json(_TargetProfile(model="other-model"), "http://m")
         with pytest.raises(ValueError, match="thinking"):
             render_models_json(_TargetProfile(thinking="low"), "http://m")
+
+    def test_doubao_high_is_explicitly_pinned_without_changing_glm(self):
+        doubao = _TargetProfile(model=DOUBAO_MODEL, thinking="high",
+                                adapter_version=DOUBAO_ADAPTER_VERSION)
+        rendered = render_models_json(doubao, "http://mock:1")
+        model = rendered["providers"][ARK_PROVIDER]["models"][0]
+        assert model["id"] == DOUBAO_MODEL
+        assert model["thinkingLevelMap"]["high"] == "high"
+        assert model["maxTokens"] == 32768
+        assert validate_profile(doubao) == 120
+        assert translate_profile(doubao.model_dump())[0] == "pi"
+        with pytest.raises(ValueError, match="adapter_version"):
+            validate_profile(_TargetProfile(model=DOUBAO_MODEL, thinking="high"))
+        with pytest.raises(ValueError, match="adapter_version"):
+            validate_profile(_TargetProfile(adapter_version=DOUBAO_ADAPTER_VERSION))
 
 
 def _TargetProfile(**overrides):

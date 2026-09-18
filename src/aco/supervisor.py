@@ -768,7 +768,8 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
     trial_obj.add_hook(TrialEvent.AGENT_START, on_agent_start)
     trial_obj.add_hook(TrialEvent.AGENT_END, on_agent_end)
 
-    runs.observe_run(conn, run_id, ADAPTER_VERSION, HARBOR_VERSION, str(trials_dir))
+    observed_adapter = parsed_profile.adapter_version if harness == PI_HARNESS else ADAPTER_VERSION
+    runs.observe_run(conn, run_id, observed_adapter, HARBOR_VERSION, str(trials_dir))
 
     submit_stopped = False
 

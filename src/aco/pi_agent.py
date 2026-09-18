@@ -1,7 +1,7 @@
 """ACO Pi adapter at Harbor's installed-agent seam (#37, ADR 0002).
 
-Runs the pinned Pi 0.84.1 inside the trial container against the first real
-TargetProfile (``ark-agent-plan/glm-5.3-flash:max``). Unlike Harbor's stock Pi
+Runs the pinned Pi 0.84.1 inside the trial container against explicitly
+supported Ark Agent Plan targets. Unlike Harbor's stock Pi
 agent, the rendered custom-model config carries full model metadata (reasoning
 flag and ``thinkingLevelMap`` including ``max``), undeclared skills/extensions/
 prompt templates/themes are disabled, the host ``~/.pi`` is never mounted, and
@@ -45,26 +45,38 @@ NODE_IMAGE = (
 )
 PI_CONFIG_DIR = "/tmp/aco-pi-agent"  # trial-local, starts empty (ADR 0002)
 
-# first real Target knowledge (issue #37): the only provider/model/credential
-# this adapter knows how to render; anything else fails explicitly
+# Only these provider/model/credential combinations are known to render;
+# anything else fails explicitly before an experiment is created.
 ARK_PROVIDER = "ark-agent-plan"
 ARK_CREDENTIAL_REF = "ark-agent-plan-main"
 ARK_CREDENTIAL_ENV = "ARK_AGENT_PLAN_API_KEY"
 ARK_BASE_URL_ENV = "ARK_AGENT_PLAN_BASE_URL"
 ARK_DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
 ARK_MODEL = "glm-5.3-flash"
+DOUBAO_MODEL = "doubao-seed-2.0-mini"
+DOUBAO_ADAPTER_VERSION = "0.1.2"
 # Pi's canonical levels -> provider reasoning effort; null = unsupported
 ARK_THINKING_LEVEL_MAP = {
     "off": None, "minimal": None, "low": None, "medium": None,
     "high": "high", "xhigh": None, "max": "max",
 }
-SUPPORTED_THINKING = tuple(level for level, mapped in ARK_THINKING_LEVEL_MAP.items() if mapped)
 MODEL_METADATA = {
     "name": "GLM 5.3 Flash",
     "reasoning": True,
     "input": ["text"],
     "contextWindow": 262144,
     "maxTokens": 8192,
+}
+DOUBAO_MODEL_METADATA = {
+    "name": "豆包 Seed 2.0 Mini",
+    "reasoning": True,
+    "input": ["text", "image"],
+    "contextWindow": 262144,
+    "maxTokens": 32768,
+}
+DOUBAO_THINKING_LEVEL_MAP = {
+    "off": "none", "minimal": None, "low": "low", "medium": "medium",
+    "high": "high", "xhigh": "xhigh", "max": "max",
 }
 DEFAULT_AGENT_TIMEOUT_SEC = 120
 
@@ -147,12 +159,22 @@ def render_models_json(profile: TargetProfile, base_url: str) -> dict[str, Any]:
             f"unsupported provider_api_style {profile.provider_api_style!r};"
             " only 'openai-responses' renders"
         )
-    if profile.model != ARK_MODEL:
-        raise ValueError(f"unsupported model {profile.model!r}; only {ARK_MODEL!r} renders")
-    if profile.thinking not in SUPPORTED_THINKING:
+    if profile.model == ARK_MODEL:
+        expected_adapter, metadata, thinking_map = (
+            ADAPTER_VERSION, MODEL_METADATA, ARK_THINKING_LEVEL_MAP)
+    elif profile.model == DOUBAO_MODEL:
+        expected_adapter, metadata, thinking_map = (
+            DOUBAO_ADAPTER_VERSION, DOUBAO_MODEL_METADATA, DOUBAO_THINKING_LEVEL_MAP)
+    else:
+        raise ValueError(f"unsupported model {profile.model!r}")
+    if profile.adapter_version != expected_adapter:
+        raise ValueError(f"unsupported adapter_version {profile.adapter_version!r};"
+                         f" pin {expected_adapter!r} for {profile.model}")
+    supported_thinking = tuple(level for level, mapped in thinking_map.items() if mapped)
+    if profile.thinking not in supported_thinking:
         raise ValueError(
             f"unsupported thinking level {profile.thinking!r};"
-            f" supported: {', '.join(SUPPORTED_THINKING)}"
+            f" supported: {', '.join(supported_thinking)}"
         )
     return {
         "providers": {
@@ -162,8 +184,8 @@ def render_models_json(profile: TargetProfile, base_url: str) -> dict[str, Any]:
                 "api": profile.provider_api_style,
                 "models": [{
                     "id": profile.model,
-                    **MODEL_METADATA,
-                    "thinkingLevelMap": dict(ARK_THINKING_LEVEL_MAP),
+                    **metadata,
+                    "thinkingLevelMap": dict(thinking_map),
                 }],
             }
         }
@@ -186,8 +208,7 @@ def validate_profile(profile: TargetProfile) -> int:
     """
     if profile.harness_version != PI_VERSION:
         raise ValueError(f"unsupported harness_version {profile.harness_version!r}; pin {PI_VERSION!r}")
-    if profile.adapter_version != ADAPTER_VERSION:
-        raise ValueError(f"unsupported adapter_version {profile.adapter_version!r}; pin {ADAPTER_VERSION!r}")
+    render_models_json(profile, ARK_DEFAULT_BASE_URL)
     if profile.assistance_mode != "none":
         raise ValueError(f"unsupported assistance_mode {profile.assistance_mode!r}; only 'none' executes")
     if profile.credentials != [ARK_CREDENTIAL_REF]:
