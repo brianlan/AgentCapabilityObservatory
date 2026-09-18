@@ -34,6 +34,7 @@ RUN_LABEL = "aco.run"
 DEFAULT_AGENT_TIMEOUT_SEC = 20
 TRIAL_GRACE_SEC = 90
 SUBMIT_POLL_SEC = 0.5
+PI_TRACE_MAX_BYTES = 2 * 1024 * 1024
 
 # the host-side route the gateway (infrastructure, not the evaluated
 # container) may use to reach host services such as the session listener (#38)
@@ -221,6 +222,41 @@ def effective_conditions(profile: dict) -> dict:
 
 def command(*args, check=True):
     return subprocess.run(args, text=True, capture_output=True, timeout=20, check=check)
+
+
+def _capture_pi_trace(container_id: str | None, root: Path, run_id: str,
+                      conn: sqlite3.Connection, phase: str) -> None:
+    """Copy the bounded Pi JSONL trace before Harbor removes its container.
+
+    The trace is diagnostic only; the sealed workspace remains the official
+    answer. Capture is idempotent because timeout and agent-end can race.
+    """
+    if not container_id:
+        return
+    trace_dir = root / "pi-traces" / run_id
+    trace_path = trace_dir / "transcript.jsonl"
+    if trace_path.exists():
+        return
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = trace_dir / ".transcript.raw"
+    result = command("docker", "cp", f"{container_id}:/tmp/aco-pi.jsonl",
+                     str(raw_path), check=False)
+    if result.returncode != 0 or not raw_path.is_file():
+        runs.add_phase(conn, run_id, "pi_trace_capture_failed", phase=phase,
+                       detail=(result.stderr or "docker cp failed")[-500:])
+        return
+    data = raw_path.read_bytes()
+    raw_path.unlink(missing_ok=True)
+    for name in ("ARK_AGENT_PLAN_API_KEY", "ACO_SESSION_TOKEN"):
+        secret = os.environ.get(name)
+        if secret and len(secret) >= 8:
+            data = data.replace(secret.encode(), b"[REDACTED]")
+    truncated = len(data) > PI_TRACE_MAX_BYTES
+    trace_path.write_bytes(data[:PI_TRACE_MAX_BYTES])
+    runs.add_phase(conn, run_id, "pi_trace_captured", phase=phase,
+                   path=str(trace_path), bytes=trace_path.stat().st_size,
+                   truncated=truncated,
+                   sha256=hashlib.sha256(trace_path.read_bytes()).hexdigest())
 
 
 def resolve_skill_mounts(conn: sqlite3.Connection, parsed: TargetProfile,
@@ -734,6 +770,9 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         nonlocal agent_ended
         agent_ended = True
         runs.add_phase(conn, run_id, "agent_end")
+        if harness == PI_HARNESS:
+            await asyncio.to_thread(_capture_pi_trace, container_id, root, run_id,
+                                    conn, "agent_end")
         trigger = "submit" if _has_submission(conn, run["trial_id"]) else "exit"
         await asyncio.to_thread(_seal_after_run, conn, run, container_id,
                                 trigger, root, baseline_dir, contract)
@@ -797,6 +836,9 @@ async def execute_run(conn: sqlite3.Connection, run: sqlite3.Row, root: Path) ->
         timeout (#16 reopen): seal, planned deadline / actual freeze /
         tolerance verdict, terminal run and trial."""
         runs.add_phase(conn, run_id, "trial_timeout", source=source)
+        if harness == PI_HARNESS:
+            await asyncio.to_thread(_capture_pi_trace, container_id, root, run_id,
+                                    conn, "timeout")
         await asyncio.to_thread(_seal_after_run, conn, run, container_id,
                                 "timeout", root, baseline_dir, contract)
         await asyncio.to_thread(_retrigger_answer, conn, run["trial_id"], run_id)
