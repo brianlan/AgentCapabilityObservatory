@@ -211,6 +211,8 @@ class TestParseTranscript:
         ("Provider returned 401 Unauthorized", "provider_auth"),
         ("invalid api key", "provider_auth"),
         ("HTTP 429 too many requests", "provider_transient"),
+        ("Response incomplete: length", "provider_output_limit"),
+        ("maximum output tokens exceeded", "provider_output_limit"),
         ("Connection error.", "provider_unavailable"),
         ("Provider exploded oddly", "provider_transient"),  # unknown bucket
     ])

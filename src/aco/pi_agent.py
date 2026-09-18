@@ -245,9 +245,9 @@ def parse_transcript(raw: str) -> dict[str, Any]:
     Returns {"observation": {...}, "failure": str | None}. The observation
     carries only what the transcript actually shows; anything missing stays
     unknown (absent). Failure classes follow the issue's diagnostics:
-    provider_auth / provider_unavailable / provider_transient. A session that
-    ended cleanly is never a provider failure, even if an earlier attempt
-    retried through a transient error.
+    provider_auth / provider_unavailable / provider_transient /
+    provider_output_limit. A session that ended cleanly is never a provider
+    failure, even if an earlier attempt retried through a transient error.
     """
     events: list[dict[str, Any]] = []
     for line in raw.splitlines():
@@ -310,6 +310,11 @@ def _classify_provider_error(error: str) -> str:
         "authentication", "forbidden",
     )):
         return "provider_auth"
+    if any(needle in lowered for needle in (
+        "response incomplete: length", "output length", "max output tokens",
+        "maximum output tokens", "token limit", "length limit",
+    )):
+        return "provider_output_limit"
     if any(needle in lowered for needle in (
         "429", "rate limit", "too many requests", "quota", "usage limit",
     )):
