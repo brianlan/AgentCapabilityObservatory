@@ -23,6 +23,7 @@ from aco.pi_agent import (
     ARK_PROVIDER,
     DOUBAO_ADAPTER_VERSION,
     DOUBAO_MODEL,
+    GLM_32K_ADAPTER_VERSION,
     PI_VERSION,
     PiAgent,
     parse_transcript,
@@ -70,6 +71,14 @@ class TestRenderModelsJson:
         assert model["id"] == ARK_MODEL
         assert model["reasoning"] is True
         assert model["thinkingLevelMap"]["max"] == "max"
+
+    def test_glm_output_budget_is_pinned_by_adapter_version(self):
+        old = render_models_json(_TargetProfile(), "http://mock:1")
+        expanded = render_models_json(
+            _TargetProfile(adapter_version=GLM_32K_ADAPTER_VERSION), "http://mock:1")
+        assert old["providers"][ARK_PROVIDER]["models"][0]["maxTokens"] == 8192
+        assert expanded["providers"][ARK_PROVIDER]["models"][0]["maxTokens"] == 32768
+        assert validate_profile(_TargetProfile(adapter_version=GLM_32K_ADAPTER_VERSION)) == 120
 
     def test_rejects_unsupported_render_inputs(self):
         with pytest.raises(ValueError, match="provider"):

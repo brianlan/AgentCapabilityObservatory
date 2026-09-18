@@ -36,6 +36,7 @@ from .models import TargetProfile
 PI_PACKAGE = "@earendil-works/pi-coding-agent"
 PI_VERSION = "0.84.1"
 ADAPTER_VERSION = "0.1.1"
+GLM_32K_ADAPTER_VERSION = "0.1.3"
 PI_IMAGE_TAG = f"aco-pi-agent:{PI_VERSION}"
 # pinned base for the trial image: node ships the runtime pi needs; the pi
 # package itself is installed at image build and verified at agent setup
@@ -67,6 +68,7 @@ MODEL_METADATA = {
     "contextWindow": 262144,
     "maxTokens": 8192,
 }
+GLM_32K_MODEL_METADATA = {**MODEL_METADATA, "maxTokens": 32768}
 DOUBAO_MODEL_METADATA = {
     "name": "豆包 Seed 2.0 Mini",
     "reasoning": True,
@@ -160,16 +162,21 @@ def render_models_json(profile: TargetProfile, base_url: str) -> dict[str, Any]:
             " only 'openai-responses' renders"
         )
     if profile.model == ARK_MODEL:
-        expected_adapter, metadata, thinking_map = (
-            ADAPTER_VERSION, MODEL_METADATA, ARK_THINKING_LEVEL_MAP)
+        if profile.adapter_version == ADAPTER_VERSION:
+            metadata = MODEL_METADATA
+        elif profile.adapter_version == GLM_32K_ADAPTER_VERSION:
+            metadata = GLM_32K_MODEL_METADATA
+        else:
+            raise ValueError(f"unsupported adapter_version {profile.adapter_version!r};"
+                             f" pin {ADAPTER_VERSION!r} or {GLM_32K_ADAPTER_VERSION!r}")
+        thinking_map = ARK_THINKING_LEVEL_MAP
     elif profile.model == DOUBAO_MODEL:
-        expected_adapter, metadata, thinking_map = (
-            DOUBAO_ADAPTER_VERSION, DOUBAO_MODEL_METADATA, DOUBAO_THINKING_LEVEL_MAP)
+        metadata, thinking_map = DOUBAO_MODEL_METADATA, DOUBAO_THINKING_LEVEL_MAP
+        if profile.adapter_version != DOUBAO_ADAPTER_VERSION:
+            raise ValueError(f"unsupported adapter_version {profile.adapter_version!r};"
+                             f" pin {DOUBAO_ADAPTER_VERSION!r} for {profile.model}")
     else:
         raise ValueError(f"unsupported model {profile.model!r}")
-    if profile.adapter_version != expected_adapter:
-        raise ValueError(f"unsupported adapter_version {profile.adapter_version!r};"
-                         f" pin {expected_adapter!r} for {profile.model}")
     supported_thinking = tuple(level for level, mapped in thinking_map.items() if mapped)
     if profile.thinking not in supported_thinking:
         raise ValueError(
